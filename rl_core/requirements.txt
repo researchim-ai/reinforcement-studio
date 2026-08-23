@@ -1,0 +1,20 @@
+# CPU-only PyTorch wheels: this app targets small models (classic control,
+# AlphaZero on tiny boards) where CUDA isn't needed, and the CPU wheel is a
+# fraction of the size of the default CUDA-bundled build — much faster to
+# install for the typical desktop user. GPU users can still install a
+# CUDA build of torch manually into the app's venv if they need it.
+# (--index-url replaces the default so torch resolves to the CPU wheel;
+# --extra-index-url falls back to PyPI for every other package below.)
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+numpy>=1.26
+torch>=2.2
+# [box2d,mujoco,atari]: unlocks LunarLander/BipedalWalker/CarRacing, the 11
+# MuJoCo robotics tasks, and the ~40 Atari games in the Environments gallery.
+# All three ship prebuilt wheels (no swig/compiler needed) and add well under
+# 100MB combined, so it's worth including by default rather than leaving
+# most of the gallery greyed out until a user manually installs extras.
+gymnasium[box2d,mujoco,atari]>=0.29
+stable-baselines3>=2.3
+pillow>=10.0

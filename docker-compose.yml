@@ -1,0 +1,24 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rl-studio:latest
+    container_name: rl-studio-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./rl_core/.runs:/app/rl_core/.runs
+      - ./rl_core/checkpoints:/app/rl_core/checkpoints
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RL_STUDIO_ROOT=/app/rl_core
+    # Uncomment to use an NVIDIA GPU (requires the NVIDIA Container Toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped

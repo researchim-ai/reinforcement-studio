@@ -1,3 +1,19 @@
+# Node / Electron
+node_modules/
+dist/
+dist-electron/
+release/
+*.local
+*.tsbuildinfo
+
+# RL runs / checkpoints (generated at runtime, not app resources)
+rl_core/.runs/
+rl_core/checkpoints/
+rl_core/previews/
+
+# Reference project kept locally for inspiration, not part of this app
+/models-at-home-studio/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
