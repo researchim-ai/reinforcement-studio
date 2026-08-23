@@ -124,7 +124,7 @@ function createWindow() {
     height: 900,
     minWidth: 1024,
     minHeight: 700,
-    title: 'RL Studio',
+    title: 'Reinforcement Studio',
     icon: iconPath ? nativeImage.createFromPath(iconPath) : undefined,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -254,8 +254,8 @@ function buildAppMenu() {
           click: () => {
             dialog.showMessageBox(mainWindow!, {
               type: 'info',
-              title: 'RL Studio',
-              message: `RL Studio v${app.getVersion()}`,
+              title: 'Reinforcement Studio',
+              message: `Reinforcement Studio v${app.getVersion()}`,
               detail: 'Desktop studio for designing and running reinforcement learning experiments.',
               icon: getIconPath() ? nativeImage.createFromPath(getIconPath()!) : undefined,
             })

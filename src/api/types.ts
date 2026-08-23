@@ -19,6 +19,7 @@ export interface WrapperSpec {
   type: string
   label: string
   params: Record<string, number | string>
+  is_custom?: boolean
 }
 
 export interface HyperparamSpec {
@@ -36,6 +37,35 @@ export interface AlgorithmSpec {
   kind: EnvKind
   description: string
   hyperparams: HyperparamSpec[]
+  is_custom?: boolean
+  supported_action_kinds?: ActionKind[]
+}
+
+export type PluginKind = 'gym-algorithms' | 'alphazero-algorithms' | 'reward-functions'
+
+export interface PluginScriptMeta {
+  id: string
+  slug: string
+  name: string
+  kind: string
+  description: string
+  hyperparams: HyperparamSpec[]
+  is_custom: true
+  broken?: boolean
+  error?: string
+}
+
+export interface PluginTemplate {
+  id: string
+  label: string
+  kind: 'gym-algorithm' | 'alphazero-algorithm' | 'reward-function'
+  code: string
+}
+
+export interface ValidateResult {
+  ok: boolean
+  error: string | null
+  traceback: string | null
 }
 
 export interface WrapperNode {
@@ -62,6 +92,50 @@ export interface ExperimentConfig {
   }
 }
 
+export interface SpaceInfo {
+  type: string
+  shape: number[] | null
+  n?: number
+}
+
+export interface NetworkInfo {
+  channels: number
+  num_blocks: number
+  rows: number
+  cols: number
+  action_size: number
+  input_planes: number
+}
+
+export interface InspectEnvironment {
+  raw_observation_space: SpaceInfo | null
+  raw_action_space: SpaceInfo | null
+  observation_space: SpaceInfo | null
+  action_space: SpaceInfo | null
+}
+
+export interface InspectNetwork {
+  policy: string
+  layers: string[]
+  total_params: number
+  trainable_params: number
+  input_shape: number[]
+  output_shape: number[]
+  note?: string
+  channels?: number
+  num_blocks?: number
+  rows?: number
+  cols?: number
+  action_size?: number
+  input_planes?: number
+}
+
+export interface InspectResult {
+  environment: InspectEnvironment | null
+  network: InspectNetwork | null
+  error: string | null
+}
+
 export interface MetricsSnapshot {
   run_id: string
   kind: EnvKind
@@ -81,6 +155,19 @@ export interface MetricsSnapshot {
   buffer_size?: number
   arena?: { wins_a: number; wins_b: number; draws: number; games: number }
   error?: string
+  // Static per-run facts, merged into every snapshot (see MetricsCallback /
+  // alphazero train.py): effective hyperparams + model/network shape.
+  hyperparams?: Record<string, number | string | boolean>
+  policy?: string
+  device?: string
+  total_params?: number
+  seed?: number | null
+  observation_space?: SpaceInfo
+  action_space?: SpaceInfo
+  wrappers?: { type: string; params: Record<string, number | string> }[]
+  network?: NetworkInfo
+  board?: number[][] | null
+  board_winner?: number | null
 }
 
 export interface RunSummary {

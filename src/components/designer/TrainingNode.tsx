@@ -43,13 +43,19 @@ export function TrainingNode({ data }: NodeProps & { data: TrainingNodeData }) {
 
         {data.kind === 'gym' ? (
           <div className="space-y-1">
-            <Label className="text-[11px] text-muted-foreground">Total timesteps</Label>
+            <Label className="text-[11px] text-muted-foreground">
+              Total timesteps <span className="text-muted-foreground/60">(без ограничений)</span>
+            </Label>
             <Input
               type="number"
+              min={1}
               value={data.totalTimesteps}
-              onChange={(e) => data.onChangeTotalTimesteps(Number(e.target.value))}
+              onChange={(e) => data.onChangeTotalTimesteps(Math.max(1, Number(e.target.value) || 0))}
               className="h-7 text-xs"
             />
+            <p className="text-[10px] text-muted-foreground/60">
+              Общая длина обучения — не путать с гиперпараметрами алгоритма слева (например, «Replay buffer size» у DQN).
+            </p>
           </div>
         ) : (
           <div className="space-y-1">

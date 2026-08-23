@@ -32,6 +32,8 @@ function EnvPreview({ env }: { env: EnvSpec }) {
   const [full, setFull] = useState<string>()
   const [hovered, setHovered] = useState(false)
   const [thumbFailed, setThumbFailed] = useState(false)
+  const [thumbLoaded, setThumbLoaded] = useState(false)
+  const [fullLoaded, setFullLoaded] = useState(false)
 
   useEffect(() => {
     const node = rootRef.current
@@ -83,7 +85,14 @@ function EnvPreview({ env }: { env: EnvSpec }) {
           src={thumb}
           alt={env.name}
           decoding="async"
-          className="absolute inset-0 h-full w-full object-cover"
+          // object-contain (not cover): source GIFs come from Farama's docs
+          // in wildly different aspect ratios (0.76 for Atari, 3.0 for Cliff
+          // Walking, ...) — cover would crop them into our fixed 16:9 card,
+          // and for *animated* previews (e.g. Blackjack dealing cards near
+          // the frame edges) that crop made content look like it was
+          // randomly appearing/disappearing as the animation played.
+          className={`absolute inset-0 h-full w-full object-contain transition-opacity duration-300 ${thumbLoaded ? 'opacity-100' : 'opacity-0'}`}
+          onLoad={() => setThumbLoaded(true)}
           onError={() => setThumbFailed(true)}
         />
       )}
@@ -92,7 +101,11 @@ function EnvPreview({ env }: { env: EnvSpec }) {
           src={full}
           alt=""
           decoding="async"
-          className="absolute inset-0 h-full w-full object-cover"
+          // Fades in over the (still-mounted) thumb instead of popping in the
+          // instant the GIF finishes downloading, so the swap reads as a
+          // smooth upgrade rather than a flicker.
+          className={`absolute inset-0 h-full w-full object-contain transition-opacity duration-300 ${fullLoaded ? 'opacity-100' : 'opacity-0'}`}
+          onLoad={() => setFullLoaded(true)}
         />
       )}
     </div>
@@ -198,7 +211,7 @@ export function Environments() {
                     variant="outline"
                     className="w-full"
                     disabled={!env.available}
-                    onClick={() => navigate('/designer')}
+                    onClick={() => navigate(`/designer?env=${encodeURIComponent(env.id)}`)}
                   >
                     Использовать в дизайнере
                   </Button>

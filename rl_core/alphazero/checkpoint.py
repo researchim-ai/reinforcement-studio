@@ -24,10 +24,24 @@ def save_checkpoint(net: AlphaZeroNet, path: Path, meta: dict[str, Any]) -> None
     )
 
 
-def load_checkpoint(path: Path, device: str = "cpu") -> tuple[AlphaZeroNet, dict[str, Any]]:
+def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any]]:
     payload = torch.load(path, map_location=device, weights_only=False)
-    net = AlphaZeroNet(payload["rows"], payload["cols"], payload["action_size"])
+    meta = payload.get("meta", {})
+    custom_slug = meta.get("custom_trainer_slug")
+    if custom_slug:
+        # Trained by a custom AlphaZero plugin, which may use a custom
+        # network architecture — reconstruct it via the same trainer class
+        # (its build_network()) rather than assuming the built-in AlphaZeroNet.
+        from rl_core.games import make_game
+        from rl_core.plugins.loader import load_alphazero_trainer
+
+        trainer_cls = load_alphazero_trainer(custom_slug)
+        game_cls = make_game(meta["game_id"]).__class__
+        trainer = trainer_cls(game_cls, meta.get("hyperparams", {}), device)
+        net = trainer.net
+    else:
+        net = AlphaZeroNet(payload["rows"], payload["cols"], payload["action_size"])
     net.load_state_dict(payload["state_dict"])
     net.to(device)
     net.eval()
-    return net, payload.get("meta", {})
+    return net, meta

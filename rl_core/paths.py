@@ -21,8 +21,16 @@ ROOT = get_root(PACKAGE_DIR)
 RUNS_DIR = ROOT / ".runs"
 CHECKPOINTS_DIR = ROOT / "checkpoints"
 
-RUNS_DIR.mkdir(parents=True, exist_ok=True)
-CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+# User-authored plugins (custom algorithms/reward functions edited in-app via
+# the Monaco editor on the Plugins page) — one .py file per script, named
+# after its slug. Kept outside PACKAGE_DIR so they survive app updates/
+# reinstalls, same rationale as RUNS_DIR/CHECKPOINTS_DIR.
+CUSTOM_GYM_ALGOS_DIR = ROOT / "custom_algorithms" / "gym"
+CUSTOM_ALPHAZERO_ALGOS_DIR = ROOT / "custom_algorithms" / "alphazero"
+CUSTOM_REWARDS_DIR = ROOT / "custom_rewards"
+
+for _d in (RUNS_DIR, CHECKPOINTS_DIR, CUSTOM_GYM_ALGOS_DIR, CUSTOM_ALPHAZERO_ALGOS_DIR, CUSTOM_REWARDS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 
 def run_dir(run_id: str) -> Path:

@@ -1,4 +1,4 @@
-# RL Studio backend image — CPU by default; pass --gpus all at run time if
+# Reinforcement Studio backend image — CPU by default; pass --gpus all at run time if
 # the host has the NVIDIA Container Toolkit and you want AlphaZero/PPO on GPU.
 FROM python:3.11-slim
 

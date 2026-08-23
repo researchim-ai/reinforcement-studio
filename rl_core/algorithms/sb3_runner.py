@@ -40,7 +40,24 @@ def _filter_kwargs(cls: type, hyperparams: dict[str, Any]) -> dict[str, Any]:
 def _make_env(env_id: str, wrapper_specs: list[dict], render: bool = False) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array" if render else None)
     env = apply_wrappers(env, wrapper_specs)
+    if isinstance(env.observation_space, (gym.spaces.Tuple, gym.spaces.Dict)):
+        # SB3 policies don't support Tuple/Dict observation spaces at all
+        # (e.g. Blackjack-v1 is Tuple(Discrete(32), Discrete(11), Discrete(2))).
+        # Flatten into a single Box (one-hot for Discrete components) so any
+        # such env "just works" with MlpPolicy, instead of failing at
+        # model construction with "observation space is not supported".
+        env = gym.wrappers.FlattenObservation(env)
     return env
+
+
+def _space_info(space: gym.Space) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "type": space.__class__.__name__,
+        "shape": list(space.shape) if getattr(space, "shape", None) is not None else None,
+    }
+    if hasattr(space, "n"):
+        info["n"] = int(space.n)
+    return info
 
 
 def _policy_for_env(env: gym.Env) -> str:
@@ -55,21 +72,18 @@ def _policy_for_env(env: gym.Env) -> str:
     return "MlpPolicy"
 
 
-def run(config: dict[str, Any], run_dir: Path) -> None:
+def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], config: dict[str, Any], run_dir: Path) -> None:
+    """Drives any SB3-compatible `BaseAlgorithm` subclass through the
+    standard Monitor + MetricsCallback pipeline. Shared by the built-in
+    `run()` below and by `rl_core/algorithms/custom_runner.py` for custom
+    algorithms that subclass an existing SB3 algorithm (e.g. PPO)."""
     env_cfg = config.get("environment", {})
-    algo_cfg = config.get("algorithm", {})
     training_cfg = config.get("training", {})
 
     env_id = env_cfg["id"]
     wrapper_specs = env_cfg.get("wrappers", [])
-    algo_id = algo_cfg.get("id", "ppo").lower()
-    hyperparams = {**DEFAULT_HYPERPARAMS.get(algo_id, {}), **(algo_cfg.get("hyperparams") or {})}
     total_timesteps = int(training_cfg.get("total_timesteps", 50_000))
     seed = training_cfg.get("seed")
-
-    if algo_id not in ALGO_CLASSES:
-        raise ValueError(f"Unknown algorithm: {algo_id}")
-    algo_cls = ALGO_CLASSES[algo_id]
 
     train_env = Monitor(_make_env(env_id, wrapper_specs))
     if seed is not None:
@@ -79,12 +93,25 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
     policy = _policy_for_env(train_env)
     model = algo_cls(policy, train_env, seed=seed, verbose=0, **model_kwargs)
 
+    total_params = sum(p.numel() for p in model.policy.parameters())
+    static_info = {
+        "policy": policy,
+        "device": str(model.device),
+        "hyperparams": {**hyperparams, **model_kwargs},
+        "total_params": int(total_params),
+        "observation_space": _space_info(train_env.observation_space),
+        "action_space": _space_info(train_env.action_space),
+        "wrappers": wrapper_specs,
+        "seed": seed,
+    }
+
     callback = MetricsCallback(
         run_dir=run_dir,
         env_id=env_id,
-        algo_id=algo_id,
+        algo_id=algo_label,
         total_timesteps=total_timesteps,
         make_render_env=lambda: _make_env(env_id, wrapper_specs, render=True),
+        static_info=static_info,
     )
 
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
@@ -94,3 +121,12 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
     finally:
         model.save(str(run_dir / "model.zip"))
         train_env.close()
+
+
+def run(config: dict[str, Any], run_dir: Path) -> None:
+    algo_cfg = config.get("algorithm", {})
+    algo_id = algo_cfg.get("id", "ppo").lower()
+    if algo_id not in ALGO_CLASSES:
+        raise ValueError(f"Unknown algorithm: {algo_id}")
+    hyperparams = {**DEFAULT_HYPERPARAMS.get(algo_id, {}), **(algo_cfg.get("hyperparams") or {})}
+    _run_sb3(ALGO_CLASSES[algo_id], algo_id, hyperparams, config, run_dir)

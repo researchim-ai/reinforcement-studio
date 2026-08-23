@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
@@ -13,7 +13,7 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useRuns } from '@/api/hooks'
 import { api, createMetricsWebSocket } from '@/api/client'
-import type { MetricsSnapshot } from '@/api/types'
+import type { MetricsSnapshot, SpaceInfo } from '@/api/types'
 import { cn, formatDuration } from '@/lib/utils'
 
 const STATUS_VARIANT: Record<string, 'success' | 'secondary' | 'destructive' | 'outline'> = {
@@ -93,6 +93,24 @@ export function TrainingMonitor() {
 
   const latest = history[history.length - 1] ?? (selectedRun?.metrics as MetricsSnapshot | undefined)
   const isAlphaZero = latest?.kind === 'alphazero' || selectedRun?.kind === 'alphazero'
+
+  // The backend only renders a fresh frame/board every couple thousand
+  // steps (rendering is expensive) — most metrics snapshots simply omit
+  // `frame_base64`/`board`. Reading those straight off `latest` made the
+  // "Живой просмотр среды" card mount/unmount on every snapshot that
+  // lacked them, i.e. exactly the "то исчезает то появляется" flicker.
+  // Instead, carry the last non-empty one forward until a newer one shows up.
+  const { lastFrame, lastBoard, lastBoardWinner } = useMemo(() => {
+    let frame = selectedRun?.metrics?.frame_base64
+    let board = selectedRun?.metrics?.board
+    let boardWinner = selectedRun?.metrics?.board_winner
+    for (const snap of history) {
+      if (snap.frame_base64) frame = snap.frame_base64
+      if (snap.board) board = snap.board
+      if (snap.board_winner != null) boardWinner = snap.board_winner
+    }
+    return { lastFrame: frame, lastBoard: board, lastBoardWinner: boardWinner }
+  }, [history, selectedRun])
 
   return (
     <div className="flex h-full">
@@ -177,20 +195,69 @@ export function TrainingMonitor() {
               <StatCard label="Время" value={latest?.elapsed_seconds ? formatDuration(latest.elapsed_seconds) : '—'} />
             </div>
 
-            {!isAlphaZero && latest?.frame_base64 && (
+            {((!isAlphaZero && lastFrame) || (isAlphaZero && lastBoard)) && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Живой просмотр среды</CardTitle>
                 </CardHeader>
-                <CardContent className="flex justify-center">
-                  <img
-                    src={`data:image/png;base64,${latest.frame_base64}`}
-                    alt="env frame"
-                    className="max-h-64 rounded-lg border border-border"
-                  />
+                <CardContent className="flex flex-col items-center gap-2">
+                  {!isAlphaZero && lastFrame && (
+                    <img
+                      src={`data:image/png;base64,${lastFrame}`}
+                      alt="env frame"
+                      className="max-h-64 rounded-lg border border-border"
+                    />
+                  )}
+                  {isAlphaZero && lastBoard && <BoardPreview board={lastBoard} />}
+                  {isAlphaZero && lastBoardWinner != null && (
+                    <p className="text-xs text-muted-foreground">
+                      Последняя self-play партия итерации: {
+                        lastBoardWinner === 0 ? 'ничья' : `победил игрок ${lastBoardWinner === 1 ? '●' : '○'}`
+                      }
+                    </p>
+                  )}
                 </CardContent>
               </Card>
             )}
+
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {latest?.hyperparams && Object.keys(latest.hyperparams).length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Гиперпараметры алгоритма</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <KeyValueGrid entries={Object.entries(latest.hyperparams)} />
+                  </CardContent>
+                </Card>
+              )}
+
+              {(latest?.total_params != null || latest?.network) && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Конфигурация модели</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <KeyValueGrid entries={buildNetworkEntries(latest)} />
+                  </CardContent>
+                </Card>
+              )}
+
+              {!isAlphaZero && latest?.wrappers && latest.wrappers.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Wrappers среды</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex flex-wrap gap-1.5">
+                      {latest.wrappers.map((w, i) => (
+                        <Badge key={i} variant="secondary" className="text-[10px]">{w.type}</Badge>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
 
             <Card>
               <CardHeader>
@@ -265,5 +332,70 @@ function StatCard({ label, value }: { label: string; value: string }) {
         <div className="text-xs text-muted-foreground">{label}</div>
       </CardContent>
     </Card>
+  )
+}
+
+function formatValue(value: unknown): string {
+  if (value == null) return '—'
+  if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')
+  if (typeof value === 'boolean') return value ? 'да' : 'нет'
+  return String(value)
+}
+
+function formatSpace(space?: SpaceInfo): string {
+  if (!space) return '—'
+  const shape = space.shape ? `[${space.shape.join(', ')}]` : space.n != null ? `n=${space.n}` : ''
+  return `${space.type} ${shape}`.trim()
+}
+
+function buildNetworkEntries(latest: MetricsSnapshot): [string, string][] {
+  const entries: [string, string][] = []
+  if (latest.policy) entries.push(['Policy', latest.policy])
+  if (latest.network) {
+    entries.push(['Каналы / блоки', `${latest.network.channels} / ${latest.network.num_blocks}`])
+    entries.push(['Доска', `${latest.network.rows}×${latest.network.cols}`])
+    entries.push(['Размер действия', String(latest.network.action_size)])
+    entries.push(['Входные плоскости', String(latest.network.input_planes)])
+  }
+  if (latest.observation_space) entries.push(['Observation space', formatSpace(latest.observation_space)])
+  if (latest.action_space) entries.push(['Action space', formatSpace(latest.action_space)])
+  if (latest.total_params != null) entries.push(['Параметры сети', latest.total_params.toLocaleString('ru-RU')])
+  if (latest.device) entries.push(['Устройство', latest.device.toUpperCase()])
+  if (latest.seed != null) entries.push(['Seed', String(latest.seed)])
+  return entries
+}
+
+function KeyValueGrid({ entries }: { entries: [string, unknown][] }) {
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-3">
+      {entries.map(([key, value]) => (
+        <div key={key} className="flex flex-col">
+          <span className="text-muted-foreground">{key}</span>
+          <span className="font-mono font-medium">{formatValue(value)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function BoardPreview({ board }: { board: number[][] }) {
+  const cols = board[0]?.length ?? 0
+  return (
+    <div className="inline-grid gap-1" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+      {board.map((rowVals, row) =>
+        rowVals.map((cell, col) => (
+          <div
+            key={`${row}-${col}`}
+            className={cn(
+              'flex h-8 w-8 items-center justify-center rounded-md border border-border text-sm font-bold',
+              cell === 0 ? 'bg-muted/40' : 'bg-muted',
+            )}
+          >
+            {cell === 1 && <span className="text-primary">●</span>}
+            {cell === -1 && <span className="text-warning">○</span>}
+          </div>
+        )),
+      )}
+    </div>
   )
 }

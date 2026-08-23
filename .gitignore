@@ -6,10 +6,12 @@ release/
 *.local
 *.tsbuildinfo
 
-# RL runs / checkpoints (generated at runtime, not app resources)
+# RL runs / checkpoints / user plugins (generated/authored at runtime, not app resources)
 rl_core/.runs/
 rl_core/checkpoints/
 rl_core/previews/
+rl_core/custom_algorithms/
+rl_core/custom_rewards/
 
 # Reference project kept locally for inspiration, not part of this app
 /models-at-home-studio/

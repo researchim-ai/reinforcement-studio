@@ -2,6 +2,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Layers, X } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import type { WrapperSpec } from '@/api/types'
 
 export interface WrapperNodeData {
@@ -19,7 +20,8 @@ export function WrapperNode({ data }: NodeProps & { data: WrapperNodeData }) {
       <div className="flex items-center gap-2 rounded-t-xl border-b border-border bg-muted px-3 py-2">
         <Layers className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Wrapper</span>
-        <Button variant="ghost" size="icon" className="ml-auto h-5 w-5" onClick={data.onRemove}>
+        {spec?.is_custom && <Badge variant="secondary" className="ml-auto text-[9px]">custom</Badge>}
+        <Button variant="ghost" size="icon" className={`h-5 w-5 ${spec?.is_custom ? '' : 'ml-auto'}`} onClick={data.onRemove}>
           <X className="h-3 w-3" />
         </Button>
       </div>

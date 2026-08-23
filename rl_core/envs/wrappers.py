@@ -26,6 +26,16 @@ def apply_wrappers(env: gym.Env, wrapper_specs: list[dict[str, Any]]) -> gym.Env
             )
         elif wtype == "frame_stack":
             env = gym.wrappers.FrameStackObservation(env, stack_size=int(params.get("num_stack", 4)))
+        elif wtype and wtype.startswith("custom_reward:"):
+            # Type encodes the plugin slug directly (custom_reward:<slug>)
+            # rather than relying on params, so multiple custom reward
+            # scripts each get a distinct wrapper-catalog entry/type — see
+            # backend/routes/environments.py::_custom_wrapper_entries.
+            from rl_core.envs.reward_fn import CustomRewardWrapper
+            from rl_core.plugins.loader import load_reward_fn
+
+            slug = wtype.split(":", 1)[1]
+            env = CustomRewardWrapper(env, load_reward_fn(slug))
         # Unknown wrapper types are ignored rather than raising, so a stale
         # graph node never blocks a run.
     return env

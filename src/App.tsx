@@ -32,6 +32,7 @@ const TrainingMonitor = lazyWithReload(() => import('@/pages/TrainingMonitor').t
 const Environments = lazyWithReload(() => import('@/pages/Environments').then((m) => ({ default: m.Environments })))
 const AlphaZeroArena = lazyWithReload(() => import('@/pages/AlphaZeroArena').then((m) => ({ default: m.AlphaZeroArena })))
 const ModelZoo = lazyWithReload(() => import('@/pages/ModelZoo').then((m) => ({ default: m.ModelZoo })))
+const PluginsPage = lazyWithReload(() => import('@/pages/Plugins').then((m) => ({ default: m.PluginsPage })))
 const SettingsPage = lazyWithReload(() => import('@/pages/Settings').then((m) => ({ default: m.SettingsPage })))
 
 function PageFallback() {
@@ -53,6 +54,7 @@ export default function App() {
           <Route path="/environments" element={<Suspense fallback={<PageFallback />}><Environments /></Suspense>} />
           <Route path="/arena" element={<Suspense fallback={<PageFallback />}><AlphaZeroArena /></Suspense>} />
           <Route path="/models" element={<Suspense fallback={<PageFallback />}><ModelZoo /></Suspense>} />
+          <Route path="/plugins" element={<Suspense fallback={<PageFallback />}><PluginsPage /></Suspense>} />
           <Route path="/settings" element={<Suspense fallback={<PageFallback />}><SettingsPage /></Suspense>} />
         </Route>
       </Routes>

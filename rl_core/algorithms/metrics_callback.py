@@ -25,6 +25,36 @@ def _encode_frame(frame: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def render_frame(
+    make_render_env: Callable[[], Any] | None,
+    predict: Callable[[Any], tuple[Any, Any]],
+    max_steps: int = 30,
+) -> str | None:
+    """Rolls out `predict` in a fresh render-mode env for up to `max_steps`
+    and returns the last rendered frame as a base64 PNG. Shared by
+    MetricsCallback (SB3 runs) and rl_core/algorithms/custom_runner.py
+    (from-scratch CustomAlgorithm runs) so both get live env previews on the
+    Training Monitor page."""
+    if make_render_env is None:
+        return None
+    try:
+        env = make_render_env()
+        obs, _ = env.reset()
+        frame = env.render()
+        for _ in range(max_steps):
+            action, _ = predict(obs)
+            obs, _, terminated, truncated, _ = env.step(action)
+            frame = env.render()
+            if terminated or truncated:
+                break
+        env.close()
+        if frame is not None:
+            return _encode_frame(np.asarray(frame))
+    except Exception:
+        return None
+    return None
+
+
 class MetricsCallback(BaseCallback):
     def __init__(
         self,
@@ -34,7 +64,8 @@ class MetricsCallback(BaseCallback):
         total_timesteps: int,
         make_render_env: Callable[[], Any] | None = None,
         write_every_steps: int = 500,
-        render_every_steps: int = 5000,
+        render_every_steps: int = 2000,
+        static_info: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.run_dir = run_dir
@@ -44,6 +75,10 @@ class MetricsCallback(BaseCallback):
         self.make_render_env = make_render_env
         self.write_every_steps = write_every_steps
         self.render_every_steps = render_every_steps
+        # Static per-run facts (effective hyperparams, network/policy shape, ...)
+        # that don't change step to step — merged into every snapshot so the
+        # Training Monitor always has them, without a separate round-trip.
+        self.static_info = static_info or {}
         self.start_time = time.time()
         self._last_write = 0
         self._last_render = 0
@@ -64,22 +99,7 @@ class MetricsCallback(BaseCallback):
         if not self.make_render_env or self.num_timesteps - self._last_render < self.render_every_steps:
             return None
         self._last_render = self.num_timesteps
-        try:
-            env = self.make_render_env()
-            obs, _ = env.reset()
-            frame = env.render()
-            for _ in range(30):
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, _, terminated, truncated, _ = env.step(action)
-                frame = env.render()
-                if terminated or truncated:
-                    break
-            env.close()
-            if frame is not None:
-                return _encode_frame(np.asarray(frame))
-        except Exception:
-            return None
-        return None
+        return render_frame(self.make_render_env, lambda obs: self.model.predict(obs, deterministic=True))
 
     def _write_snapshot(self, status: str, extra: dict | None = None) -> None:
         mean_reward, mean_length = self._episode_stats()
@@ -97,6 +117,7 @@ class MetricsCallback(BaseCallback):
             "fps": round(self.num_timesteps / elapsed, 1) if elapsed > 0 else 0,
             "elapsed_seconds": round(elapsed, 1),
         }
+        snapshot.update(self.static_info)
         frame = self._maybe_render()
         if frame:
             snapshot["frame_base64"] = frame

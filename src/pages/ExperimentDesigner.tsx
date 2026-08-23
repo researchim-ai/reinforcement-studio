@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ReactFlow, Background, Controls, type Node, type Edge } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { toast } from 'sonner'
 import { Loader2, Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { useAlgorithms, useEnvironments, useWrappers } from '@/api/hooks'
+import { useAlgorithms, useEnvironments, useInspectDesign, useWrappers } from '@/api/hooks'
 import { api } from '@/api/client'
 import { EnvNode, type EnvNodeData } from '@/components/designer/EnvNode'
 import { WrapperNode, type WrapperNodeData } from '@/components/designer/WrapperNode'
 import { AlgorithmNode, type AlgorithmNodeData } from '@/components/designer/AlgorithmNode'
 import { TrainingNode, type TrainingNodeData } from '@/components/designer/TrainingNode'
+import { InspectPanel } from '@/components/designer/InspectPanel'
 import type { EnvKind, WrapperNode as WrapperNodeSpec } from '@/api/types'
 
 const nodeTypes = {
@@ -26,6 +27,8 @@ const WRAPPER_GAP = 200
 
 export function ExperimentDesigner() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedEnvId = searchParams.get('env')
   const { data: envData, isLoading: envsLoading } = useEnvironments()
   const { data: wrapperData } = useWrappers()
   const { data: algoData } = useAlgorithms()
@@ -47,17 +50,35 @@ export function ExperimentDesigner() {
 
   const selectedEnv = environments.find((e) => e.id === environmentId)
   const kind: EnvKind = selectedEnv?.kind ?? 'gym'
-  const compatibleAlgorithms = allAlgorithms.filter(
-    (a) => a.kind === kind && (!selectedEnv || selectedEnv.compatible_algorithms.includes(a.id)),
-  )
+  const compatibleAlgorithms = allAlgorithms.filter((a) => {
+    if (a.kind !== kind) return false
+    if (!a.is_custom) return !selectedEnv || selectedEnv.compatible_algorithms.includes(a.id)
+    // Custom algorithms don't appear in any built-in env's compatible_algorithms
+    // list — for the Gym track, match on action kind instead (declared by the
+    // plugin's SUPPORTED_ACTION_KINDS); AlphaZero board games have no action
+    // kind concept, so custom AlphaZero trainers are always considered compatible.
+    if (a.kind === 'gym') {
+      return !selectedEnv || !a.supported_action_kinds || a.supported_action_kinds.includes(selectedEnv.action_kind)
+    }
+    return true
+  })
 
-  // Auto-pick a sensible default env/algorithm once the catalog loads.
+  // Auto-pick a default env once the catalog loads — prefer whatever was
+  // requested from the Environments gallery ("Использовать в дизайнере"),
+  // falling back to the first available one otherwise.
   useEffect(() => {
     if (!environmentId && environments.length > 0) {
-      const first = environments.find((e) => e.available) ?? environments[0]
+      const requested = requestedEnvId ? environments.find((e) => e.id === requestedEnvId) : undefined
+      const first = requested ?? environments.find((e) => e.available) ?? environments[0]
       setEnvironmentId(first.id)
+      if (requestedEnvId) {
+        setSearchParams((prev) => {
+          prev.delete('env')
+          return prev
+        }, { replace: true })
+      }
     }
-  }, [environments, environmentId])
+  }, [environments, environmentId, requestedEnvId, setSearchParams])
 
   useEffect(() => {
     if (compatibleAlgorithms.length > 0 && !compatibleAlgorithms.some((a) => a.id === algorithmId)) {
@@ -102,6 +123,17 @@ export function ExperimentDesigner() {
     },
     [wrapperCatalog],
   )
+
+  const inspectPayload = useMemo(() => {
+    if (!environmentId || !algorithmId) return null
+    return {
+      kind,
+      environment: { id: environmentId, wrappers: kind === 'gym' ? wrappers : undefined },
+      algorithm: { id: algorithmId, hyperparams },
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environmentId, algorithmId, kind, JSON.stringify(wrappers), JSON.stringify(hyperparams)])
+  const { data: inspectData, isFetching: inspectFetching } = useInspectDesign(inspectPayload)
 
   const canRun = !!environmentId && !!algorithmId && !starting
 
@@ -235,6 +267,7 @@ export function ExperimentDesigner() {
           </Button>
         )}
       </div>
+      <InspectPanel data={inspectData} isFetching={inspectFetching} />
       <ReactFlow
         nodes={nodes}
         edges={edges}

@@ -11,6 +11,7 @@ import {
   Archive,
   Settings,
   Activity,
+  Puzzle,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { useDockerStore } from '@/stores/dockerStore'
@@ -23,6 +24,7 @@ const navItems = [
   { path: '/environments', icon: Boxes, labelKey: 'nav.environments' },
   { path: '/arena', icon: Swords, labelKey: 'nav.arena' },
   { path: '/models', icon: Archive, labelKey: 'nav.models' },
+  { path: '/plugins', icon: Puzzle, labelKey: 'nav.plugins' },
   { path: '/settings', icon: Settings, labelKey: 'nav.settings' },
 ]
 
@@ -45,9 +47,9 @@ export function Sidebar() {
             file:// loadFile(), not the app's own dist folder — same class of
             bug as BrowserRouter. Importing it lets Vite rewrite the URL
             relative to the app, like it already does for JS/CSS. */}
-        <img src={appIcon} alt="RL Studio" className="h-8 w-8 rounded-lg" />
+        <img src={appIcon} alt="Reinforcement Studio" className="h-8 w-8 rounded-lg" />
         <div className="flex flex-col">
-          <span className="text-sm font-semibold">RL Studio</span>
+          <span className="text-sm font-semibold">Reinforcement Studio</span>
           <span className="text-[10px] text-muted-foreground">Reinforcement Learning Lab</span>
         </div>
       </div>

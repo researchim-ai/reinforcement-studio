@@ -22,7 +22,7 @@ export function Dashboard() {
   return (
     <div className="mx-auto max-w-6xl space-y-8 p-8">
       <div className="space-y-1">
-        <h2 className="text-2xl font-semibold">Добро пожаловать в RL Studio</h2>
+        <h2 className="text-2xl font-semibold">Добро пожаловать в Reinforcement Studio</h2>
         <p className="text-sm text-muted-foreground">
           Локальная лаборатория для reinforcement learning: классика на Gymnasium (DQN/PPO/A2C) и
           AlphaZero self-play для настольных игр — без единой строчки кода.

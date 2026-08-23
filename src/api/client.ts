@@ -2,12 +2,18 @@ import type {
   AlgorithmSpec,
   ArenaState,
   ArenaOpponent,
+  EnvKind,
   EnvSpec,
   ExperimentConfig,
   GameInfo,
+  InspectResult,
   ModelInfo,
+  PluginKind,
+  PluginScriptMeta,
+  PluginTemplate,
   RunSummary,
   SystemInfo,
+  ValidateResult,
   WrapperSpec,
 } from './types'
 
@@ -62,6 +68,11 @@ export const api = {
   listEnvironments: () => request<{ environments: EnvSpec[] }>('/environments/list'),
   listWrappers: () => request<{ wrappers: WrapperSpec[] }>('/environments/wrappers'),
   listAlgorithms: () => request<{ algorithms: AlgorithmSpec[] }>('/environments/algorithms'),
+  inspectDesign: (payload: {
+    kind: EnvKind
+    environment: { id: string; wrappers?: { type: string; params: Record<string, number | string> }[] }
+    algorithm: { id: string; hyperparams: Record<string, number> }
+  }) => request<InspectResult>('/environments/inspect', { method: 'POST', body: JSON.stringify(payload) }),
   resolveUrl: async (path: string) => {
     const base = await basePromise
     return `${base}${path.startsWith('/') ? path : `/${path}`}`
@@ -109,6 +120,17 @@ export const api = {
     }),
   deleteArenaSession: (sessionId: string) =>
     request<{ success: boolean }>(`/alphazero/session/${sessionId}`, { method: 'DELETE' }),
+
+  listPluginTemplates: () => request<{ templates: PluginTemplate[] }>('/plugins/templates'),
+  listPluginScripts: (kind: PluginKind) => request<{ scripts: PluginScriptMeta[] }>(`/plugins/${kind}`),
+  getPluginScript: (kind: PluginKind, slug: string) =>
+    request<{ slug: string; code: string }>(`/plugins/${kind}/${slug}`),
+  savePluginScript: (kind: PluginKind, slug: string, code: string) =>
+    request<{ success: boolean }>(`/plugins/${kind}/${slug}`, { method: 'PUT', body: JSON.stringify({ code }) }),
+  deletePluginScript: (kind: PluginKind, slug: string) =>
+    request<{ success: boolean }>(`/plugins/${kind}/${slug}`, { method: 'DELETE' }),
+  validatePluginScript: (kind: PluginKind, slug: string, code: string) =>
+    request<ValidateResult>(`/plugins/${kind}/${slug}/validate`, { method: 'POST', body: JSON.stringify({ code }) }),
 }
 
 export function createMetricsWebSocket(

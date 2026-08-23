@@ -1,14 +1,24 @@
 """Environment/wrapper/algorithm catalogs consumed by the Experiment Designer."""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from rl_core.envs.previews import preview_media_type, resolve_preview_file
 from rl_core.envs.registry import list_environments
 from rl_core.envs.wrappers import WRAPPER_CATALOG
+from rl_core.plugins import loader as plugin_loader
 
 router = APIRouter()
+
+
+class InspectRequest(BaseModel):
+    kind: str = "gym"  # "gym" | "alphazero"
+    environment: dict[str, Any] = {}
+    algorithm: dict[str, Any] = {}
 
 ALGORITHM_CATALOG = [
     {
@@ -76,7 +86,15 @@ async def list_envs():
 
 @router.get("/preview")
 async def env_preview(id: str = Query(..., min_length=1), thumb: bool = False):
-    path = resolve_preview_file(id, thumb=thumb)
+    # resolve_preview_file() does a blocking network download (urllib) on a
+    # cache miss (first time a given env's GIF is requested) — off the event
+    # loop, or that one download stalls every other request (including
+    # other envs' already-cached previews and WS metric traffic) for as
+    # long as it takes, which reads to the user as random images failing to
+    # load / flickering in and out.
+    from starlette.concurrency import run_in_threadpool
+
+    path = await run_in_threadpool(resolve_preview_file, id, thumb=thumb)
     if path is None:
         raise HTTPException(status_code=404, detail=f"No preview for {id}")
     return FileResponse(
@@ -86,11 +104,69 @@ async def env_preview(id: str = Query(..., min_length=1), thumb: bool = False):
     )
 
 
+def _custom_algorithm_entries() -> list[dict]:
+    """Custom Gym/AlphaZero algorithm plugins (see backend/routes/plugins.py),
+    surfaced alongside the built-ins with `is_custom: true` so the
+    Experiment Designer can pick them up without any UI logic changes."""
+    entries: list[dict] = []
+    for slug in plugin_loader.list_gym_algorithm_slugs():
+        try:
+            entries.append(plugin_loader.gym_algorithm_meta(slug))
+        except Exception:
+            continue  # broken plugin file — hidden from the catalog, still editable via /api/plugins
+    for slug in plugin_loader.list_alphazero_trainer_slugs():
+        try:
+            entries.append(plugin_loader.alphazero_trainer_meta(slug))
+        except Exception:
+            continue
+    return entries
+
+
+def _custom_wrapper_entries() -> list[dict]:
+    """One wrapper-catalog entry per custom reward-function plugin. The type
+    encodes the slug directly (`custom_reward:<slug>`) so several custom
+    reward scripts don't collide on the same <select> value in the
+    Designer's WrapperNode."""
+    entries: list[dict] = []
+    for slug in plugin_loader.list_reward_fn_slugs():
+        try:
+            meta = plugin_loader.reward_fn_meta(slug)
+        except Exception:
+            continue
+        entries.append({
+            "type": f"custom_reward:{slug}",
+            "label": f"Custom reward: {meta['name']}",
+            "params": {"script_id": slug},
+            "is_custom": True,
+        })
+    return entries
+
+
 @router.get("/wrappers")
 async def list_wrappers():
-    return {"wrappers": WRAPPER_CATALOG}
+    return {"wrappers": WRAPPER_CATALOG + _custom_wrapper_entries()}
 
 
 @router.get("/algorithms")
 async def list_algorithms():
-    return {"algorithms": ALGORITHM_CATALOG}
+    return {"algorithms": ALGORITHM_CATALOG + _custom_algorithm_entries()}
+
+
+@router.post("/inspect")
+async def inspect(req: InspectRequest):
+    """Live env/network preview for the Experiment Designer — builds the
+    (wrapped) env and the algorithm's network with the current selection,
+    without running any training, so the UI can show input/output dims,
+    layer summary and parameter count while the user is still designing."""
+    from rl_core import inspect as inspect_core
+
+    env_id = req.environment.get("id")
+    if not env_id:
+        raise HTTPException(status_code=400, detail="environment.id is required")
+    algo_id = req.algorithm.get("id", "ppo")
+    hyperparams = req.algorithm.get("hyperparams") or {}
+
+    if req.kind == "alphazero":
+        return inspect_core.inspect_alphazero(env_id, algo_id, hyperparams)
+    wrapper_specs = req.environment.get("wrappers") or []
+    return inspect_core.inspect_gym(env_id, wrapper_specs, algo_id, hyperparams)

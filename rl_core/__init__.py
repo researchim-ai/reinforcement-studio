@@ -1,4 +1,4 @@
-"""RL Studio core — environments, algorithms and AlphaZero self-play engine.
+"""Reinforcement Studio core — environments, algorithms and AlphaZero self-play engine.
 
 This package is pure Python/PyTorch and has no dependency on the desktop
 app or the FastAPI layer. The backend calls into it directly (native mode)
