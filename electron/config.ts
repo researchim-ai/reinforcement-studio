@@ -8,12 +8,26 @@ export interface AppConfig {
   backendMode: BackendMode
   dockerAutoBuild: boolean
   dockerGpu: boolean
+  // Native mode counterpart to dockerGpu: makes the app's private venv
+  // install rl_core/requirements-gpu.txt (CUDA torch) instead of the default
+  // CPU-only requirements.txt. Requires a backend restart to take effect —
+  // see startBackendNative(), which picks the requirements file from this.
+  nativeGpu: boolean
+  // Gates the CPU/GPU picker shown on first launch (see main.ts's
+  // app.whenReady()) — false means "haven't asked yet", so we show the
+  // picker instead of silently starting an install. Flips to true as soon
+  // as the user picks either option; from then on this app behaves exactly
+  // like before (auto-starts on launch, Settings has the same two toggles
+  // for changing your mind later).
+  setupComplete: boolean
 }
 
 const DEFAULT_CONFIG: AppConfig = {
   backendMode: 'auto',
   dockerAutoBuild: true,
   dockerGpu: false,
+  nativeGpu: false,
+  setupComplete: false,
 }
 
 function configPath(): string {

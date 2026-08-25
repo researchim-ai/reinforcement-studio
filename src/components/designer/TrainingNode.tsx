@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Rocket, Loader2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -23,7 +24,9 @@ export interface TrainingNodeData {
   onRun: () => void
 }
 
-export function TrainingNode({ data }: NodeProps & { data: TrainingNodeData }) {
+// See AlgorithmNode.tsx for why this is memoized against `data` only —
+// otherwise the node re-renders (and visibly flickers) on every drag frame.
+export const TrainingNode = memo(function TrainingNode({ data }: NodeProps & { data: TrainingNodeData }) {
   return (
     <div className="w-72 rounded-xl border border-border bg-card shadow-md">
       <div className="flex items-center gap-2 rounded-t-xl border-b border-border bg-success/10 px-3 py-2">
@@ -83,6 +86,11 @@ export function TrainingNode({ data }: NodeProps & { data: TrainingNodeData }) {
           <Label className="text-[11px] text-muted-foreground">Использовать GPU</Label>
           <Switch checked={data.useGpu} onCheckedChange={data.onChangeUseGpu} />
         </div>
+        {data.useGpu && (
+          <p className="text-[10px] text-muted-foreground/60">
+            Нужна CUDA-версия PyTorch — включите GPU в Настройках (Settings), иначе прогон тихо пойдёт на CPU.
+          </p>
+        )}
 
         <Button className="w-full" size="sm" onClick={data.onRun} disabled={data.disabled || data.starting}>
           {data.starting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
@@ -92,4 +100,4 @@ export function TrainingNode({ data }: NodeProps & { data: TrainingNodeData }) {
       <Handle type="target" position={Position.Left} className="!bg-success" />
     </div>
   )
-}
+}, (prev, next) => prev.data === next.data)

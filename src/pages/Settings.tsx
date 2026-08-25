@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Loader2, FileText, Container, RefreshCw } from 'lucide-react'
+import { Loader2, FileText, Container, RefreshCw, Cpu } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,7 +17,7 @@ const MODES = [
 
 export function SettingsPage() {
   const {
-    config, backendMode, backendPort, loadConfig, setBackendMode, setDockerGpu, restartBackend,
+    config, backendMode, backendPort, loadConfig, setBackendMode, setDockerGpu, setNativeGpu, restartBackend,
   } = useDockerStore()
   const { data: sysInfo } = useSystemInfo()
   const [version, setVersion] = useState<string>('')
@@ -71,11 +71,34 @@ export function SettingsPage() {
               <Container className="h-4 w-4 text-muted-foreground" />
               <div>
                 <div className="text-sm font-medium">GPU в Docker</div>
-                <div className="text-xs text-muted-foreground">Передавать --gpus all в контейнер (нужен NVIDIA Container Toolkit)</div>
+                <div className="text-xs text-muted-foreground">
+                  Собрать образ на CUDA-версии PyTorch и передавать --gpus all в контейнер (нужны драйвер NVIDIA на хосте
+                  и NVIDIA Container Toolkit). После включения нажмите «Перезапустить backend» — образ пересоберётся.
+                </div>
               </div>
             </div>
             <Switch checked={config?.dockerGpu ?? false} onCheckedChange={setDockerGpu} />
           </div>
+
+          <div className="flex items-center justify-between rounded-lg border border-border p-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="h-4 w-4 text-muted-foreground" />
+              <div>
+                <div className="text-sm font-medium">GPU в Native-режиме</div>
+                <div className="text-xs text-muted-foreground">
+                  Поставить в приватное окружение CUDA-версию PyTorch вместо CPU-версии (нужен GPU NVIDIA и его драйвер).
+                  Переключение сразу перезапускает backend и переустанавливает зависимости — это может занять пару минут.
+                </div>
+              </div>
+            </div>
+            <Switch checked={config?.nativeGpu ?? false} onCheckedChange={setNativeGpu} />
+          </div>
+
+          <p className="text-xs text-muted-foreground/70">
+            Обучение по умолчанию идёт на CPU — большинство сред и AlphaZero на маленьких досках в этом не нуждаются, а GPU
+            иногда даже медленнее из-за накладных расходов на маленьких сетях. Включайте GPU для тяжёлых прогонов
+            (self-play на больших досках, Atari/MuJoCo с CNN). Ниже видно, доступна ли CUDA прямо сейчас.
+          </p>
 
           <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={handleRestart} disabled={restarting}>
@@ -98,8 +121,34 @@ export function SettingsPage() {
           <InfoRow label="Платформа" value={platform || sysInfo?.platform || '—'} />
           <InfoRow label="CPU cores" value={String(sysInfo?.cpu_count ?? '—')} />
           <InfoRow label="CUDA" value={sysInfo?.torch_cuda_available ? 'доступна' : 'нет'} />
+          <InfoRow label="PyTorch" value={sysInfo?.torch_version ?? '—'} />
+          <InfoRow label="Собран с CUDA" value={sysInfo?.torch_cuda_build ? `да (${sysInfo.torch_cuda_build})` : 'нет (CPU-версия)'} />
         </CardContent>
       </Card>
+
+      {sysInfo?.gpus && sysInfo.gpus.length > 0 && !sysInfo.torch_cuda_available && (
+        <Card className="border-destructive/40">
+          <CardHeader>
+            <CardTitle className="text-sm text-destructive">GPU видны, но CUDA не работает</CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-muted-foreground space-y-1">
+            {sysInfo.torch_cuda_build ? (
+              <p>
+                Установлен CUDA-билд PyTorch ({sysInfo.torch_version}, cuda {sysInfo.torch_cuda_build}), но он не видит
+                видеокарту — скорее всего дело в драйвере NVIDIA на этой машине (слишком старый/не установлен, или backend
+                в Docker-контейнере без реального доступа к GPU). Проверьте <code>nvidia-smi</code> вне приложения и,
+                если backend в Docker, что NVIDIA Container Toolkit настроен и виден демону Docker.
+              </p>
+            ) : (
+              <p>
+                Установлена CPU-версия PyTorch ({sysInfo.torch_version ?? '?'}), хотя переключатель GPU выше включён —
+                установка либо ещё не завершилась (нажмите «Перезапустить backend» и дайте пару минут на пересборку),
+                либо не смогла подтянуть CUDA-версию. Проверьте логи (кнопка «Логи» выше) на ошибки pip/сборки образа.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {sysInfo?.gpus && sysInfo.gpus.length > 0 && (
         <Card>

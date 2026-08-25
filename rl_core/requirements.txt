@@ -1,8 +1,9 @@
 # CPU-only PyTorch wheels: this app targets small models (classic control,
 # AlphaZero on tiny boards) where CUDA isn't needed, and the CPU wheel is a
 # fraction of the size of the default CUDA-bundled build — much faster to
-# install for the typical desktop user. GPU users can still install a
-# CUDA build of torch manually into the app's venv if they need it.
+# install for the typical desktop user. GPU users can flip the "GPU" switch
+# in Settings instead, which installs from requirements-gpu.txt (CUDA build)
+# and applies to this same env.
 # (--index-url replaces the default so torch resolves to the CPU wheel;
 # --extra-index-url falls back to PyPI for every other package below.)
 --index-url https://download.pytorch.org/whl/cpu

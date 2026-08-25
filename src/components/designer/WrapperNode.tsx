@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Layers, X } from 'lucide-react'
 import { Select } from '@/components/ui/select'
@@ -12,7 +13,9 @@ export interface WrapperNodeData {
   onRemove: () => void
 }
 
-export function WrapperNode({ data }: NodeProps & { data: WrapperNodeData }) {
+// See AlgorithmNode.tsx for why this is memoized against `data` only —
+// otherwise the node re-renders (and visibly flickers) on every drag frame.
+export const WrapperNode = memo(function WrapperNode({ data }: NodeProps & { data: WrapperNodeData }) {
   const spec = data.catalog.find((w) => w.type === data.type)
 
   return (
@@ -46,4 +49,4 @@ export function WrapperNode({ data }: NodeProps & { data: WrapperNodeData }) {
       <Handle type="source" position={Position.Right} className="!bg-muted-foreground" />
     </div>
   )
-}
+}, (prev, next) => prev.data === next.data)

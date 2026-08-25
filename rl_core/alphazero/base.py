@@ -27,6 +27,7 @@ from rl_core.alphazero.checkpoint import save_checkpoint
 from rl_core.alphazero.network import AlphaZeroNet
 from rl_core.alphazero.self_play import play_self_play_game
 from rl_core.games.base import BoardGame
+from rl_core.netbuilder import SpecAlphaZeroNet
 
 DEFAULT_HYPERPARAMS = {
     "num_simulations": 25,
@@ -49,10 +50,13 @@ class AlphaZeroTrainer(ABC):
 
     Required override: `run_iteration(iteration)` -> a dict of extra metrics
     to merge into that iteration's snapshot (`loss`, `win_rate_vs_prev`,
-    `board`, ... — whatever keys you want surfaced on the Training Monitor
-    page). Include a `"_self_play_records"` key (a list of move-history
-    dicts) if you want games viewable on the AlphaZero Arena replay page —
-    the driver strips this key out before writing metrics.json.
+    `board_history`, ... — whatever keys you want surfaced on the Training
+    Monitor page). `board_history` (a list of board matrices, one per move)
+    lets the Monitor replay a whole game move by move instead of a single
+    freeze-frame — `play_self_play_game` already returns one per record.
+    Include a `"_self_play_records"` key (a list of move-history dicts) if
+    you want games viewable on the AlphaZero Arena replay page — the driver
+    strips this key out before writing metrics.json.
 
     Optional override: `build_network()` if you only want to swap the
     network architecture and keep self-play/MCTS/arena-gating as-is — see
@@ -69,12 +73,19 @@ class AlphaZeroTrainer(ABC):
         self.net.to(device)
 
     def build_network(self) -> nn.Module:
-        """Default: the built-in small dual-head conv net. Override to plug
-        in a different architecture — must expose `.rows`, `.cols`,
-        `.action_size` attributes (for checkpointing) and a
+        """Default: the built-in small dual-head conv net, unless
+        `hyperparams["network_spec"]` was set (a hand-designed architecture
+        picked in the Designer, resolved by `rl_core.netbuilder_store` before
+        the trainer is constructed) — then a `SpecAlphaZeroNet` built from
+        that spec is used instead. Override to plug in a different
+        architecture entirely — must expose `.rows`, `.cols`, `.action_size`
+        attributes (for checkpointing) and a
         `predict(encoded_state, device) -> (policy_probs, value)` method
         (used by MCTS)."""
         g = self.sample_game
+        network_spec = self.hp.get("network_spec")
+        if network_spec:
+            return SpecAlphaZeroNet(g.rows, g.cols, g.action_size, network_spec)
         return AlphaZeroNet(g.rows, g.cols, g.action_size, self.hp["channels"], self.hp["num_blocks"])
 
     @abstractmethod
@@ -90,7 +101,7 @@ class AlphaZeroTrainer(ABC):
     @property
     def network_info(self) -> dict[str, Any]:
         g = self.sample_game
-        return {
+        info: dict[str, Any] = {
             "channels": self.hp.get("channels"),
             "num_blocks": self.hp.get("num_blocks"),
             "rows": g.rows,
@@ -98,6 +109,9 @@ class AlphaZeroTrainer(ABC):
             "action_size": g.action_size,
             "input_planes": 3,
         }
+        if self.hp.get("network_spec"):
+            info["network_spec"] = self.hp["network_spec"]
+        return info
 
 
 class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
@@ -184,7 +198,11 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
             "win_rate_vs_prev": round(win_rate, 3),
             "accepted": accepted,
             "arena": match,
-            "board": last_game["final_board"] if last_game else None,
+            # Full move-by-move board history of one game from this
+            # iteration (not just the final position) — the Training
+            # Monitor replays it move by move instead of showing a single
+            # disconnected freeze-frame per iteration.
+            "board_history": last_game["board_history"] if last_game else None,
             "board_winner": last_game["winner"] if last_game else None,
             "buffer_size": len(self.replay_buffer),
             "_self_play_records": iteration_records,

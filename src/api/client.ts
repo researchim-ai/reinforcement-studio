@@ -8,6 +8,11 @@ import type {
   GameInfo,
   InspectResult,
   ModelInfo,
+  NetworkDoc,
+  NetworkFamilyInfo,
+  NetworkMeta,
+  NetworkPreviewRequest,
+  NetworkPreviewResult,
   PluginKind,
   PluginScriptMeta,
   PluginTemplate,
@@ -131,6 +136,15 @@ export const api = {
     request<{ success: boolean }>(`/plugins/${kind}/${slug}`, { method: 'DELETE' }),
   validatePluginScript: (kind: PluginKind, slug: string, code: string) =>
     request<ValidateResult>(`/plugins/${kind}/${slug}/validate`, { method: 'POST', body: JSON.stringify({ code }) }),
+
+  listNetworkFamilies: () => request<{ families: NetworkFamilyInfo[] }>('/networks/families'),
+  listNetworks: () => request<{ networks: NetworkMeta[] }>('/networks'),
+  getNetwork: (slug: string) => request<{ slug: string } & NetworkDoc>(`/networks/${slug}`),
+  saveNetwork: (slug: string, doc: NetworkDoc) =>
+    request<{ success: boolean }>(`/networks/${slug}`, { method: 'PUT', body: JSON.stringify(doc) }),
+  deleteNetwork: (slug: string) => request<{ success: boolean }>(`/networks/${slug}`, { method: 'DELETE' }),
+  previewNetwork: (payload: NetworkPreviewRequest) =>
+    request<NetworkPreviewResult>('/networks/preview', { method: 'POST', body: JSON.stringify(payload) }),
 }
 
 export function createMetricsWebSocket(

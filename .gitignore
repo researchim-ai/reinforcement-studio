@@ -12,6 +12,7 @@ rl_core/checkpoints/
 rl_core/previews/
 rl_core/custom_algorithms/
 rl_core/custom_rewards/
+rl_core/custom_networks/
 
 # Reference project kept locally for inspiration, not part of this app
 /models-at-home-studio/
@@ -26,7 +27,10 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+# NOT ignoring build/ — this project has no setup.py/pyproject.toml that would
+# ever produce a Python build/ dir here, and electron-builder's buildResources
+# (icons, afterPack.cjs, deb-after-install.sh) deliberately live in ./build/
+# and must be tracked, or packaged installers ship with no icon on a fresh clone.
 develop-eggs/
 dist/
 downloads/

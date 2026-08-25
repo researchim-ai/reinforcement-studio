@@ -28,8 +28,15 @@ CHECKPOINTS_DIR = ROOT / "checkpoints"
 CUSTOM_GYM_ALGOS_DIR = ROOT / "custom_algorithms" / "gym"
 CUSTOM_ALPHAZERO_ALGOS_DIR = ROOT / "custom_algorithms" / "alphazero"
 CUSTOM_REWARDS_DIR = ROOT / "custom_rewards"
+# Saved architectures from the visual Network Architecture Builder
+# (/network-builder) — plain JSON (a layer spec), not code, since the actual
+# nn.Module only gets built at train time by rl_core/netbuilder.py.
+CUSTOM_NETWORKS_DIR = ROOT / "custom_networks"
 
-for _d in (RUNS_DIR, CHECKPOINTS_DIR, CUSTOM_GYM_ALGOS_DIR, CUSTOM_ALPHAZERO_ALGOS_DIR, CUSTOM_REWARDS_DIR):
+for _d in (
+    RUNS_DIR, CHECKPOINTS_DIR, CUSTOM_GYM_ALGOS_DIR, CUSTOM_ALPHAZERO_ALGOS_DIR, CUSTOM_REWARDS_DIR,
+    CUSTOM_NETWORKS_DIR,
+):
     _d.mkdir(parents=True, exist_ok=True)
 
 

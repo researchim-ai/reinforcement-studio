@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useRuns } from '@/api/hooks'
 import { api, createMetricsWebSocket } from '@/api/client'
+import { AlgorithmDiagram, type AlgorithmDiagramNetwork } from '@/components/AlgorithmDiagram'
 import type { MetricsSnapshot, SpaceInfo } from '@/api/types'
 import { cn, formatDuration } from '@/lib/utils'
 
@@ -94,22 +95,24 @@ export function TrainingMonitor() {
   const latest = history[history.length - 1] ?? (selectedRun?.metrics as MetricsSnapshot | undefined)
   const isAlphaZero = latest?.kind === 'alphazero' || selectedRun?.kind === 'alphazero'
 
-  // The backend only renders a fresh frame/board every couple thousand
-  // steps (rendering is expensive) — most metrics snapshots simply omit
-  // `frame_base64`/`board`. Reading those straight off `latest` made the
-  // "Живой просмотр среды" card mount/unmount on every snapshot that
-  // lacked them, i.e. exactly the "то исчезает то появляется" flicker.
-  // Instead, carry the last non-empty one forward until a newer one shows up.
-  const { lastFrame, lastBoard, lastBoardWinner } = useMemo(() => {
-    let frame = selectedRun?.metrics?.frame_base64
-    let board = selectedRun?.metrics?.board
+  // The backend only records a fresh episode/game every couple thousand
+  // steps (rendering + encoding is expensive) — most metrics snapshots
+  // simply omit `episode_gif_base64`/`board_history`. Reading those straight
+  // off `latest` made the "Живой просмотр среды" card mount/unmount on every
+  // snapshot that lacked them, i.e. exactly the "то исчезает то появляется"
+  // flicker. Instead, carry the last non-empty one forward until a newer
+  // one shows up — the GIF/board-replay component below then plays that
+  // whole recorded episode/game on a loop until it's replaced.
+  const { lastGif, lastBoardHistory, lastBoardWinner } = useMemo(() => {
+    let gif = selectedRun?.metrics?.episode_gif_base64
+    let boardHistory = selectedRun?.metrics?.board_history
     let boardWinner = selectedRun?.metrics?.board_winner
     for (const snap of history) {
-      if (snap.frame_base64) frame = snap.frame_base64
-      if (snap.board) board = snap.board
+      if (snap.episode_gif_base64) gif = snap.episode_gif_base64
+      if (snap.board_history) boardHistory = snap.board_history
       if (snap.board_winner != null) boardWinner = snap.board_winner
     }
-    return { lastFrame: frame, lastBoard: board, lastBoardWinner: boardWinner }
+    return { lastGif: gif, lastBoardHistory: boardHistory, lastBoardWinner: boardWinner }
   }, [history, selectedRun])
 
   return (
@@ -195,30 +198,66 @@ export function TrainingMonitor() {
               <StatCard label="Время" value={latest?.elapsed_seconds ? formatDuration(latest.elapsed_seconds) : '—'} />
             </div>
 
-            {((!isAlphaZero && lastFrame) || (isAlphaZero && lastBoard)) && (
+            {!isAlphaZero && (
+              latest?.exploration_epsilon != null
+              || latest?.rnd_bonus_mean != null
+              || latest?.rnd_predictor_loss != null
+            ) && (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                {latest?.exploration_epsilon != null && Number(latest.hyperparams?.action_exploration ?? 0) === 0 && (
+                  <StatCard label="Текущий ε" value={latest.exploration_epsilon.toFixed(3)} />
+                )}
+                {latest?.episode_extrinsic_reward_mean != null && (
+                  <StatCard label="Extrinsic reward" value={latest.episode_extrinsic_reward_mean.toFixed(2)} />
+                )}
+                {latest?.episode_intrinsic_reward_mean != null && (
+                  <StatCard label="Intrinsic reward" value={latest.episode_intrinsic_reward_mean.toFixed(2)} />
+                )}
+                {latest?.rnd_predictor_loss != null && latest.rnd_predictor_loss > 0 && (
+                  <StatCard label="RND predictor loss" value={latest.rnd_predictor_loss.toFixed(4)} />
+                )}
+              </div>
+            )}
+
+            {((!isAlphaZero && lastGif) || (isAlphaZero && lastBoardHistory && lastBoardHistory.length > 0)) && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Живой просмотр среды</CardTitle>
+                  <p className="text-xs text-muted-foreground">
+                    {isAlphaZero
+                      ? 'Самая свежая self-play партия: проигрывается один раз и остаётся на финальной позиции до следующей итерации.'
+                      : 'Самый свежий записанный эпизод: проигрывается один раз и остаётся на финальном кадре до следующей записи.'}
+                  </p>
                 </CardHeader>
                 <CardContent className="flex flex-col items-center gap-2">
-                  {!isAlphaZero && lastFrame && (
+                  {!isAlphaZero && lastGif && (
                     <img
-                      src={`data:image/png;base64,${lastFrame}`}
-                      alt="env frame"
+                      key={lastGif.slice(0, 32)}
+                      src={`data:image/gif;base64,${lastGif}`}
+                      alt="env episode replay"
                       className="max-h-64 rounded-lg border border-border"
                     />
                   )}
-                  {isAlphaZero && lastBoard && <BoardPreview board={lastBoard} />}
-                  {isAlphaZero && lastBoardWinner != null && (
-                    <p className="text-xs text-muted-foreground">
-                      Последняя self-play партия итерации: {
-                        lastBoardWinner === 0 ? 'ничья' : `победил игрок ${lastBoardWinner === 1 ? '●' : '○'}`
-                      }
-                    </p>
+                  {isAlphaZero && lastBoardHistory && lastBoardHistory.length > 0 && (
+                    <BoardReplay history={lastBoardHistory} winner={lastBoardWinner} />
                   )}
                 </CardContent>
               </Card>
             )}
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm">Схема алгоритма</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <AlgorithmDiagram
+                  algorithmId={selectedRun.algorithm_id}
+                  kind={latest?.kind ?? selectedRun.kind}
+                  hyperparams={latest?.hyperparams}
+                  network={buildDiagramNetwork(latest)}
+                />
+              </CardContent>
+            </Card>
 
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               {latest?.hyperparams && Object.keys(latest.hyperparams).length > 0 && (
@@ -262,7 +301,7 @@ export function TrainingMonitor() {
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm">
-                  {isAlphaZero ? 'Win-rate по итерациям' : 'Награда по шагам'}
+                  {isAlphaZero ? 'Win-rate по итерациям' : 'Награда по шагам (реальная и intrinsic отдельно)'}
                 </CardTitle>
               </CardHeader>
               <CardContent className="h-64">
@@ -282,7 +321,11 @@ export function TrainingMonitor() {
                       {isAlphaZero ? (
                         <Line type="monotone" dataKey="win_rate_vs_prev" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} />
                       ) : (
-                        <Line type="monotone" dataKey="episode_reward_mean" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} />
+                        <>
+                          <Line name="Суммарная" type="monotone" dataKey="episode_reward_mean" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} />
+                          <Line name="Extrinsic" type="monotone" dataKey="episode_extrinsic_reward_mean" stroke="oklch(0.72 0.16 145)" dot={false} strokeWidth={1.5} connectNulls />
+                          <Line name="Intrinsic" type="monotone" dataKey="episode_intrinsic_reward_mean" stroke="oklch(0.72 0.16 55)" dot={false} strokeWidth={1.5} connectNulls />
+                        </>
                       )}
                     </LineChart>
                   </ResponsiveContainer>
@@ -344,8 +387,44 @@ function formatValue(value: unknown): string {
 
 function formatSpace(space?: SpaceInfo): string {
   if (!space) return '—'
-  const shape = space.shape ? `[${space.shape.join(', ')}]` : space.n != null ? `n=${space.n}` : ''
+  // `Discrete` spaces have an empty `shape` ([]) and carry their size in
+  // `n` instead — `space.shape ? ... : ...` treated `[]` as truthy (empty
+  // arrays are truthy in JS) and never fell through to the `n=` branch,
+  // showing a blank "Discrete []" instead of "Discrete n=2".
+  const shape = space.shape && space.shape.length > 0
+    ? `[${space.shape.join(', ')}]`
+    : space.n != null ? `n=${space.n}` : ''
   return `${space.type} ${shape}`.trim()
+}
+
+function spaceToShape(space?: SpaceInfo): number[] | undefined {
+  if (!space) return undefined
+  if (space.shape && space.shape.length > 0) return space.shape
+  if (space.n != null) return [space.n]
+  return undefined
+}
+
+/** Adapts whatever a live run's `MetricsSnapshot` happens to carry (AlphaZero's
+ * `network{}` dims vs. gym runs' flat `layers`/spaces) into the one shape
+ * `AlgorithmDiagram` understands — mirrors the InspectPanel's Designer-side
+ * adapter for the exact same `InspectNetwork` data, just sourced from a live
+ * run instead of a pre-run inspect call. */
+function buildDiagramNetwork(latest: MetricsSnapshot | undefined): AlgorithmDiagramNetwork | null {
+  if (!latest) return null
+  if (latest.total_params == null && !latest.network && !latest.layers?.length) return null
+  return {
+    policy: latest.policy,
+    layers: latest.layers,
+    totalParams: latest.total_params,
+    inputShape: spaceToShape(latest.observation_space),
+    outputShape: spaceToShape(latest.action_space),
+    channels: latest.network?.channels,
+    numBlocks: latest.network?.num_blocks,
+    actionSize: latest.network?.action_size,
+    inputPlanes: latest.network?.input_planes,
+    rows: latest.network?.rows,
+    cols: latest.network?.cols,
+  }
 }
 
 function buildNetworkEntries(latest: MetricsSnapshot): [string, string][] {
@@ -377,6 +456,49 @@ function KeyValueGrid({ entries }: { entries: [string, unknown][] }) {
     </div>
   )
 }
+
+/** Steps through the latest recorded self-play game once and remains on its
+ * final position. A newer game replaces `history` and restarts playback. */
+const BoardReplay = memo(function BoardReplay({ history, winner }: { history: number[][][]; winner: number | null | undefined }) {
+  const [moveIndex, setMoveIndex] = useState(0)
+
+  useEffect(() => {
+    setMoveIndex(0)
+    if (history.length <= 1) return
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout>
+    const scheduleNext = (idx: number) => {
+      const isLast = idx === history.length - 1
+      if (isLast) return
+      timeoutId = setTimeout(() => {
+        if (cancelled) return
+        const next = idx + 1
+        setMoveIndex(next)
+        scheduleNext(next)
+      }, 550)
+    }
+    scheduleNext(0)
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [history])
+
+  const board = history[Math.min(moveIndex, history.length - 1)]
+  const isLastMove = moveIndex === history.length - 1
+
+  return (
+    <div className="flex flex-col items-center gap-2">
+      <BoardPreview board={board} />
+      <p className="text-xs text-muted-foreground">
+        Ход {moveIndex} / {history.length - 1}
+        {isLastMove && winner != null && (
+          winner === 0 ? ' · ничья' : ` · победил игрок ${winner === 1 ? '●' : '○'}`
+        )}
+      </p>
+    </div>
+  )
+})
 
 function BoardPreview({ board }: { board: number[][] }) {
   const cols = board[0]?.length ?? 0

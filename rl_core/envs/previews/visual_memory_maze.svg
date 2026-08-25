@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" width="320" height="180">
+  <rect width="320" height="180" fill="#151520"/>
+  <g fill="#2e2e3a">
+    <rect x="20" y="76" width="230" height="28" />
+    <rect x="250" y="30" width="50" height="28" />
+    <rect x="250" y="122" width="50" height="28" />
+  </g>
+  <rect x="24" y="80" width="26" height="20" rx="3" fill="#4696dc"/>
+  <rect x="264" y="34" width="26" height="20" rx="3" fill="#4696dc"/>
+  <rect x="264" y="126" width="26" height="20" rx="3" fill="#e6963c"/>
+  <circle cx="140" cy="90" r="9" fill="#f0f0f5"/>
+  <g stroke="#818cf8" stroke-width="2" stroke-dasharray="4 4" fill="none">
+    <path d="M 140 90 H 250 M 275 66 V 90 M 275 90 V 122"/>
+  </g>
+  <text x="160" y="20" text-anchor="middle" font-size="14" fill="#a1a1b5" font-family="sans-serif">Подсказка → долгий коридор → выбор</text>
+  <text x="160" y="167" text-anchor="middle" font-size="12" fill="#6f6f85" font-family="sans-serif">Visual Memory Maze</text>
+</svg>

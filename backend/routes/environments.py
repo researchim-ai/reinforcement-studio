@@ -20,6 +20,63 @@ class InspectRequest(BaseModel):
     environment: dict[str, Any] = {}
     algorithm: dict[str, Any] = {}
 
+
+# Shared "memory" hyperparam block for every algorithm that supports an
+# optional LSTM/GRU recurrent core (see rl_core/algorithms/native/networks.py
+# and rl_core.algorithms.native.networks.memory_type_from_hyperparams).
+# `memory_type` is a plain int (0/1/2), not a string, like every other
+# hyperparam in this catalog — `options` is what turns it into a labeled
+# dropdown in the Designer instead of a bare number field (see
+# AlgorithmNode.tsx). Ignored by the algorithm whenever a hand-designed
+# network (Network Builder) is selected instead of the built-in one.
+def _memory_hyperparams(default_seq_len: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "key": "memory_type", "label": "Память (рекуррентность)", "type": "int", "default": 0, "min": 0, "max": 2,
+            "options": [
+                {"value": 0, "label": "Нет (обычная сеть)"},
+                {"value": 1, "label": "LSTM"},
+                {"value": 2, "label": "GRU"},
+            ],
+        },
+        {"key": "memory_hidden_size", "label": "Память: размер hidden state", "type": "int", "default": 128, "min": 8, "max": 512, "visibleWhen": [{"key": "memory_type", "gte": 1}]},
+        {"key": "memory_num_layers", "label": "Память: число слоёв RNN", "type": "int", "default": 1, "min": 1, "max": 3, "visibleWhen": [{"key": "memory_type", "gte": 1}]},
+        {"key": "memory_seq_len", "label": "Память: длина BPTT-последовательности", "type": "int", "default": default_seq_len, "min": 2, "max": 200, "visibleWhen": [{"key": "memory_type", "gte": 1}]},
+    ]
+
+
+def _exploration_hyperparams() -> list[dict[str, Any]]:
+    """Independent action exploration and intrinsic-motivation controls."""
+    epsilon = [{"key": "action_exploration", "eq": 0}]
+    noisy = [{"key": "action_exploration", "eq": 1}]
+    rnd = [{"key": "intrinsic_exploration", "eq": 1}]
+    return [
+        {
+            "key": "action_exploration", "label": "Исследование действий", "type": "int", "default": 0, "min": 0, "max": 1,
+            "options": [
+                {"value": 0, "label": "ε-greedy"},
+                {"value": 1, "label": "NoisyNet (параметрический шум)"},
+            ],
+        },
+        {"key": "exploration_fraction", "label": "ε: доля шагов decay", "type": "float", "default": 0.2, "min": 0.0, "max": 1.0, "visibleWhen": epsilon},
+        {"key": "exploration_initial_eps", "label": "ε: начальное значение", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "visibleWhen": epsilon},
+        {"key": "exploration_final_eps", "label": "ε: конечное значение", "type": "float", "default": 0.05, "min": 0.0, "max": 1.0, "visibleWhen": epsilon},
+        {"key": "noisy_sigma0", "label": "NoisyNet: начальная σ", "type": "float", "default": 0.5, "min": 0.01, "max": 1.0, "visibleWhen": noisy},
+        {
+            "key": "intrinsic_exploration", "label": "Intrinsic motivation", "type": "int", "default": 0, "min": 0, "max": 1,
+            "options": [
+                {"value": 0, "label": "Нет"},
+                {"value": 1, "label": "RND (Random Network Distillation)"},
+            ],
+        },
+        {"key": "rnd_bonus_coef", "label": "RND: коэффициент бонуса", "type": "float", "default": 0.1, "min": 0.0, "max": 10.0, "visibleWhen": rnd},
+        {"key": "rnd_learning_rate", "label": "RND: learning rate", "type": "float", "default": 1e-4, "min": 1e-6, "max": 1e-2, "visibleWhen": rnd},
+        {"key": "rnd_feature_dim", "label": "RND: размер признаков", "type": "int", "default": 128, "min": 8, "max": 512, "visibleWhen": rnd},
+        {"key": "rnd_hidden_dim", "label": "RND: hidden size", "type": "int", "default": 128, "min": 16, "max": 1024, "visibleWhen": rnd},
+        {"key": "rnd_bonus_clip", "label": "RND: clip бонуса", "type": "float", "default": 5.0, "min": 0.1, "max": 100.0, "visibleWhen": rnd},
+    ]
+
+
 ALGORITHM_CATALOG = [
     {
         "id": "dqn",
@@ -31,7 +88,25 @@ ALGORITHM_CATALOG = [
             {"key": "buffer_size", "label": "Replay buffer size", "type": "int", "default": 50_000, "min": 1_000, "max": 1_000_000},
             {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 512},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
-            {"key": "exploration_fraction", "label": "Exploration fraction", "type": "float", "default": 0.2, "min": 0.0, "max": 1.0},
+            *_exploration_hyperparams(),
+            *_memory_hyperparams(default_seq_len=20),
+        ],
+    },
+    {
+        "id": "rainbow_dqn",
+        "name": "Rainbow DQN",
+        "kind": "gym",
+        "description": "DQN + Double Q-learning + Dueling-сеть + Prioritized Replay + n-step — сильнее обычного DQN на тех же дискретных средах.",
+        "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-3, "min": 1e-6, "max": 1e-1},
+            {"key": "buffer_size", "label": "Replay buffer size", "type": "int", "default": 50_000, "min": 1_000, "max": 1_000_000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 512},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
+            {"key": "n_step", "label": "N-step return", "type": "int", "default": 3, "min": 1, "max": 10},
+            {"key": "per_alpha", "label": "PER: приоритет (alpha)", "type": "float", "default": 0.6, "min": 0.0, "max": 1.0},
+            {"key": "per_beta_start", "label": "PER: IS-коррекция (beta start)", "type": "float", "default": 0.4, "min": 0.0, "max": 1.0},
+            *_exploration_hyperparams(),
+            *_memory_hyperparams(default_seq_len=20),
         ],
     },
     {
@@ -45,6 +120,7 @@ ALGORITHM_CATALOG = [
             {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 1024},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.0, "min": 0.0, "max": 0.1},
+            *_memory_hyperparams(default_seq_len=32),
         ],
     },
     {
@@ -57,6 +133,21 @@ ALGORITHM_CATALOG = [
             {"key": "n_steps", "label": "Steps per update", "type": "int", "default": 5, "min": 1, "max": 256},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.01, "min": 0.0, "max": 0.1},
+            *_memory_hyperparams(default_seq_len=32),
+        ],
+    },
+    {
+        "id": "sac",
+        "name": "SAC",
+        "kind": "gym",
+        "description": "Soft Actor-Critic — off-policy метод для непрерывных действий, обычно эффективнее по данным, чем PPO/A2C.",
+        "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
+            {"key": "buffer_size", "label": "Replay buffer size", "type": "int", "default": 100_000, "min": 1_000, "max": 1_000_000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 256, "min": 8, "max": 1024},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
+            {"key": "tau", "label": "Target soft-update (tau)", "type": "float", "default": 0.005, "min": 0.0001, "max": 0.1},
+            {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.2, "min": 0.0, "max": 1.0},
         ],
     },
     {

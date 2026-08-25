@@ -14,6 +14,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   box2d: 'Box2D / Physics',
   mujoco: 'MuJoCo / Robotics',
   atari: 'Atari 2600',
+  pomdp: 'POMDP (нужна память)',
   board_game: 'Настольная игра',
 }
 
@@ -23,7 +24,7 @@ const EXTRA_HINT: Record<string, string> = {
   atari: 'pip install "gymnasium[atari]" && ale-import-roms',
 }
 
-const CATEGORY_ORDER = ['classic_control', 'toy_text', 'box2d', 'mujoco', 'atari', 'board_game']
+const CATEGORY_ORDER = ['classic_control', 'toy_text', 'box2d', 'mujoco', 'atari', 'pomdp', 'board_game']
 
 function EnvPreview({ env }: { env: EnvSpec }) {
   const rootRef = useRef<HTMLDivElement>(null)

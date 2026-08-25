@@ -28,6 +28,7 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any
     payload = torch.load(path, map_location=device, weights_only=False)
     meta = payload.get("meta", {})
     custom_slug = meta.get("custom_trainer_slug")
+    hp = meta.get("hyperparams") or {}
     if custom_slug:
         # Trained by a custom AlphaZero plugin, which may use a custom
         # network architecture — reconstruct it via the same trainer class
@@ -37,10 +38,23 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any
 
         trainer_cls = load_alphazero_trainer(custom_slug)
         game_cls = make_game(meta["game_id"]).__class__
-        trainer = trainer_cls(game_cls, meta.get("hyperparams", {}), device)
+        trainer = trainer_cls(game_cls, hp, device)
         net = trainer.net
+    elif hp.get("network_spec"):
+        # Built-in trainer, but with a hand-designed architecture from the
+        # Network Builder — same deal, reconstruct via the spec rather than
+        # assuming the default AlphaZeroNet.
+        from rl_core.netbuilder import SpecAlphaZeroNet
+
+        net = SpecAlphaZeroNet(payload["rows"], payload["cols"], payload["action_size"], hp["network_spec"])
     else:
-        net = AlphaZeroNet(payload["rows"], payload["cols"], payload["action_size"])
+        # Built-in trainer with the default architecture — respect whatever
+        # channels/num_blocks it was actually trained with (older
+        # checkpoints without `meta.hyperparams` fall back to the defaults).
+        net = AlphaZeroNet(
+            payload["rows"], payload["cols"], payload["action_size"],
+            hp.get("channels", 48), hp.get("num_blocks", 3),
+        )
     net.load_state_dict(payload["state_dict"])
     net.to(device)
     net.eval()

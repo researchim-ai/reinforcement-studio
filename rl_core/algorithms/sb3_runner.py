@@ -12,7 +12,9 @@ from stable_baselines3 import A2C, DQN, PPO
 from stable_baselines3.common.monitor import Monitor
 
 from rl_core.algorithms.metrics_callback import MetricsCallback
+from rl_core.device import resolve_device
 from rl_core.envs.wrappers import apply_wrappers
+from rl_core.inspect import _describe_layers
 
 try:
     import ale_py
@@ -20,6 +22,10 @@ try:
     gym.register_envs(ale_py)
 except ImportError:
     pass
+
+from rl_core.envs.pomdp import register_pomdp_envs  # noqa: E402
+
+register_pomdp_envs()
 
 ALGO_CLASSES = {"ppo": PPO, "dqn": DQN, "a2c": A2C}
 
@@ -84,6 +90,12 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
     wrapper_specs = env_cfg.get("wrappers", [])
     total_timesteps = int(training_cfg.get("total_timesteps", 50_000))
     seed = training_cfg.get("seed")
+    # Explicit, not SB3's own device="auto" default — "auto" picks CUDA
+    # whenever one happens to be present, regardless of the Designer's
+    # "Использовать GPU" toggle, which is opt-in by design (see
+    # rl_core/device.py for why: most built-in envs are tiny enough that a
+    # GPU's launch overhead can make training *slower*, not faster).
+    device = resolve_device(training_cfg)
 
     train_env = Monitor(_make_env(env_id, wrapper_specs))
     if seed is not None:
@@ -91,7 +103,7 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
 
     model_kwargs = _filter_kwargs(algo_cls, hyperparams)
     policy = _policy_for_env(train_env)
-    model = algo_cls(policy, train_env, seed=seed, verbose=0, **model_kwargs)
+    model = algo_cls(policy, train_env, seed=seed, verbose=0, device=device, **model_kwargs)
 
     total_params = sum(p.numel() for p in model.policy.parameters())
     static_info = {
@@ -99,6 +111,7 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
         "device": str(model.device),
         "hyperparams": {**hyperparams, **model_kwargs},
         "total_params": int(total_params),
+        "layers": _describe_layers(model.policy),
         "observation_space": _space_info(train_env.observation_space),
         "action_space": _space_info(train_env.action_space),
         "wrappers": wrapper_specs,

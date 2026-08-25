@@ -16,6 +16,7 @@ from typing import Any
 
 import torch.nn as nn
 
+from rl_core.algorithms.native.exploration.noisy import NoisyLinear
 
 def _find_torch_module(instance: Any) -> nn.Module | None:
     """Best-effort lookup of "the" network on an arbitrary algorithm
@@ -42,12 +43,17 @@ def _describe_layers(module: nn.Module, max_layers: int = 24) -> list[str]:
     for name, m in module.named_modules():
         if name == "" or list(m.children()):
             continue
-        if isinstance(m, nn.Linear):
+        if isinstance(m, NoisyLinear):
+            out.append(f"NoisyLinear({m.in_features}\u2192{m.out_features})")
+        elif isinstance(m, nn.Linear):
             out.append(f"Linear({m.in_features}\u2192{m.out_features})")
         elif isinstance(m, nn.Conv2d):
             k = m.kernel_size[0] if isinstance(m.kernel_size, tuple) else m.kernel_size
             s = m.stride[0] if isinstance(m.stride, tuple) else m.stride
             out.append(f"Conv2d({m.in_channels}\u2192{m.out_channels}, k{k}s{s})")
+        elif isinstance(m, (nn.LSTM, nn.GRU)):
+            kind = "LSTM" if isinstance(m, nn.LSTM) else "GRU"
+            out.append(f"{kind}(hidden={m.hidden_size}, layers={m.num_layers})")
         else:
             out.append(m.__class__.__name__)
         if len(out) >= max_layers:
@@ -131,7 +137,17 @@ def inspect_gym(env_id: str, wrapper_specs: list[dict], algo_id: str, hyperparam
 
 
 def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) -> dict[str, Any]:
-    from rl_core.algorithms.native.networks import ActorCriticNet, QNetwork, policy_name
+    from rl_core.algorithms.native.networks import (
+        ActorCriticNet,
+        DuelingQNetwork,
+        GaussianPolicy,
+        QNetwork,
+        RecurrentActorCriticNet,
+        RecurrentDuelingQNetwork,
+        RecurrentQNetwork,
+        memory_type_from_hyperparams,
+        policy_name,
+    )
 
     io = _io_shapes(env.observation_space, env.action_space)
 
@@ -166,10 +182,39 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
         return {**_network_summary(module, "custom"), **io}
 
     algo_id = (algo_id or "ppo").lower()
+    memory_type = memory_type_from_hyperparams(hyperparams) if algo_id in ("dqn", "rainbow_dqn", "ppo", "a2c") else None
+    noisy_kwargs = {
+        "noisy": int(hyperparams.get("action_exploration", 0) or 0) == 1,
+        "noisy_sigma0": float(hyperparams.get("noisy_sigma0", 0.5)),
+    }
+    memory_kwargs = {
+        "hidden_size": int(hyperparams.get("memory_hidden_size", 128)),
+        "num_layers": int(hyperparams.get("memory_num_layers", 1)),
+    }
     if algo_id == "dqn":
-        module = QNetwork(env.observation_space, int(env.action_space.n))
+        module = (
+            RecurrentQNetwork(env.observation_space, int(env.action_space.n), memory_type, **memory_kwargs, **noisy_kwargs)
+            if memory_type
+            else QNetwork(env.observation_space, int(env.action_space.n), **noisy_kwargs)
+        )
+    elif algo_id == "rainbow_dqn":
+        module = (
+            RecurrentDuelingQNetwork(env.observation_space, int(env.action_space.n), memory_type, **memory_kwargs, **noisy_kwargs)
+            if memory_type
+            else DuelingQNetwork(env.observation_space, int(env.action_space.n), **noisy_kwargs)
+        )
+    elif algo_id == "sac":
+        import numpy as np
+
+        low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+        module = GaussianPolicy(env.observation_space, low, high)
     else:
-        module = ActorCriticNet(env.observation_space, env.action_space)
+        module = (
+            RecurrentActorCriticNet(env.observation_space, env.action_space, memory_type, **memory_kwargs)
+            if memory_type
+            else ActorCriticNet(env.observation_space, env.action_space)
+        )
     return {**_network_summary(module, policy_name(env.observation_space)), **io}
 
 

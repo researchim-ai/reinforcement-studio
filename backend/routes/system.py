@@ -18,10 +18,19 @@ async def health():
 @router.get("/info")
 async def info():
     torch_cuda = False
+    torch_version: str | None = None
+    torch_cuda_build: str | None = None
     try:
         import torch
 
         torch_cuda = torch.cuda.is_available()
+        torch_version = torch.__version__
+        # None here means a CPU-only wheel — the actual `+cu121`/etc. build
+        # tag (present even when torch_cuda_available comes back False,
+        # e.g. driver too old for this CUDA runtime) lets Settings tell
+        # "wrong wheel installed" apart from "wheel is fine, driver isn't"
+        # instead of just one flat "нет" either way.
+        torch_cuda_build = torch.version.cuda
     except Exception:
         pass
 
@@ -52,5 +61,7 @@ async def info():
         "platform": platform.platform(),
         "cpu_count": os.cpu_count(),
         "torch_cuda_available": torch_cuda,
+        "torch_version": torch_version,
+        "torch_cuda_build": torch_cuda_build,
         "gpus": gpus,
     }

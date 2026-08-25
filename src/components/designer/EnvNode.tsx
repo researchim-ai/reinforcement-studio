@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Boxes } from 'lucide-react'
 import { Select } from '@/components/ui/select'
@@ -10,6 +11,7 @@ const CATEGORY_SHORT: Record<string, string> = {
   box2d: 'Box2D',
   mujoco: 'MuJoCo',
   atari: 'Atari',
+  pomdp: 'POMDP',
   board_game: 'Board',
 }
 
@@ -19,7 +21,9 @@ export interface EnvNodeData {
   onChange: (id: string) => void
 }
 
-export function EnvNode({ data }: NodeProps & { data: EnvNodeData }) {
+// See AlgorithmNode.tsx for why this is memoized against `data` only —
+// otherwise the node re-renders (and visibly flickers) on every drag frame.
+export const EnvNode = memo(function EnvNode({ data }: NodeProps & { data: EnvNodeData }) {
   const selected = data.environments.find((e) => e.id === data.selectedId)
 
   return (
@@ -50,4 +54,4 @@ export function EnvNode({ data }: NodeProps & { data: EnvNodeData }) {
       <Handle type="source" position={Position.Right} className="!bg-primary" />
     </div>
   )
-}
+}, (prev, next) => prev.data === next.data)

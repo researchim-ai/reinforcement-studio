@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { api } from './client'
-import type { EnvKind, PluginKind } from './types'
+import type { EnvKind, NetworkFamily, NetworkSpec, PluginKind, WrapperNode } from './types'
 
 export function useEnvironments() {
   return useQuery({ queryKey: ['environments'], queryFn: api.listEnvironments })
@@ -56,6 +56,14 @@ export function usePluginScripts(kind: PluginKind) {
   return useQuery({ queryKey: ['plugin-scripts', kind], queryFn: () => api.listPluginScripts(kind) })
 }
 
+export function useNetworkFamilies() {
+  return useQuery({ queryKey: ['network-families'], queryFn: api.listNetworkFamilies })
+}
+
+export function useNetworks() {
+  return useQuery({ queryKey: ['networks'], queryFn: api.listNetworks })
+}
+
 /** Delays propagating `value` until it's stayed stable for `delayMs` — used
  * to avoid firing a backend request on every keystroke while the user is
  * still tweaking a hyperparameter in the Designer. */
@@ -83,6 +91,34 @@ export function useInspectDesign(payload: {
     queryKey: ['inspect-design', key],
     queryFn: () => api.inspectDesign(debounced as NonNullable<typeof debounced>),
     enabled: !!key,
+    placeholderData: (prev) => prev,
+  })
+}
+
+/** Live shape-inference preview for the Network Builder — re-checks the
+ * spec against a real env/game's observation & action space on every
+ * change (debounced), so per-layer shapes/param count/errors update as the
+ * user edits the trunk or a head. */
+export function useNetworkPreview(payload: {
+  family: NetworkFamily
+  spec: NetworkSpec
+  environmentId?: string | null
+  wrappers?: WrapperNode[]
+  gameId?: string | null
+} | null) {
+  const debounced = useDebouncedValue(payload, 350)
+  const key = debounced ? JSON.stringify(debounced) : null
+  return useQuery({
+    queryKey: ['network-preview', key],
+    queryFn: () =>
+      api.previewNetwork({
+        family: debounced!.family,
+        spec: debounced!.spec,
+        environment_id: debounced!.environmentId,
+        wrappers: debounced!.wrappers,
+        game_id: debounced!.gameId,
+      }),
+    enabled: !!key && (!!debounced?.environmentId || !!debounced?.gameId),
     placeholderData: (prev) => prev,
   })
 }

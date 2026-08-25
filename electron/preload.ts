@@ -6,10 +6,19 @@ export interface AppConfigShape {
   backendMode: BackendMode
   dockerAutoBuild: boolean
   dockerGpu: boolean
+  nativeGpu: boolean
+  setupComplete: boolean
+}
+
+export interface DetectedGpu {
+  index: number
+  name: string
+  memoryTotalMb: number
 }
 
 export type BootPhase =
   | { phase: 'starting' }
+  | { phase: 'awaiting-setup'; gpus: DetectedGpu[] }
   | { phase: 'checking-docker' }
   | { phase: 'docker-unavailable'; detail?: string }
   | { phase: 'docker-no-image' }
@@ -17,6 +26,8 @@ export type BootPhase =
   | { phase: 'starting-container' }
   | { phase: 'waiting-container-health'; attempt: number }
   | { phase: 'starting-python' }
+  | { phase: 'creating-venv'; line?: string }
+  | { phase: 'installing-dependencies'; line?: string }
   | { phase: 'python-starting'; line?: string }
   | { phase: 'ready'; mode: 'native' | 'docker'; port: number }
   | { phase: 'failed'; error: string }
@@ -54,6 +65,11 @@ const api = {
     set: (patch: Partial<AppConfigShape>) => ipcRenderer.invoke('config:set', patch) as Promise<AppConfigShape>,
     setBackendMode: (mode: BackendMode) =>
       ipcRenderer.invoke('config:set-backend-mode', mode) as Promise<AppConfigShape>,
+    setNativeGpu: (gpu: boolean) => ipcRenderer.invoke('config:set-native-gpu', gpu) as Promise<AppConfigShape>,
+  },
+  setup: {
+    detectGpus: () => ipcRenderer.invoke('setup:detect-gpus') as Promise<DetectedGpu[]>,
+    choose: (device: 'cpu' | 'gpu') => ipcRenderer.invoke('setup:choose', device) as Promise<AppConfigShape>,
   },
   docker: {
     status: () =>

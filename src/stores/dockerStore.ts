@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import type { BackendMode, BootPhase } from '@/types/electron'
 
+export type SetupDevice = 'cpu' | 'gpu'
+
 interface DockerState {
   status: 'unknown' | 'running' | 'stopped' | 'building' | 'error'
   backendOnline: boolean
@@ -14,7 +16,10 @@ interface DockerState {
     backendMode: BackendMode
     dockerAutoBuild: boolean
     dockerGpu: boolean
+    nativeGpu: boolean
+    setupComplete: boolean
   } | null
+  choosingSetup: boolean
 
   setBootPhase: (phase: BootPhase) => void
   checkBackend: () => Promise<void>
@@ -23,6 +28,8 @@ interface DockerState {
   loadConfig: () => Promise<void>
   setBackendMode: (mode: BackendMode) => Promise<void>
   setDockerGpu: (gpu: boolean) => Promise<void>
+  setNativeGpu: (gpu: boolean) => Promise<void>
+  chooseSetupDevice: (device: SetupDevice) => Promise<void>
   subscribeToBootPhase: () => () => void
 }
 
@@ -36,6 +43,7 @@ export const useDockerStore = create<DockerState>((set) => ({
   containerId: null,
   error: null,
   config: null,
+  choosingSetup: false,
 
   setBootPhase: (bootPhase) => set({ bootPhase }),
 
@@ -104,6 +112,24 @@ export const useDockerStore = create<DockerState>((set) => ({
     if (!window.electronAPI) return
     const cfg = await window.electronAPI.config.set({ dockerGpu: gpu })
     set({ config: cfg })
+  },
+
+  setNativeGpu: async (gpu) => {
+    if (!window.electronAPI) return
+    // Unlike setDockerGpu, this restarts the backend immediately (main
+    // process side) — it's what makes ensurePythonEnv() notice
+    // requirements-gpu.txt vs requirements.txt changed and actually
+    // reinstall torch, same as switching backend mode.
+    set({ backendOnline: false, bootPhase: { phase: 'starting' } })
+    const cfg = await window.electronAPI.config.setNativeGpu(gpu)
+    set({ config: cfg })
+  },
+
+  chooseSetupDevice: async (device) => {
+    if (!window.electronAPI) return
+    set({ choosingSetup: true, bootPhase: { phase: 'starting' } })
+    const cfg = await window.electronAPI.setup.choose(device)
+    set({ config: cfg, choosingSetup: false })
   },
 
   subscribeToBootPhase: () => {

@@ -16,6 +16,7 @@ templates surfaced on the Plugins page):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import inspect
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,20 +28,24 @@ class TrainingCallback:
     algorithms stay lightweight and framework-agnostic.
     """
 
-    def __init__(self, writer: Callable[[int, float | None, float | None], bool]) -> None:
+    def __init__(self, writer: Callable[..., bool]) -> None:
         self._writer = writer
+        self._writer_accepts_metrics = len(inspect.signature(writer).parameters) >= 4
 
     def on_step(
         self,
         num_timesteps: int,
         episode_reward: float | None = None,
         episode_length: float | None = None,
+        metrics: dict[str, float] | None = None,
     ) -> bool:
         """Call this regularly from inside `learn()` (e.g. once per env
         step). Pass the finished episode's reward/length when one just
         ended, so the Training Monitor can show running averages. Returns
         `False` once the run should stop (user pressed Stop) — break your
         loop when it does."""
+        if self._writer_accepts_metrics:
+            return self._writer(num_timesteps, episode_reward, episode_length, metrics)
         return self._writer(num_timesteps, episode_reward, episode_length)
 
 
@@ -64,10 +69,20 @@ class CustomAlgorithm(ABC):
         returns `False`."""
 
     @abstractmethod
-    def predict(self, obs: Any, deterministic: bool = True) -> tuple[Any, Any]:
+    def predict(self, obs: Any, deterministic: bool = True, episode_start: bool = False) -> tuple[Any, Any]:
         """Returns `(action, state)` — mirrors SB3's
         `BaseAlgorithm.predict` signature so the same live-frame rendering
-        code in the runner works for both SB3 and from-scratch algorithms."""
+        code in the runner works for both SB3 and from-scratch algorithms.
+
+        `episode_start` is only meaningful for algorithms with memory
+        (LSTM/GRU) — pass `True` on the first call of a fresh rollout so
+        they reset their hidden state instead of carrying one over from
+        whatever the *previous* call happened to leave it at. It's a plain
+        optional kwarg (not threaded through a `state` object like SB3
+        does) so existing subclasses — including user-authored plugins
+        that predate this parameter — don't need to change anything unless
+        they actually want memory; `runner_utils.py` only passes it to
+        algorithms whose `predict()` declares it."""
 
     @abstractmethod
     def save(self, path: Path) -> None: ...

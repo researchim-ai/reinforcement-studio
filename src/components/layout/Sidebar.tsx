@@ -12,6 +12,8 @@ import {
   Settings,
   Activity,
   Puzzle,
+  Network,
+  GraduationCap,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { useDockerStore } from '@/stores/dockerStore'
@@ -25,6 +27,8 @@ const navItems = [
   { path: '/arena', icon: Swords, labelKey: 'nav.arena' },
   { path: '/models', icon: Archive, labelKey: 'nav.models' },
   { path: '/plugins', icon: Puzzle, labelKey: 'nav.plugins' },
+  { path: '/network-builder', icon: Network, labelKey: 'nav.networkBuilder' },
+  { path: '/academy', icon: GraduationCap, labelKey: 'nav.academy' },
   { path: '/settings', icon: Settings, labelKey: 'nav.settings' },
 ]
 

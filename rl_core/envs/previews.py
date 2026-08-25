@@ -86,12 +86,43 @@ PREVIEW_REL: dict[str, str] = {
     "ALE/VideoPinball-v5": "atari/video_pinball",
     "ALE/WizardOfWor-v5": "atari/wizard_of_wor",
     "ALE/Zaxxon-v5": "atari/zaxxon",
+    # POMDP variants reuse the base env's official GIF — the physics and
+    # on-screen animation are identical, only what the *agent* observes
+    # differs (see rl_core/envs/pomdp.py), so the base env's video is still
+    # an accurate preview.
+    "POCartPole-v0": "classic_control/cart_pole",
+    "POPendulum-v0": "classic_control/pendulum",
+    "POMountainCar-v0": "classic_control/mountain_car",
+    "POAcrobot-v0": "classic_control/acrobot",
+    "POLunarLander-v0": "box2d/lunar_lander",
+    "FlickeringCartPole-v0": "classic_control/cart_pole",
+    "FlickeringPong-v0": "atari/pong",
 }
 
-BOARD_PREVIEW_FILES: dict[str, Path] = {
+# Bundled (locally-shipped) SVG previews for envs with no matching Farama
+# Foundation asset — board games and the from-scratch Memory Corridor task.
+BUNDLED_SVG_PREVIEWS: dict[str, Path] = {
     "tic_tac_toe": PACKAGE_DIR / "envs" / "previews" / "tic_tac_toe.svg",
     "connect_four": PACKAGE_DIR / "envs" / "previews" / "connect_four.svg",
     "gomoku": PACKAGE_DIR / "envs" / "previews" / "gomoku.svg",
+    "MemoryCorridor-v0": PACKAGE_DIR / "envs" / "previews" / "memory_corridor.svg",
+    # Same task, just a longer delay — the static preview card doesn't need
+    # to look different to be an accurate illustration.
+    "MemoryCorridorLong-v0": PACKAGE_DIR / "envs" / "previews" / "memory_corridor.svg",
+    "RepeatPrevious-v0": PACKAGE_DIR / "envs" / "previews" / "repeat_previous.svg",
+    "RockSample-v0": PACKAGE_DIR / "envs" / "previews" / "rock_sample.svg",
+    "VisualMemoryMaze-v0": PACKAGE_DIR / "envs" / "previews" / "visual_memory_maze.svg",
+    "Tiger-v0": PACKAGE_DIR / "envs" / "previews" / "tiger.svg",
+    "HeavenHell-v0": PACKAGE_DIR / "envs" / "previews" / "heaven_hell.svg",
+    "Hallway-v0": PACKAGE_DIR / "envs" / "previews" / "hallway.svg",
+    "Battleship-v0": PACKAGE_DIR / "envs" / "previews" / "battleship.svg",
+    "MinesweeperPOMDP-v0": PACKAGE_DIR / "envs" / "previews" / "minesweeper_pomdp.svg",
+    "Concentration-v0": PACKAGE_DIR / "envs" / "previews" / "concentration.svg",
+    "LaserTag-v0": PACKAGE_DIR / "envs" / "previews" / "laser_tag.svg",
+    "ActiveTMaze-v0": PACKAGE_DIR / "envs" / "previews" / "active_tmaze.svg",
+    # Same task, just a longer corridor — the static preview doesn't need to
+    # look different to be an accurate illustration.
+    "ActiveTMazeLong-v0": PACKAGE_DIR / "envs" / "previews" / "active_tmaze.svg",
 }
 
 BUNDLED_DIR = PACKAGE_DIR / "envs" / "previews"
@@ -108,7 +139,7 @@ MEDIA_TYPES = {
 
 
 def has_preview(env_id: str) -> bool:
-    return env_id in PREVIEW_REL or env_id in BOARD_PREVIEW_FILES
+    return env_id in PREVIEW_REL or env_id in BUNDLED_SVG_PREVIEWS
 
 
 def _stem(env_id: str) -> str:
@@ -174,8 +205,8 @@ def _ensure_gif(env_id: str) -> Path | None:
 
 def resolve_preview_file(env_id: str, *, thumb: bool = False) -> Path | None:
     """Return a local preview file. `thumb=True` is a small first-frame JPEG."""
-    if env_id in BOARD_PREVIEW_FILES:
-        path = BOARD_PREVIEW_FILES[env_id]
+    if env_id in BUNDLED_SVG_PREVIEWS:
+        path = BUNDLED_SVG_PREVIEWS[env_id]
         return path if path.is_file() else None
 
     if env_id not in PREVIEW_REL:

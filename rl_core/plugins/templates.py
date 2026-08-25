@@ -228,7 +228,7 @@ class Trainer(AlphaZeroTrainer):
         match = play_match(self.game_cls, self.net, self.net, num_games=2, device=self.device)
         return {
             "arena": match,
-            "board": records[-1]["final_board"] if records else None,
+            "board_history": records[-1]["board_history"] if records else None,
             "_self_play_records": records,
         }
 

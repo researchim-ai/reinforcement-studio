@@ -1,0 +1,45 @@
+# GPU counterpart to Dockerfile — the only difference is installing
+# rl_core/requirements-gpu.txt (CUDA build of torch) instead of the CPU-only
+# default. Built as a separate `rl-studio:gpu` image (see electron/docker.ts)
+# so switching the "GPU в Docker" setting doesn't force every user to
+# download a multi-GB CUDA wheel just to try the app.
+#
+# Run with `docker run --gpus all ...` (requires the NVIDIA Container Toolkit
+# on the host) — electron/docker.ts does this automatically when the Docker
+# GPU setting is on.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY rl_core/requirements-gpu.txt /app/rl_core/requirements.txt
+COPY backend/requirements.txt /app/backend/requirements.txt
+
+# Which PyTorch CUDA wheel channel to install torch from — picked by
+# electron/docker.ts at build time from the *host's* driver (see
+# electron/gpu.ts's pickTorchCudaChannel; rl_core/requirements-gpu.txt
+# intentionally has no --index-url of its own, for the same reason: pinning
+# one statically here would go stale the next time PyTorch retires a
+# channel, same as it already did once with cu121/cu128).
+ARG TORCH_CUDA_CHANNEL=cu126
+RUN pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/${TORCH_CUDA_CHANNEL} \
+      --extra-index-url https://pypi.org/simple \
+      -r /app/rl_core/requirements.txt \
+    && pip install --no-cache-dir -r /app/backend/requirements.txt
+
+COPY rl_core /app/rl_core
+COPY backend /app/backend
+
+ENV PYTHONUNBUFFERED=1 \
+    RL_STUDIO_ROOT=/app/rl_core
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=2)" || exit 1
+
+CMD ["python", "-m", "uvicorn", "backend.api:app", "--host", "0.0.0.0", "--port", "8000"]

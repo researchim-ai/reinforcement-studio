@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" width="320" height="180">
+  <rect width="320" height="180" fill="#151520"/>
+  <rect x="60" y="40" width="80" height="110" rx="4" fill="#3c3c4c" stroke="#5a5a70" stroke-width="2"/>
+  <rect x="180" y="40" width="80" height="110" rx="4" fill="#3c3c4c" stroke="#5a5a70" stroke-width="2"/>
+  <circle cx="100" cy="95" r="3" fill="#dcdce6"/>
+  <circle cx="220" cy="95" r="3" fill="#dcdce6"/>
+  <text x="100" y="30" text-anchor="middle" font-size="22" fill="#dc4646" font-family="sans-serif">?</text>
+  <text x="220" y="30" text-anchor="middle" font-size="22" fill="#5ade82" font-family="sans-serif">?</text>
+  <path d="M 160 60 q 20 20 0 40" stroke="#818cf8" stroke-width="2" fill="none" stroke-dasharray="4 3"/>
+  <text x="160" y="165" text-anchor="middle" font-size="13" fill="#a1a1b5" font-family="sans-serif">Слушать (шумно) или открыть дверь?</text>
+</svg>

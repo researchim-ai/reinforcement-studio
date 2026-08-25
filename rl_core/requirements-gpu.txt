@@ -1,0 +1,29 @@
+# GPU (CUDA) build of PyTorch — opt-in counterpart to requirements.txt, used
+# instead of it when the user turns on "GPU" in Settings (Native mode: swaps
+# which file the app's private venv is built from; Docker mode: baked into
+# the `Dockerfile.gpu` image). Needs a host machine with an NVIDIA GPU +
+# driver (Docker additionally needs the NVIDIA Container Toolkit for
+# --gpus all to work) — otherwise this installs fine but
+# torch.cuda.is_available() is just False and every run silently falls back
+# to CPU (see rl_core/device.py).
+#
+# Deliberately does NOT pin an --index-url here (unlike requirements.txt's
+# CPU wheel, which has been stable at .../whl/cpu for years): PyTorch's
+# per-CUDA-version wheel channels (cu121, cu128, ...) get fully retired as
+# new CUDA majors ship, at which point pip silently falls through to
+# PyPI's *current default* channel instead — which can need a newer driver
+# than the user actually has, leaving CUDA installed-but-unusable with no
+# error. The app picks the right --index-url for the detected driver at
+# install time instead (see electron/gpu.ts's pickTorchCudaChannel, wired
+# in via electron/main.ts's startBackendNative / Dockerfile.gpu's build arg).
+
+numpy>=1.26
+torch>=2.2
+# [box2d,mujoco,atari]: unlocks LunarLander/BipedalWalker/CarRacing, the 11
+# MuJoCo robotics tasks, and the ~40 Atari games in the Environments gallery.
+# All three ship prebuilt wheels (no swig/compiler needed) and add well under
+# 100MB combined, so it's worth including by default rather than leaving
+# most of the gallery greyed out until a user manually installs extras.
+gymnasium[box2d,mujoco,atari]>=0.29
+stable-baselines3>=2.3
+pillow>=10.0

@@ -5,6 +5,7 @@ import net from 'net'
 import { spawn, type ChildProcess } from 'child_process'
 import { DockerManager } from './docker'
 import { loadConfig, saveConfig, type AppConfig, type BackendMode } from './config'
+import { detectGpus, detectMaxCudaVersion, pickTorchCudaChannel, type DetectedGpu } from './gpu'
 import { ensurePythonEnv } from './pythonEnv'
 
 if (process.platform === 'linux') {
@@ -43,6 +44,7 @@ let booting = false
 // Boot phases — streamed to renderer for splash screen feedback
 type BootPhase =
   | { phase: 'starting' }
+  | { phase: 'awaiting-setup'; gpus: DetectedGpu[] }
   | { phase: 'checking-docker' }
   | { phase: 'docker-unavailable'; detail?: string }
   | { phase: 'docker-no-image' }
@@ -323,21 +325,26 @@ async function startBackendDocker(config: AppConfig): Promise<boolean> {
     return false
   }
 
-  if (!dockerManager.hasDockerfile()) {
-    emitBootPhase({ phase: 'docker-unavailable', detail: 'Dockerfile not found' })
+  if (!dockerManager.hasDockerfile(config.dockerGpu)) {
+    emitBootPhase({ phase: 'docker-unavailable', detail: config.dockerGpu ? 'Dockerfile.gpu not found' : 'Dockerfile not found' })
     return false
   }
 
   const existing = await dockerManager.getStatus()
 
-  if (!(await dockerManager.imageExists())) {
+  if (!(await dockerManager.imageExists(config.dockerGpu))) {
     emitBootPhase({ phase: 'docker-no-image' })
     if (!config.dockerAutoBuild) {
       backendStartError = 'Docker image missing and auto-build is disabled'
       return false
     }
     emitBootPhase({ phase: 'building-image' })
-    const build = await dockerManager.buildImage((line) => emitBootPhase({ phase: 'building-image', line }))
+    const torchCudaChannel = config.dockerGpu ? pickTorchCudaChannel(detectMaxCudaVersion()) : undefined
+    const build = await dockerManager.buildImage(
+      (line) => emitBootPhase({ phase: 'building-image', line }),
+      config.dockerGpu,
+      torchCudaChannel,
+    )
     if (!build.success) {
       backendStartError = build.error ?? 'Image build failed'
       return false
@@ -375,19 +382,34 @@ async function startBackendNative(): Promise<void> {
   const logStream = fs.createWriteStream(logPath, { flags: 'a' })
   logStream.write(`\n--- Session start ${new Date().toISOString()} ---\n`)
 
-  // First run (or after a requirements change) — create a private venv and
-  // install rl_core/backend dependencies into it. This is what actually
-  // fulfils the "installs everything it needs" promise, instead of relying
-  // on the user's system Python already having fastapi/gymnasium/torch.
+  // First run (or after a requirements change, e.g. toggling the "GPU"
+  // setting below) — create a private venv and install rl_core/backend
+  // dependencies into it. This is what actually fulfils the "installs
+  // everything it needs" promise, instead of relying on the user's system
+  // Python already having fastapi/gymnasium/torch.
+  const nativeGpu = loadConfig().nativeGpu
+  const rlCoreRequirements = nativeGpu ? 'requirements-gpu.txt' : 'requirements.txt'
+  // requirements-gpu.txt has no --index-url of its own (see that file's
+  // comment for why: PyTorch's cuXXX channels get retired over time and a
+  // stale pin silently falls through to whatever PyPI's *current* default
+  // is, which can need a newer driver than this machine actually has) — so
+  // pick the right one for the driver actually detected on *this* boot.
+  const extraPipArgs: string[] = []
+  if (nativeGpu) {
+    const cudaChannel = pickTorchCudaChannel(detectMaxCudaVersion())
+    logStream.write(`[env] GPU включён — ставлю torch с канала ${cudaChannel}\n`)
+    extraPipArgs.push('--index-url', `https://download.pytorch.org/whl/${cudaChannel}`, '--extra-index-url', 'https://pypi.org/simple')
+  }
   let pythonPath: string
   try {
     const result = await ensurePythonEnv(
       venvDir,
-      [path.join(projectRoot, 'rl_core', 'requirements.txt'), path.join(projectRoot, 'backend', 'requirements.txt')],
+      [path.join(projectRoot, 'rl_core', rlCoreRequirements), path.join(projectRoot, 'backend', 'requirements.txt')],
       (phase, line) => {
         logStream.write(`[env:${phase}] ${line ?? ''}\n`)
         emitBootPhase({ phase, line })
       },
+      extraPipArgs,
     )
     pythonPath = result.pythonPath
   } catch (err) {
@@ -541,9 +563,17 @@ app.whenReady().then(async () => {
 
   createWindow()
 
-  startBackend().catch((err) => {
-    console.error('[backend] Could not auto-start:', err)
-  })
+  // First launch ever (or config wiped) — don't silently start installing
+  // anything yet. Detect local NVIDIA GPUs and show the user a CPU/GPU
+  // picker on the splash screen instead; startBackend() only runs once
+  // they've answered (see the 'setup:choose' IPC handler below).
+  if (!loadConfig().setupComplete) {
+    emitBootPhase({ phase: 'awaiting-setup', gpus: detectGpus() })
+  } else {
+    startBackend().catch((err) => {
+      console.error('[backend] Could not auto-start:', err)
+    })
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -613,15 +643,55 @@ function registerIpcHandlers() {
   ipcMain.handle('config:set', (_e, patch: Partial<AppConfig>) => saveConfig(patch))
   ipcMain.handle('config:set-backend-mode', async (_e, mode: BackendMode) => {
     const next = saveConfig({ backendMode: mode })
+    // If Auto/Docker is mid-build (e.g. right after this Dockerfile
+    // packaging fix, Auto started actually finding+building the image for
+    // the first time — a multi-GB download the user didn't expect), cancel
+    // it so this explicit mode switch actually takes effect immediately
+    // instead of silently no-op'ing behind the still-running startBackend()
+    // call's `booting` guard until the abandoned build finishes on its own.
+    dockerManager?.cancelBuild()
     await stopBackend()
     startBackend().catch((err) => console.error('[backend] Restart after mode change failed:', err))
+    return next
+  })
+  // Restarting (rather than just saving) matters here: it's what actually
+  // triggers ensurePythonEnv() to notice requirements-gpu.txt vs
+  // requirements.txt changed and reinstall torch — see startBackendNative().
+  ipcMain.handle('config:set-native-gpu', async (_e, gpu: boolean) => {
+    const next = saveConfig({ nativeGpu: gpu })
+    await stopBackend()
+    startBackend().catch((err) => console.error('[backend] Restart after native GPU toggle failed:', err))
+    return next
+  })
+
+  // CPU/GPU picker. Shown as a full first-run screen the very first time
+  // (see app.whenReady() above) *and* as a persistent control on every boot
+  // screen after that (BackendBoot.tsx) — not a one-shot decision, since a
+  // driver/GPU setup can change (or the user just wants to flip it) at any
+  // later point too. Applies the choice to *both* dockerGpu and nativeGpu —
+  // we don't know yet whether Auto mode will land on Docker or native
+  // Python, and the user just answered "I want CPU" / "I want GPU" in
+  // general, not "for this one specific backend". Whichever mode actually
+  // starts will provision the matching (CPU-only or CUDA) PyTorch build.
+  ipcMain.handle('setup:detect-gpus', () => detectGpus())
+  ipcMain.handle('setup:choose', async (_e, device: 'cpu' | 'gpu') => {
+    const gpu = device === 'gpu'
+    const next = saveConfig({ nativeGpu: gpu, dockerGpu: gpu, setupComplete: true })
+    // Same reasoning as config:set-backend-mode: this can now be clicked
+    // while a backend is already running or mid-boot (Docker build,
+    // pip install, ...), not just on the very first, backend-less launch —
+    // cancel/stop whatever's in flight so the new choice actually takes
+    // effect right away instead of queuing invisibly behind it.
+    dockerManager?.cancelBuild()
+    await stopBackend()
+    startBackend().catch((err) => console.error('[backend] Could not start after setup choice:', err))
     return next
   })
 
   // Docker
   ipcMain.handle('docker:status', async () => dockerManager?.getStatus() ?? { running: false })
   ipcMain.handle('docker:available', async () => (dockerManager ? dockerManager.isAvailable() : false))
-  ipcMain.handle('docker:image-exists', async () => (dockerManager ? dockerManager.imageExists() : false))
+  ipcMain.handle('docker:image-exists', async () => (dockerManager ? dockerManager.imageExists(loadConfig().dockerGpu) : false))
   ipcMain.handle('docker:start', async () => {
     if (!dockerManager) return { success: false, error: 'Docker not initialized' }
     const port = await findAvailablePort(8000)
@@ -630,7 +700,9 @@ function registerIpcHandlers() {
   ipcMain.handle('docker:stop', async () => dockerManager?.stopContainer())
   ipcMain.handle('docker:build', async () => {
     if (!dockerManager) return { success: false, error: 'Docker not initialized' }
-    return dockerManager.buildImage((line) => mainWindow?.webContents.send('docker:build-progress', line))
+    const gpu = loadConfig().dockerGpu
+    const torchCudaChannel = gpu ? pickTorchCudaChannel(detectMaxCudaVersion()) : undefined
+    return dockerManager.buildImage((line) => mainWindow?.webContents.send('docker:build-progress', line), gpu, torchCudaChannel)
   })
   ipcMain.handle('docker:logs', async (_event, tail?: number) => dockerManager?.getContainerLogs(tail))
 

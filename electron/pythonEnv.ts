@@ -152,13 +152,16 @@ export interface EnsurePythonEnvResult {
 
 /**
  * Ensures a dedicated venv exists under `venvDir` with all packages from
- * `requirementFiles` installed. Skips reinstall if requirements haven't
- * changed since the last successful install (tracked via a content hash).
+ * `requirementFiles` installed. Skips reinstall if neither the requirement
+ * files' content nor `extraPipArgs` (e.g. which CUDA wheel channel to pull
+ * torch from) have changed since the last successful install (tracked via
+ * a content hash).
  */
 export async function ensurePythonEnv(
   venvDir: string,
   requirementFiles: string[],
   onProgress: (phase: PythonEnvPhase, line?: string) => void,
+  extraPipArgs: string[] = [],
 ): Promise<EnsurePythonEnvResult> {
   const systemPython = resolveSystemPython()
   if (!systemPython) {
@@ -169,7 +172,11 @@ export async function ensurePythonEnv(
 
   const pyExe = venvPythonPath(venvDir)
   const existingFiles = requirementFiles.filter((f) => fs.existsSync(f))
-  const currentHash = requirementsHash(existingFiles)
+  // extraPipArgs folded into the hash too: switching CUDA wheel channel
+  // (e.g. detected driver now supports cu130 instead of last time's cu126)
+  // must trigger a reinstall even though the requirement *files* themselves
+  // didn't change a single byte.
+  const currentHash = requirementsHash(existingFiles) + ':' + extraPipArgs.join(' ')
   const markerPath = path.join(venvDir, '.deps-hash')
 
   // A previous run may have been interrupted (crash, force-quit, killed
@@ -236,6 +243,18 @@ export async function ensurePythonEnv(
   if (installedHash !== currentHash && existingFiles.length > 0) {
     onProgress('installing-dependencies')
     const pipArgs = ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-input']
+    // --force-reinstall matters specifically for the CPU<->GPU torch swap
+    // (toggling the "GPU" setting points this at requirements-gpu.txt
+    // instead of requirements.txt, or extraPipArgs' --index-url now points
+    // at a different CUDA channel than last time): all of these still
+    // satisfy the same `torch>=2.2` constraint, so a plain `pip install`
+    // would see the already-installed wheel as "good enough" and silently
+    // keep it, leaving the GPU toggle (or a newly-detected driver) with no
+    // actual effect. This only runs when the hash changed (first install,
+    // app update, or one of these toggles), so the extra reinstall cost is
+    // rare, not per-boot.
+    pipArgs.push('--force-reinstall')
+    pipArgs.push(...extraPipArgs)
     for (const f of existingFiles) pipArgs.push('-r', f)
     // Generous timeout: torch + friends are a real download (hundreds of MB)
     // and can legitimately take several minutes on a slow connection. This

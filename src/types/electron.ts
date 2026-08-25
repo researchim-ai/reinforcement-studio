@@ -4,10 +4,19 @@ export interface AppConfigShape {
   backendMode: BackendMode
   dockerAutoBuild: boolean
   dockerGpu: boolean
+  nativeGpu: boolean
+  setupComplete: boolean
+}
+
+export interface DetectedGpu {
+  index: number
+  name: string
+  memoryTotalMb: number
 }
 
 export type BootPhase =
   | { phase: 'starting' }
+  | { phase: 'awaiting-setup'; gpus: DetectedGpu[] }
   | { phase: 'checking-docker' }
   | { phase: 'docker-unavailable'; detail?: string }
   | { phase: 'docker-no-image' }
@@ -40,6 +49,11 @@ export interface ElectronAPI {
     get: () => Promise<AppConfigShape>
     set: (patch: Partial<AppConfigShape>) => Promise<AppConfigShape>
     setBackendMode: (mode: BackendMode) => Promise<AppConfigShape>
+    setNativeGpu: (gpu: boolean) => Promise<AppConfigShape>
+  }
+  setup: {
+    detectGpus: () => Promise<DetectedGpu[]>
+    choose: (device: 'cpu' | 'gpu') => Promise<AppConfigShape>
   }
   docker: {
     status: () => Promise<{ running: boolean; containerId?: string; hostPort?: number; error?: string }>

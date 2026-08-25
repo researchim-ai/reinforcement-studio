@@ -1,0 +1,128 @@
+appId: ai.researchim.reinforcement-studio
+# Keep this a single space-free slug: it drives the app name, the Linux install path
+# (/opt/<productName>/) AND — historically — spaces in that /opt path crash Electron at
+# startup (chrome-sandbox / resource resolution). executableName + a unified artifactName
+# below guarantee the SAME space-free name across every platform and package format.
+# User-visible strings (window title, desktop shortcut label, Start Menu entry) are set
+# separately below and are free to contain spaces — only this identifier must not.
+productName: reinforcement-studio
+# One consistent, space-free filename for every target (AppImage/deb/exe/dmg/zip)
+# instead of each installer inventing its own casing/separators.
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+copyright: Copyright © 2026 researchim-ai
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - "!**/*.map"
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+
+# Ship the Python backend + RL engine + Docker build recipes as resources next to
+# the packaged app (not inside asar) so the Native/Docker backend modes can read,
+# execute and hot-reload them exactly as in dev.
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!__pycache__/**"
+      - "!*.pyc"
+  - from: rl_core
+    to: rl_core
+    filter:
+      - "**/*"
+      - "!__pycache__/**"
+      - "!*.pyc"
+      - "!.runs/**"
+      - "!checkpoints/**"
+  - from: Dockerfile
+    to: Dockerfile
+  - from: Dockerfile.gpu
+    to: Dockerfile.gpu
+
+asar: true
+asarUnpack:
+  # dockerode's optional ssh2 transport pulls in native bindings (cpu-features) that
+  # must live on the real filesystem, not inside asar.
+  - "**/node_modules/dockerode/**"
+
+# Wrap the Linux executable so AppImage launches with --no-sandbox from process
+# start. Chromium's setuid sandbox helper (chrome-sandbox) needs root:4755
+# ownership/mode to work, which an AppImage's read-only FUSE mount cannot provide —
+# Electron aborts before our own app.commandLine.appendSwitch() calls in main.ts even
+# run. deb/tar.gz keep the normal (sandboxed) path via build/deb-after-install.sh.
+afterPack: build/afterPack.cjs
+
+linux:
+  executableName: reinforcement-studio
+  # desktopName lives in package.json (it's an app metadata field, not a build
+  # option); this just tells electron-builder to derive the installed .desktop
+  # filename from it so it matches StartupWMClass / Electron's app_id.
+  syncDesktopName: true
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  category: Development
+  icon: build/icons
+  synopsis: Design and run reinforcement learning experiments
+  description: >-
+    Desktop studio for reinforcement learning: Gymnasium environments,
+    DQN/PPO/A2C, and AlphaZero self-play, with visual experiment design.
+  maintainer: researchim-ai <noreply@researchim-ai.github.io>
+  desktop:
+    entry:
+      Name: Reinforcement Studio
+      Comment: Design and run RL experiments at home
+      Keywords: AI;ML;RL;reinforcement-learning;alphazero;gymnasium;
+      StartupWMClass: reinforcement-studio
+
+deb:
+  # Restore the SUID bit on chrome-sandbox for .deb installs so the full Chromium
+  # sandbox works (the /opt install path allows setuid, unlike the AppImage mount).
+  afterInstall: build/deb-after-install.sh
+
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  darkModeSupport: true
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Reinforcement Studio
+
+dmg:
+  contents:
+    - x: 410
+      y: 150
+      type: link
+      path: /Applications
+    - x: 130
+      y: 150
+      type: file
+
+publish: null

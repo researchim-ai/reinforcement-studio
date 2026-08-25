@@ -1,0 +1,380 @@
+import { Fragment, type ReactNode } from 'react'
+import {
+  ArrowRight, Brain, Database, Dices, Repeat, RefreshCw, Shuffle, Swords, Target, TrendingUp, Eye, Layers, History, Sparkles,
+} from 'lucide-react'
+import { cn, formatNumber } from '@/lib/utils'
+
+type HpValue = number | string | boolean
+type Hyperparams = Record<string, HpValue> | undefined
+
+function hp(hyperparams: Hyperparams, key: string, prefix = ''): string | undefined {
+  const v = hyperparams?.[key]
+  return v == null ? undefined : `${prefix}${v}`
+}
+
+function joinDetail(...parts: (string | undefined)[]): string | undefined {
+  const filtered = parts.filter(Boolean)
+  return filtered.length ? filtered.join(' · ') : undefined
+}
+
+/** `memory_type` is stored as a plain int (0=none/1=LSTM/2=GRU) — see
+ * `rl_core/algorithms/native/networks.py::memory_type_from_hyperparams` —
+ * kept in sync here rather than imported since the frontend has no access
+ * to the Python module. */
+function memoryLabel(hyperparams: Hyperparams): string | null {
+  const code = Number(hyperparams?.memory_type ?? 0)
+  if (code === 1) return 'LSTM'
+  if (code === 2) return 'GRU'
+  return null
+}
+
+const MEMORY_FAMILIES: Family[] = ['ppo', 'a2c', 'dqn', 'rainbow_dqn']
+
+interface Step {
+  icon: typeof Brain
+  title: string
+  detail?: string
+}
+
+type Family = 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'alphazero' | 'generic'
+
+/** Best-effort family detection from the algorithm id — used to pick which
+ * canned "how it learns" loop to render. Custom plugins (`custom:*`) fall
+ * through to a family based on their base-class-agnostic id text (many
+ * people name a PPO tweak "custom:ppo-clip" etc.) or, failing that, a
+ * generic agent<->env loop that's honest about not knowing the internals. */
+function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
+  if (kind === 'alphazero') return 'alphazero'
+  const id = algorithmId.replace(/^custom:/, '').toLowerCase()
+  if (id.includes('rainbow')) return 'rainbow_dqn'
+  if (id.includes('sac')) return 'sac'
+  if (id.includes('dqn')) return 'dqn'
+  if (id.includes('a2c')) return 'a2c'
+  if (id.includes('ppo')) return 'ppo'
+  return 'generic'
+}
+
+function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; loopCaption: string } {
+  const noisy = Number(hyperparams?.action_exploration ?? 0) === 1
+  const rnd = Number(hyperparams?.intrinsic_exploration ?? 0) === 1
+  const actionStep: Step = noisy
+    ? { icon: Dices, title: 'Действие через NoisyNet', detail: hp(hyperparams, 'noisy_sigma0', 'σ₀=') }
+    : {
+        icon: Dices,
+        title: 'Действие ε-greedy',
+        detail: joinDetail(
+          hp(hyperparams, 'exploration_initial_eps', 'ε₀='),
+          hp(hyperparams, 'exploration_final_eps', 'εmin='),
+          hp(hyperparams, 'exploration_fraction', 'decay='),
+        ),
+      }
+  const rndStep: Step = {
+    icon: Sparkles,
+    title: 'RND: бонус новизны',
+    detail: hp(hyperparams, 'rnd_bonus_coef', 'coef='),
+  }
+  switch (family) {
+    case 'ppo':
+      return {
+        steps: [
+          { icon: Shuffle, title: 'Rollout в среде', detail: hp(hyperparams, 'n_steps', 'n_steps=') },
+          { icon: TrendingUp, title: 'Advantage (GAE)', detail: hp(hyperparams, 'gamma', 'γ=') },
+          {
+            icon: Brain,
+            title: 'Обновление policy + value',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'ent_coef', 'ent=')),
+          },
+        ],
+        loopCaption: 'Повторяется, пока не наберётся total_timesteps шагов',
+      }
+    case 'a2c':
+      return {
+        steps: [
+          { icon: Shuffle, title: 'n-step rollout', detail: hp(hyperparams, 'n_steps', 'n_steps=') },
+          { icon: TrendingUp, title: 'Advantage', detail: hp(hyperparams, 'gamma', 'γ=') },
+          { icon: Brain, title: 'Одно обновление policy + value', detail: hp(hyperparams, 'ent_coef', 'ent=') },
+        ],
+        loopCaption: 'Повторяется, пока не наберётся total_timesteps шагов',
+      }
+    case 'dqn':
+      return {
+        steps: [
+          actionStep,
+          ...(rnd ? [rndStep] : []),
+          { icon: Database, title: 'Replay buffer', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Brain,
+            title: 'Обновление Q-сети',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
+          },
+          { icon: RefreshCw, title: 'Синхронизация target-сети', detail: hp(hyperparams, 'target_update_interval', 'every=') },
+        ],
+        loopCaption: 'Повторяется на каждом шаге, пока не наберётся total_timesteps',
+      }
+    case 'rainbow_dqn':
+      return {
+        steps: [
+          actionStep,
+          ...(rnd ? [rndStep] : []),
+          {
+            icon: Database,
+            title: 'Приоритетный буфер',
+            detail: joinDetail(hp(hyperparams, 'buffer_size', 'size='), hp(hyperparams, 'n_step', 'n-step=')),
+          },
+          {
+            icon: Brain,
+            title: 'Double + Dueling обновление',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
+          },
+          { icon: RefreshCw, title: 'Синхронизация target-сети', detail: hp(hyperparams, 'target_update_interval', 'every=') },
+        ],
+        loopCaption: 'Rainbow-lite: Double DQN + Dueling-сеть + Prioritized Replay + n-step возврат',
+      }
+    case 'sac':
+      return {
+        steps: [
+          { icon: Dices, title: 'Действие из stochastic policy', detail: hp(hyperparams, 'ent_coef', 'α=') },
+          { icon: Database, title: 'Replay buffer', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Brain,
+            title: 'Обновление 2×Q-критиков + policy',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
+          },
+          { icon: RefreshCw, title: 'Мягкое обновление target-сетей', detail: hp(hyperparams, 'tau', 'τ=') },
+        ],
+        loopCaption: 'Off-policy: непрерывные действия, максимизация награды + энтропии',
+      }
+    case 'alphazero':
+      return {
+        steps: [
+          {
+            icon: Dices,
+            title: 'Self-play + MCTS',
+            detail: joinDetail(hp(hyperparams, 'games_per_iteration', 'игр='), hp(hyperparams, 'num_simulations', 'sim=')),
+          },
+          { icon: Database, title: 'Буфер партий', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Brain,
+            title: 'Обучение сети',
+            detail: joinDetail(hp(hyperparams, 'epochs', 'epochs='), hp(hyperparams, 'batch_size', 'batch=')),
+          },
+          {
+            icon: Swords,
+            title: 'Арена vs чемпион',
+            detail: joinDetail(hp(hyperparams, 'eval_games', 'игр='), hp(hyperparams, 'win_rate_threshold', 'порог=')),
+          },
+          { icon: Target, title: 'Принять / откатить', detail: 'чемпион меняется только при победе ≥ порога' },
+        ],
+        loopCaption: 'Повторяется num_iterations раз; чемпион обновляется только когда новая сеть выигрывает арену',
+      }
+    default:
+      return {
+        steps: [
+          { icon: Eye, title: 'Наблюдение среды' },
+          { icon: Dices, title: 'Действие агента' },
+          { icon: Brain, title: 'Награда → обновление параметров' },
+        ],
+        loopCaption: 'Кастомный алгоритм — точный цикл зависит от плагина',
+      }
+  }
+}
+
+function StepChip({ icon: Icon, title, detail }: Step) {
+  return (
+    <div className="flex w-28 shrink-0 flex-col items-center gap-1 rounded-lg border border-border/70 bg-background/60 p-2 text-center">
+      <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary/10 text-primary">
+        <Icon className="h-3.5 w-3.5" />
+      </div>
+      <div className="text-[10.5px] font-medium leading-tight">{title}</div>
+      {detail && <div className="text-[9px] leading-tight text-muted-foreground">{detail}</div>}
+    </div>
+  )
+}
+
+function StepArrow() {
+  return <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+}
+
+function LoopDiagram({ algorithmId, kind, hyperparams }: { algorithmId: string; kind: 'gym' | 'alphazero'; hyperparams: Hyperparams }) {
+  const family = familyOf(algorithmId, kind)
+  const { steps: baseSteps, loopCaption: baseCaption } = buildSteps(family, hyperparams)
+  const memory = MEMORY_FAMILIES.includes(family) ? memoryLabel(hyperparams) : null
+  // Inserted right after the first step (observe/rollout/ε-greedy act) —
+  // that's conceptually where the recurrent core sits, folding the raw
+  // observation into a running hidden state before whatever comes next
+  // (advantage estimation, the Q-/policy-update, ...) ever sees it.
+  const steps = memory
+    ? [baseSteps[0], { icon: History, title: `${memory}-память`, detail: hp(hyperparams, 'memory_hidden_size', 'hidden=') }, ...baseSteps.slice(1)]
+    : baseSteps
+  const loopCaption = memory ? `${baseCaption} · рекуррентная память (${memory}) переносится между шагами эпизода` : baseCaption
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {steps.map((s, i) => (
+          <Fragment key={i}>
+            <StepChip {...s} />
+            {i < steps.length - 1 && <StepArrow />}
+          </Fragment>
+        ))}
+      </div>
+      <div className="mt-2 flex items-center gap-1 text-[10px] text-muted-foreground">
+        <Repeat className="h-3 w-3 shrink-0" />
+        <span>{loopCaption}</span>
+      </div>
+    </div>
+  )
+}
+
+export interface AlgorithmDiagramNetwork {
+  policy?: string
+  layers?: string[]
+  totalParams?: number
+  inputShape?: number[] | null
+  outputShape?: number[] | null
+  channels?: number
+  numBlocks?: number
+  actionSize?: number
+  inputPlanes?: number
+  rows?: number
+  cols?: number
+  note?: string | null
+}
+
+function ShapeChip({ label, shape }: { label: string; shape?: number[] | null }) {
+  return (
+    <div className="flex w-28 shrink-0 flex-col items-center gap-1 rounded-lg border border-dashed border-border/70 bg-background/40 p-2 text-center">
+      <div className="text-[10.5px] font-medium leading-tight">{label}</div>
+      <div className="font-mono text-[9px] leading-tight text-muted-foreground">
+        {shape && shape.length > 0 ? `[${shape.join('×')}]` : '—'}
+      </div>
+    </div>
+  )
+}
+
+/** Pretty-prints an inspect layer string ("Linear(64→64)") into a compact
+ * two-line chip — no per-network-family logic needed since this comes
+ * straight from real introspection of whatever module the algorithm (built-
+ * in or plugin) actually exposes, so it works for architectures we've never
+ * heard of too. */
+function LayerChip({ layer }: { layer: string }) {
+  const match = layer.match(/^([A-Za-z0-9]+)\((.*)\)$/)
+  return (
+    <div className="flex w-24 shrink-0 flex-col items-center gap-0.5 rounded-lg border border-border/70 bg-background/60 px-2 py-1.5 text-center">
+      <div className="text-[10px] font-medium leading-tight">{match ? match[1] : layer}</div>
+      {match && <div className="font-mono text-[9px] leading-tight text-muted-foreground">{match[2]}</div>}
+    </div>
+  )
+}
+
+const MAX_LAYER_CHIPS = 8
+
+function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null }) {
+  if (!network) {
+    return <p className="text-xs text-muted-foreground">Нет данных о сети</p>
+  }
+
+  const isBoardNet = network.channels != null && network.numBlocks != null
+  const shownLayers = network.layers?.slice(0, MAX_LAYER_CHIPS) ?? []
+  const hiddenCount = (network.layers?.length ?? 0) - shownLayers.length
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {isBoardNet ? (
+          <>
+            <ShapeChip label="Вход (доска)" shape={[network.inputPlanes ?? 3, network.rows ?? 0, network.cols ?? 0]} />
+            <StepArrow />
+            <StepChip icon={Layers} title="Conv stem" detail={`${network.channels} ch`} />
+            <StepArrow />
+            <StepChip icon={Layers} title={`ResBlock ×${network.numBlocks}`} detail={`${network.channels} ch, 3×3`} />
+            <StepArrow />
+            <div className="flex items-center gap-1.5 rounded-lg border border-dashed border-border/70 p-1.5">
+              <StepChip icon={Target} title="Policy head" detail={`→ ${network.actionSize ?? '?'}`} />
+              <StepChip icon={TrendingUp} title="Value head" detail="→ 1 (tanh)" />
+            </div>
+          </>
+        ) : (
+          <>
+            <ShapeChip label="Вход" shape={network.inputShape} />
+            {shownLayers.length > 0 && <StepArrow />}
+            {shownLayers.map((l, i) => (
+              <Fragment key={i}>
+                <LayerChip layer={l} />
+                {i < shownLayers.length - 1 && <StepArrow />}
+              </Fragment>
+            ))}
+            {hiddenCount > 0 && (
+              <div className="flex w-16 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-background/40 py-1.5 text-[10px] text-muted-foreground">
+                +{hiddenCount}
+              </div>
+            )}
+            <StepArrow />
+            <ShapeChip label="Выход" shape={network.outputShape} />
+          </>
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+        {network.policy && <span>Policy: <span className="font-mono text-foreground/80">{network.policy}</span></span>}
+        {network.totalParams != null && (
+          <span>Параметры: <span className="font-mono text-foreground/80">{formatNumber(network.totalParams)}</span></span>
+        )}
+        {network.note && <span className="italic">{network.note}</span>}
+      </div>
+    </div>
+  )
+}
+
+export interface AlgorithmDiagramProps {
+  // Optional because callers that only render `show.network` (e.g. the
+  // Designer's env/network InspectPanel, which knows the net's shape but
+  // not which algorithm produced it in a strongly-typed way at that call
+  // site) have nothing meaningful to pass here.
+  algorithmId?: string
+  kind?: 'gym' | 'alphazero'
+  hyperparams?: Hyperparams
+  network?: AlgorithmDiagramNetwork | null
+  show?: { loop?: boolean; network?: boolean }
+  /** Skip the small "Как учится"/"Архитектура сети" section captions —
+   * for call sites that already have their own, more specific Card title
+   * right above (e.g. Designer's InspectPanel says "Нейросеть" already). */
+  hideTitles?: boolean
+  className?: string
+}
+
+/** Two-part "what is this algorithm actually doing" visualization, reused
+ * for every built-in algorithm (PPO/A2C/DQN/AlphaZero) *and* custom plugins:
+ * - the training-loop diagram only needs the algorithm id/kind/hyperparams,
+ *   so it renders instantly in the Designer before anything is inspected;
+ * - the network diagram is driven entirely by real introspection data
+ *   (`InspectNetwork` in the Designer, `MetricsSnapshot` fields in the
+ *   Monitor) so it's honest about whatever architecture a plugin actually
+ *   builds, without needing per-plugin special-casing. */
+export function AlgorithmDiagram({ algorithmId, kind, hyperparams, network, show, hideTitles, className }: AlgorithmDiagramProps) {
+  const showLoop = (show?.loop ?? true) && algorithmId != null && kind != null
+  const showNetwork = show?.network ?? true
+  return (
+    <div className={cn('space-y-3', className)}>
+      {showLoop && (
+        <Section title="Как учится" hide={hideTitles}>
+          <LoopDiagram algorithmId={algorithmId!} kind={kind!} hyperparams={hyperparams} />
+        </Section>
+      )}
+      {showNetwork && (
+        <Section title="Архитектура сети" hide={hideTitles}>
+          <NetworkDiagram network={network} />
+        </Section>
+      )}
+    </div>
+  )
+}
+
+function Section({ title, hide, children }: { title: string; hide?: boolean; children: ReactNode }) {
+  return (
+    <div>
+      {!hide && (
+        <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{title}</div>
+      )}
+      {children}
+    </div>
+  )
+}

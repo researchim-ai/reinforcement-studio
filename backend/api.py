@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.routes import alphazero, environments, models, plugins, system, training
+from backend.routes import alphazero, environments, models, networks, plugins, system, training
 from backend.ws import router as ws_router
 
 app = FastAPI(title="Reinforcement Studio API", version="0.1.0")
@@ -30,4 +30,5 @@ app.include_router(training.router, prefix="/api/training", tags=["training"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(alphazero.router, prefix="/api/alphazero", tags=["alphazero"])
 app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
+app.include_router(networks.router, prefix="/api/networks", tags=["networks"])
 app.include_router(ws_router)

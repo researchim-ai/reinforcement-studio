@@ -31,6 +31,10 @@ def play_self_play_game(
 
     raw_examples: list[tuple[np.ndarray, np.ndarray, int]] = []
     move_history: list[dict[str, Any]] = []
+    # One board snapshot per move (post-move state) — lets the Training
+    # Monitor (and the AlphaZero Arena replay page) play the *entire* game
+    # move by move instead of only ever seeing the final position.
+    board_history: list[list[list[int]]] = [game.board_list()]
     move_count = 0
 
     while not game.done:
@@ -48,6 +52,7 @@ def play_self_play_game(
 
         move_history.append({"action": action, "player": int(game.current_player)})
         game.step(action)
+        board_history.append(game.board_list())
         move_count += 1
 
     winner = game.winner
@@ -61,5 +66,6 @@ def play_self_play_game(
         "winner": int(winner) if winner is not None else 0,
         "num_moves": move_count,
         "final_board": game.board_list(),
+        "board_history": board_history,
     }
     return examples, record

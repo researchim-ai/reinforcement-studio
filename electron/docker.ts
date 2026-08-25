@@ -2,7 +2,8 @@ import Docker from 'dockerode'
 import fs from 'fs'
 import path from 'path'
 
-const IMAGE_NAME = 'rl-studio:latest'
+const IMAGE_NAME_CPU = 'rl-studio:latest'
+const IMAGE_NAME_GPU = 'rl-studio:gpu'
 const CONTAINER_NAME = 'rl-studio-backend'
 const CONTAINER_PORT = 8000
 
@@ -20,6 +21,7 @@ export class DockerManager {
   private containerId: string | null = null
   private hostPort: number | null = null
   private projectRoot: string
+  private buildStream: NodeJS.ReadableStream | null = null
 
   constructor(projectRoot?: string) {
     this.docker = new Docker()
@@ -39,14 +41,14 @@ export class DockerManager {
     }
   }
 
-  hasDockerfile(): boolean {
-    return fs.existsSync(path.join(this.projectRoot, 'Dockerfile'))
+  hasDockerfile(gpu = false): boolean {
+    return fs.existsSync(path.join(this.projectRoot, gpu ? 'Dockerfile.gpu' : 'Dockerfile'))
   }
 
-  async imageExists(): Promise<boolean> {
+  async imageExists(gpu = false): Promise<boolean> {
     try {
       const images = await this.docker.listImages({
-        filters: { reference: [IMAGE_NAME] },
+        filters: { reference: [gpu ? IMAGE_NAME_GPU : IMAGE_NAME_CPU] },
       })
       return images.length > 0
     } catch {
@@ -87,16 +89,26 @@ export class DockerManager {
   // Build
   // -----------------------------------------------------------------------
 
-  async buildImage(onProgress?: BuildProgress): Promise<{ success: boolean; error?: string }> {
-    if (!this.hasDockerfile()) {
-      return { success: false, error: `Dockerfile not found at ${this.projectRoot}/Dockerfile` }
+  async buildImage(onProgress?: BuildProgress, gpu = false, torchCudaChannel?: string): Promise<{ success: boolean; error?: string }> {
+    const dockerfile = gpu ? 'Dockerfile.gpu' : 'Dockerfile'
+    if (!this.hasDockerfile(gpu)) {
+      return { success: false, error: `${dockerfile} not found at ${this.projectRoot}/${dockerfile}` }
     }
 
     try {
       const stream = await this.docker.buildImage(
         { context: this.projectRoot, src: ['.'] },
-        { t: IMAGE_NAME, dockerfile: 'Dockerfile' },
+        {
+          t: gpu ? IMAGE_NAME_GPU : IMAGE_NAME_CPU,
+          dockerfile,
+          // Only meaningful for Dockerfile.gpu (plain Dockerfile has no
+          // matching ARG) — which CUDA wheel channel torch gets installed
+          // from, picked from the host's driver right before the build
+          // (see electron/gpu.ts's pickTorchCudaChannel).
+          buildargs: gpu && torchCudaChannel ? { TORCH_CUDA_CHANNEL: torchCudaChannel } : undefined,
+        },
       )
+      this.buildStream = stream
 
       await new Promise<void>((resolve, reject) => {
         this.docker.modem.followProgress(
@@ -120,7 +132,21 @@ export class DockerManager {
       return { success: true }
     } catch (error) {
       return { success: false, error: String(error) }
+    } finally {
+      this.buildStream = null
     }
+  }
+
+  /** Aborts an in-progress buildImage() call (destroys its HTTP connection
+   * to the daemon, which the daemon treats as a client disconnect and stops
+   * the build) — lets the user bail out of e.g. an Auto-mode boot that
+   * picked Docker and is now downloading a multi-GB CUDA image, instead of
+   * being stuck watching it with no escape but force-quitting the app. */
+  cancelBuild(): void {
+    try {
+      (this.buildStream as { destroy?: () => void } | null)?.destroy?.()
+    } catch { /* ignore */ }
+    this.buildStream = null
   }
 
   // -----------------------------------------------------------------------
@@ -159,7 +185,7 @@ export class DockerManager {
       const deviceRequests = opts.gpu ? [{ Count: -1, Capabilities: [['gpu']] }] : undefined
 
       const container = await this.docker.createContainer({
-        Image: IMAGE_NAME,
+        Image: opts.gpu ? IMAGE_NAME_GPU : IMAGE_NAME_CPU,
         name: CONTAINER_NAME,
         Cmd: ['python', '-m', 'uvicorn', 'backend.api:app', '--host', '0.0.0.0', '--port', String(CONTAINER_PORT)],
         ExposedPorts: { [`${CONTAINER_PORT}/tcp`]: {} },

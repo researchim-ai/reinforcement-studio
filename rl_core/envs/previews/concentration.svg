@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" width="320" height="180">
+  <rect width="320" height="180" fill="#151520"/>
+  <g stroke="#44445a" stroke-width="1">
+    <rect x="30" y="60" width="50" height="66" rx="4" fill="#2c2c38"/>
+    <rect x="90" y="60" width="50" height="66" rx="4" fill="#4c4c66"/>
+    <rect x="150" y="60" width="50" height="66" rx="4" fill="#2c2c38"/>
+    <rect x="210" y="60" width="50" height="66" rx="4" fill="#4c4c66"/>
+  </g>
+  <text x="115" y="100" text-anchor="middle" font-size="26" fill="#f0c93c" font-family="sans-serif">★</text>
+  <text x="235" y="100" text-anchor="middle" font-size="26" fill="#818cf8" font-family="sans-serif">♦</text>
+  <text x="55" y="100" text-anchor="middle" font-size="20" fill="#5a5a70" font-family="sans-serif">?</text>
+  <text x="175" y="100" text-anchor="middle" font-size="20" fill="#5a5a70" font-family="sans-serif">?</text>
+  <text x="160" y="150" text-anchor="middle" font-size="12" fill="#a1a1b5" font-family="sans-serif">Значение видно только в момент переворота</text>
+</svg>

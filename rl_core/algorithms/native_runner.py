@@ -16,10 +16,26 @@ from rl_core.algorithms.native.dqn import NativeDQN
 from rl_core.algorithms.native.networks import policy_name
 from rl_core.algorithms.native.ppo import DEFAULT_HYPERPARAMS as PPO_DEFAULTS
 from rl_core.algorithms.native.ppo import NativePPO
+from rl_core.algorithms.native.rainbow_dqn import DEFAULT_HYPERPARAMS as RAINBOW_DQN_DEFAULTS
+from rl_core.algorithms.native.rainbow_dqn import NativeRainbowDQN
+from rl_core.algorithms.native.sac import DEFAULT_HYPERPARAMS as SAC_DEFAULTS
+from rl_core.algorithms.native.sac import NativeSAC
 from rl_core.algorithms.runner_utils import run_custom_algorithm
 
-ALGO_CLASSES = {"ppo": NativePPO, "dqn": NativeDQN, "a2c": NativeA2C}
-DEFAULT_HYPERPARAMS = {"ppo": PPO_DEFAULTS, "dqn": DQN_DEFAULTS, "a2c": A2C_DEFAULTS}
+ALGO_CLASSES = {
+    "ppo": NativePPO,
+    "dqn": NativeDQN,
+    "a2c": NativeA2C,
+    "rainbow_dqn": NativeRainbowDQN,
+    "sac": NativeSAC,
+}
+DEFAULT_HYPERPARAMS = {
+    "ppo": PPO_DEFAULTS,
+    "dqn": DQN_DEFAULTS,
+    "a2c": A2C_DEFAULTS,
+    "rainbow_dqn": RAINBOW_DQN_DEFAULTS,
+    "sac": SAC_DEFAULTS,
+}
 
 
 def run(config: dict[str, Any], run_dir: Path) -> None:

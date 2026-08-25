@@ -33,6 +33,8 @@ const Environments = lazyWithReload(() => import('@/pages/Environments').then((m
 const AlphaZeroArena = lazyWithReload(() => import('@/pages/AlphaZeroArena').then((m) => ({ default: m.AlphaZeroArena })))
 const ModelZoo = lazyWithReload(() => import('@/pages/ModelZoo').then((m) => ({ default: m.ModelZoo })))
 const PluginsPage = lazyWithReload(() => import('@/pages/Plugins').then((m) => ({ default: m.PluginsPage })))
+const NetworkBuilderPage = lazyWithReload(() => import('@/pages/NetworkBuilder').then((m) => ({ default: m.NetworkBuilderPage })))
+const Academy = lazyWithReload(() => import('@/pages/Academy').then((m) => ({ default: m.Academy })))
 const SettingsPage = lazyWithReload(() => import('@/pages/Settings').then((m) => ({ default: m.SettingsPage })))
 
 function PageFallback() {
@@ -55,6 +57,8 @@ export default function App() {
           <Route path="/arena" element={<Suspense fallback={<PageFallback />}><AlphaZeroArena /></Suspense>} />
           <Route path="/models" element={<Suspense fallback={<PageFallback />}><ModelZoo /></Suspense>} />
           <Route path="/plugins" element={<Suspense fallback={<PageFallback />}><PluginsPage /></Suspense>} />
+          <Route path="/network-builder" element={<Suspense fallback={<PageFallback />}><NetworkBuilderPage /></Suspense>} />
+          <Route path="/academy" element={<Suspense fallback={<PageFallback />}><Academy /></Suspense>} />
           <Route path="/settings" element={<Suspense fallback={<PageFallback />}><SettingsPage /></Suspense>} />
         </Route>
       </Routes>
