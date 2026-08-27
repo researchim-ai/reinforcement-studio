@@ -3,18 +3,13 @@ import { AlertTriangle, Boxes, Cpu, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
-import type { InspectResult, SpaceInfo } from '@/api/types'
-
-function formatSpace(space?: SpaceInfo | null): string {
-  if (!space) return '—'
-  if (space.n !== undefined) return `${space.type}(n=${space.n})`
-  if (space.shape && space.shape.length > 0) return `${space.type}[${space.shape.join('×')}]`
-  return space.type
-}
+import { formatSpace, spaceSize } from '@/lib/spaceInfo'
+import type { InspectResult } from '@/api/types'
 
 export interface InspectPanelProps {
   data: InspectResult | undefined
   isFetching: boolean
+  sceneAgentCount?: number | null
 }
 
 /** Live, read-only preview docked over the Designer canvas — shows the
@@ -29,7 +24,7 @@ export interface InspectPanelProps {
  * dozens of times a second when its own props haven't actually changed.
  * That repeated repaint of a blurred, elevated card is what read as a
  * strong flicker while dragging. */
-export const InspectPanel = memo(function InspectPanel({ data, isFetching }: InspectPanelProps) {
+export const InspectPanel = memo(function InspectPanel({ data, isFetching, sceneAgentCount }: InspectPanelProps) {
   const env = data?.environment
   const net = data?.network
   const obsChangedByWrappers =
@@ -50,9 +45,22 @@ export const InspectPanel = memo(function InspectPanel({ data, isFetching }: Ins
             <p className="text-muted-foreground">Выберите среду</p>
           ) : (
             <>
-              <div className="flex justify-between gap-2">
-                <span className="text-muted-foreground">Наблюдения (вход)</span>
-                <span className="text-right font-mono">{formatSpace(env.observation_space)}</span>
+              {sceneAgentCount != null && sceneAgentCount > 0 && (
+                <p className="rounded-md bg-primary/10 px-2 py-1 text-[10px] text-primary">
+                  3D-сцена: {sceneAgentCount} агент(ов) в одном мире, общая политика (parameter sharing).
+                  Поле num_envs в узле обучения игнорируется.
+                </p>
+              )}
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-muted-foreground">Входов (наблюдения)</span>
+                <span className="text-right">
+                  <span className="font-mono text-sm font-semibold text-foreground">
+                    {spaceSize(env.observation_space) ?? '—'}
+                  </span>
+                  <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">
+                    {formatSpace(env.observation_space)}
+                  </span>
+                </span>
               </div>
               {obsChangedByWrappers && (
                 <div className="flex justify-between gap-2 text-[10px] text-muted-foreground/70">
@@ -60,9 +68,16 @@ export const InspectPanel = memo(function InspectPanel({ data, isFetching }: Ins
                   <span className="text-right font-mono line-through">{formatSpace(env.raw_observation_space)}</span>
                 </div>
               )}
-              <div className="flex justify-between gap-2">
-                <span className="text-muted-foreground">Действия (выход)</span>
-                <span className="text-right font-mono">{formatSpace(env.action_space)}</span>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-muted-foreground">Выходов (действия)</span>
+                <span className="text-right">
+                  <span className="font-mono text-sm font-semibold text-foreground">
+                    {spaceSize(env.action_space) ?? '—'}
+                  </span>
+                  <span className="ml-1.5 font-mono text-[10px] text-muted-foreground">
+                    {formatSpace(env.action_space)}
+                  </span>
+                </span>
               </div>
             </>
           )}

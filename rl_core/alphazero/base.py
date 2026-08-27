@@ -127,7 +127,7 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
         self.replay_buffer: deque = deque(maxlen=self.hp["buffer_size"])
         self.best_state = copy.deepcopy(self.net.state_dict())
 
-    def _train_epochs(self, examples: list[tuple[np.ndarray, np.ndarray, float]]) -> float:
+    def _train_epochs(self, examples: list[tuple[np.ndarray, np.ndarray, float]]) -> dict[str, float]:
         net, optimizer, hp, device = self.net, self.optimizer, self.hp, self.device
         net.train()
         states = torch.as_tensor(np.stack([e[0] for e in examples]), dtype=torch.float32, device=device)
@@ -135,7 +135,7 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
         values = torch.as_tensor(np.array([e[2] for e in examples]), dtype=torch.float32, device=device)
 
         n = len(examples)
-        total_loss = 0.0
+        total_loss, total_policy_loss, total_value_loss = 0.0, 0.0, 0.0
         num_batches = 0
         for _ in range(hp["epochs"]):
             perm = torch.randperm(n)
@@ -153,8 +153,15 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
                 optimizer.step()
 
                 total_loss += loss.item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
                 num_batches += 1
-        return total_loss / max(num_batches, 1)
+        num_batches = max(num_batches, 1)
+        return {
+            "loss": total_loss / num_batches,
+            "policy_loss": total_policy_loss / num_batches,
+            "value_loss": total_value_loss / num_batches,
+        }
 
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         self.net.load_state_dict(self.best_state)
@@ -170,9 +177,9 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
             if g < 3:
                 iteration_records.append(record)
 
-        loss = 0.0
+        loss_metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
         if len(self.replay_buffer) >= self.hp["batch_size"]:
-            loss = self._train_epochs(list(self.replay_buffer))
+            loss_metrics = self._train_epochs(list(self.replay_buffer))
 
         prev_net = self.build_network()
         prev_net.load_state_dict(self.best_state)
@@ -194,7 +201,9 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
 
         last_game = iteration_records[-1] if iteration_records else None
         return {
-            "loss": round(loss, 4),
+            "loss": round(loss_metrics["loss"], 4),
+            "policy_loss": round(loss_metrics["policy_loss"], 4),
+            "value_loss": round(loss_metrics["value_loss"], 4),
             "win_rate_vs_prev": round(win_rate, 3),
             "accepted": accepted,
             "arena": match,

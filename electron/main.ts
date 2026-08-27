@@ -6,6 +6,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import { DockerManager } from './docker'
 import { loadConfig, saveConfig, type AppConfig, type BackendMode } from './config'
 import { detectGpus, detectMaxCudaVersion, pickTorchCudaChannel, type DetectedGpu } from './gpu'
+import { migrateLegacyUserData } from './migrateUserData'
 import { ensurePythonEnv } from './pythonEnv'
 
 if (process.platform === 'linux') {
@@ -79,6 +80,27 @@ function getResourcePath(...segments: string[]): string {
     return path.join(__dirname, '..', ...segments)
   }
   return path.join(process.resourcesPath, ...segments)
+}
+
+// Mirrors exactly which directory each backend mode's `rl_core.paths.RUNS_DIR`
+// resolves to *on the host* — the backend itself may report a container-
+// internal path (Docker) that means nothing to the OS file manager here, so
+// the Training Monitor's "open run folder" button asks the main process to
+// resolve/open it instead of trusting whatever path the API returns.
+// - Docker: `${getResourcePath()}/rl_core/.runs` is bind-mounted to
+//   `/app/rl_core/.runs` in the container (see docker.ts's `Binds`, and the
+//   matching `new DockerManager(getResourcePath())` call below).
+// - Native, packaged: `RL_STUDIO_ROOT=userData/rl_data` is passed to the
+//   spawned Python process (see startBackendNative below), so its RUNS_DIR
+//   is `userData/rl_data/.runs`.
+// - Native, dev: no `RL_STUDIO_ROOT` override — `rl_core.paths.ROOT` falls
+//   back to the `rl_core/` package dir itself, same as `getResourcePath()`
+//   resolves to in dev.
+function getHostRunsDir(): string {
+  if (currentMode === 'docker' || isDev) {
+    return getResourcePath('rl_core', '.runs')
+  }
+  return path.join(app.getPath('userData'), 'rl_data', '.runs')
 }
 
 function getIconPath(): string | undefined {
@@ -526,18 +548,46 @@ async function stopBackend() {
 
   if (!backendProcess) return
   console.log('[backend] Stopping native...')
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(backendProcess.pid), '/f', '/t'])
-    } else {
-      backendProcess.kill('SIGTERM')
-      setTimeout(() => backendProcess?.kill('SIGKILL'), 3000)
-    }
-  } catch (err) {
-    console.error('[backend] Error stopping:', err)
-  }
+  const proc = backendProcess
   backendProcess = null
   currentMode = 'offline'
+
+  // Previously this fired SIGTERM/SIGKILL and returned immediately without
+  // ever waiting for the process to actually die. That's harmless if
+  // nothing else cares, but `before-quit` awaits this expecting it to mean
+  // "the backend is gone" — since that handler didn't call
+  // `e.preventDefault()` either (see below), Electron tore the whole app
+  // down before either signal reliably landed, let alone before a 3s
+  // SIGKILL fallback timer got a chance to fire. Every single quit could
+  // leave `uvicorn`/the Python venv behind as an orphan holding the port —
+  // exactly the pile of stale backend processes from every past launch
+  // found accumulated on a real install. Now this genuinely blocks (up to
+  // a hard 5s cap) until the process is confirmed gone.
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    proc.once('exit', finish)
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'])
+      } else {
+        proc.kill('SIGTERM')
+      }
+    } catch (err) {
+      console.error('[backend] Error stopping:', err)
+    }
+    // PyTorch/native ops don't yield back to Python's signal handler until
+    // they return, so a busy training step can ignore SIGTERM for a bit —
+    // escalate rather than wait forever.
+    setTimeout(() => {
+      try { proc.kill('SIGKILL') } catch { /* already dead */ }
+    }, 3000)
+    setTimeout(finish, 5000)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +607,11 @@ if (!gotSingleInstanceLock) {
 }
 
 app.whenReady().then(async () => {
+  // Must run before anything below reads config.json or checks for an
+  // installed venv — see migrateUserData.ts for why this app's userData
+  // folder can change out from under an existing install after a rebuild.
+  migrateLegacyUserData()
+
   buildAppMenu()
   dockerManager = new DockerManager(getResourcePath())
   registerIpcHandlers()
@@ -584,15 +639,26 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
+// An `async` listener alone does NOT make Electron wait for it — without a
+// synchronous `e.preventDefault()`, the quit sequence (and the whole
+// process) proceeds immediately in parallel with whatever this handler
+// awaits, so `stopBackend()` frequently lost the race against the process
+// actually exiting. That's exactly how every past launch left an orphaned
+// `uvicorn`/venv process (and, for Docker mode, a running container)
+// behind: the SIGTERM got sent but the app was gone before SIGKILL's grace
+// period — or the container stop call — ever got to finish. `isQuitting`
+// prevents the `app.quit()` below (which re-emits this same event) from
+// looping forever now that the default action is actually prevented.
+let isQuitting = false
 app.on('before-quit', async (e) => {
-  if (currentMode === 'docker' && dockerManager) {
-    e.preventDefault()
-    try { await dockerManager.stopContainer() } catch { /* ignore */ }
-    currentMode = 'offline'
+  if (isQuitting) return
+  isQuitting = true
+  e.preventDefault()
+  try {
+    await stopBackend()
+  } finally {
     app.quit()
-    return
   }
-  await stopBackend()
 })
 
 // ---------------------------------------------------------------------------
@@ -720,5 +786,18 @@ function registerIpcHandlers() {
   ipcMain.handle('dialog:pickDirectory', async () => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
     return dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'] })
+  })
+
+  // A run's saved weights, episode GIFs, logs and metadata (config.json,
+  // metrics.json, network.json, ...) all live together in one folder — see
+  // `rl_core/paths.py::run_dir`. The Training Monitor shows this as a
+  // clickable absolute path per run; resolved/opened here (not by trusting
+  // whatever path the backend API reports) so it's always the real path on
+  // *this* machine, even when the backend is running inside Docker.
+  ipcMain.handle('runs:hostPath', (_event, runId: string) => path.join(getHostRunsDir(), runId))
+  ipcMain.handle('runs:openFolder', async (_event, runId: string) => {
+    const dir = path.join(getHostRunsDir(), runId)
+    const result = await shell.openPath(dir)
+    if (result) throw new Error(result)
   })
 }

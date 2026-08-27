@@ -12,8 +12,11 @@ from stable_baselines3 import A2C, DQN, PPO
 from stable_baselines3.common.monitor import Monitor
 
 from rl_core.algorithms.metrics_callback import MetricsCallback
+from rl_core.algorithms.resume import resolve_resume_source
 from rl_core.device import resolve_device
 from rl_core.envs.wrappers import apply_wrappers
+from rl_core import scene_store
+from rl_core.envs.factory import make_training_env
 from rl_core.inspect import _describe_layers
 
 try:
@@ -43,7 +46,22 @@ def _filter_kwargs(cls: type, hyperparams: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in hyperparams.items() if k in accepted}
 
 
+def _make_monitored_env(env_id: str, wrapper_specs: list[dict]) -> gym.Env:
+    """Picklable env factory target for `AsyncVectorEnv` worker processes."""
+    return Monitor(_make_env(env_id, wrapper_specs))
+
+
+def make_monitored_env_factory(env_id: str, wrapper_specs: list[dict] | None = None):
+    """Returns a picklable zero-arg callable — safe to ship to subprocess
+    workers on Windows/Electron (`functools.partial` of a module function)."""
+    from functools import partial
+
+    return partial(_make_monitored_env, env_id, list(wrapper_specs or []))
+
+
 def _make_env(env_id: str, wrapper_specs: list[dict], render: bool = False) -> gym.Env:
+    if scene_store.is_scene_env_id(env_id):
+        return make_training_env(env_id, wrapper_specs, render=render)
     env = gym.make(env_id, render_mode="rgb_array" if render else None)
     env = apply_wrappers(env, wrapper_specs)
     if isinstance(env.observation_space, (gym.spaces.Tuple, gym.spaces.Dict)):
@@ -103,7 +121,17 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
 
     model_kwargs = _filter_kwargs(algo_cls, hyperparams)
     policy = _policy_for_env(train_env)
-    model = algo_cls(policy, train_env, seed=seed, verbose=0, device=device, **model_kwargs)
+
+    # `training.resume_from` — same fine-tune/continue-training feature as
+    # the native runner (see rl_core/algorithms/resume.py), just via SB3's
+    # own `.load()` classmethod, which already restores optimizer state
+    # and everything else needed to keep training a `BaseAlgorithm` model.
+    resume_cfg = training_cfg.get("resume_from")
+    if resume_cfg:
+        model_path = resolve_resume_source(resume_cfg, config.get("algorithm", {}).get("id", algo_label))
+        model = algo_cls.load(str(model_path), env=train_env, device=device)
+    else:
+        model = algo_cls(policy, train_env, seed=seed, verbose=0, device=device, **model_kwargs)
 
     total_params = sum(p.numel() for p in model.policy.parameters())
     static_info = {
@@ -117,6 +145,8 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
         "wrappers": wrapper_specs,
         "seed": seed,
     }
+    if resume_cfg:
+        static_info["resumed_from"] = resume_cfg
 
     callback = MetricsCallback(
         run_dir=run_dir,

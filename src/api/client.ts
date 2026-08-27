@@ -4,6 +4,7 @@ import type {
   ArenaOpponent,
   EnvKind,
   EnvSpec,
+  EvaluateResult,
   ExperimentConfig,
   GameInfo,
   InspectResult,
@@ -13,12 +14,19 @@ import type {
   NetworkMeta,
   NetworkPreviewRequest,
   NetworkPreviewResult,
+  NetworkSnapshot,
+  NetworkSpec,
   PluginKind,
   PluginScriptMeta,
   PluginTemplate,
   RunSummary,
+  SceneMeta,
+  SceneSpec,
+  SweepDetail,
+  SweepSummary,
   SystemInfo,
   ValidateResult,
+  WrapperNode,
   WrapperSpec,
 } from './types'
 
@@ -76,7 +84,12 @@ export const api = {
   inspectDesign: (payload: {
     kind: EnvKind
     environment: { id: string; wrappers?: { type: string; params: Record<string, number | string> }[] }
-    algorithm: { id: string; hyperparams: Record<string, number> }
+    algorithm: {
+      id: string
+      hyperparams: Record<string, number>
+      network_spec_id?: string | null
+      network_spec?: NetworkSpec | null
+    }
   }) => request<InspectResult>('/environments/inspect', { method: 'POST', body: JSON.stringify(payload) }),
   resolveUrl: async (path: string) => {
     const base = await basePromise
@@ -93,6 +106,10 @@ export const api = {
     request<{ run_id: string; stdout: string; stderr: string; error: string }>(
       `/training/runs/${runId}/logs?lines=${lines}`,
     ),
+  getMetricsHistory: (runId: string) =>
+    request<{ history: import('./types').MetricsSnapshot[] }>(`/training/runs/${runId}/metrics_history`),
+  getRunNetwork: (runId: string) => request<NetworkSnapshot>(`/training/runs/${runId}/network`),
+  getRunConfig: (runId: string) => request<ExperimentConfig>(`/training/runs/${runId}/config`),
   listSelfPlayIterations: (runId: string) =>
     request<{ iterations: string[] }>(`/training/runs/${runId}/games`),
   getSelfPlayGames: (runId: string, iteration: string) =>
@@ -108,6 +125,27 @@ export const api = {
     }),
   deleteCheckpoint: (name: string) =>
     request<{ success: boolean }>(`/models/checkpoints/${name}`, { method: 'DELETE' }),
+  getCheckpointNetwork: (name: string) => request<NetworkSnapshot>(`/models/checkpoints/${name}/network`),
+  getCheckpointConfig: (name: string) => request<ExperimentConfig>(`/models/checkpoints/${name}/config`),
+  evaluateModel: (payload: { source: 'run' | 'checkpoint'; id: string; episodes?: number; record_gif?: boolean; seed?: number | null }) =>
+    request<EvaluateResult>('/models/evaluate', { method: 'POST', body: JSON.stringify(payload) }),
+
+  startSweep: (payload: {
+    kind: EnvKind
+    name?: string | null
+    environment: { id: string; wrappers?: WrapperNode[] }
+    algorithm: { id: string; hyperparams: Record<string, number> }
+    training?: Record<string, unknown>
+    grid: Record<string, number[]>
+    seeds: number[]
+  }) => request<{ sweep_id: string; run_ids: string[]; total: number }>('/sweeps/start', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  listSweeps: () => request<{ sweeps: SweepSummary[] }>('/sweeps'),
+  getSweep: (sweepId: string) => request<SweepDetail>(`/sweeps/${sweepId}`),
+  deleteSweep: (sweepId: string) =>
+    request<{ success: boolean; deleted_runs: number }>(`/sweeps/${sweepId}`, { method: 'DELETE' }),
 
   listGames: () => request<{ games: GameInfo[] }>('/alphazero/games'),
   listOpponents: (gameId: string) => request<{ opponents: ArenaOpponent[] }>(`/alphazero/opponents?game_id=${gameId}`),
@@ -145,6 +183,13 @@ export const api = {
   deleteNetwork: (slug: string) => request<{ success: boolean }>(`/networks/${slug}`, { method: 'DELETE' }),
   previewNetwork: (payload: NetworkPreviewRequest) =>
     request<NetworkPreviewResult>('/networks/preview', { method: 'POST', body: JSON.stringify(payload) }),
+
+  listScenes: () => request<{ scenes: SceneMeta[] }>('/scenes'),
+  getDefaultScene: () => request<SceneSpec>('/scenes/default'),
+  getScene: (slug: string) => request<{ slug: string } & SceneSpec>(`/scenes/${slug}`),
+  saveScene: (slug: string, doc: SceneSpec) =>
+    request<{ success: boolean; id: string }>(`/scenes/${slug}`, { method: 'PUT', body: JSON.stringify(doc) }),
+  deleteScene: (slug: string) => request<{ success: boolean }>(`/scenes/${slug}`, { method: 'DELETE' }),
 }
 
 export function createMetricsWebSocket(

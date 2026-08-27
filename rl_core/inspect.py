@@ -93,13 +93,22 @@ def _io_shapes(observation_space: Any, action_space: Any) -> dict[str, Any]:
 def inspect_gym(env_id: str, wrapper_specs: list[dict], algo_id: str, hyperparams: dict[str, Any]) -> dict[str, Any]:
     import gymnasium as gym
 
+    from rl_core import scene_store
     from rl_core.algorithms.sb3_runner import _make_env, _space_info
+    from rl_core.algorithms.vec_env import action_space as single_action_space, obs_space
+    from rl_core.envs.factory import make_inspect_env
 
     try:
-        raw_env = gym.make(env_id)
-        raw_observation_space = _space_info(raw_env.observation_space)
-        raw_action_space = _space_info(raw_env.action_space)
-        raw_env.close()
+        if scene_store.is_scene_env_id(env_id):
+            raw_env = make_inspect_env(env_id, wrapper_specs)
+            raw_observation_space = _space_info(obs_space(raw_env))
+            raw_action_space = _space_info(single_action_space(raw_env))
+            raw_env.close()
+        else:
+            raw_env = gym.make(env_id)
+            raw_observation_space = _space_info(raw_env.observation_space)
+            raw_action_space = _space_info(raw_env.action_space)
+            raw_env.close()
     except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not a crash
         return {"environment": None, "network": None, "error": f"Не удалось создать среду: {exc}"}
 
@@ -120,8 +129,8 @@ def inspect_gym(env_id: str, wrapper_specs: list[dict], algo_id: str, hyperparam
     environment = {
         "raw_observation_space": raw_observation_space,
         "raw_action_space": raw_action_space,
-        "observation_space": _space_info(env.observation_space),
-        "action_space": _space_info(env.action_space),
+        "observation_space": _space_info(obs_space(env)),
+        "action_space": _space_info(single_action_space(env)),
     }
 
     network = None
@@ -137,11 +146,15 @@ def inspect_gym(env_id: str, wrapper_specs: list[dict], algo_id: str, hyperparam
 
 
 def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) -> dict[str, Any]:
+    from rl_core.algorithms.vec_env import action_space as vec_action_space, obs_space
     from rl_core.algorithms.native.networks import (
         ActorCriticNet,
+        DeterministicPolicy,
         DuelingQNetwork,
+        ESPolicyNet,
         GaussianPolicy,
         QNetwork,
+        QuantileDuelingQNetwork,
         RecurrentActorCriticNet,
         RecurrentDuelingQNetwork,
         RecurrentQNetwork,
@@ -149,7 +162,9 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
         policy_name,
     )
 
-    io = _io_shapes(env.observation_space, env.action_space)
+    obs_sp = obs_space(env)
+    act_sp = vec_action_space(env)
+    io = _io_shapes(obs_sp, act_sp)
 
     if isinstance(algo_id, str) and algo_id.startswith("custom:"):
         from stable_baselines3.common.base_class import BaseAlgorithm
@@ -182,6 +197,14 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
         return {**_network_summary(module, "custom"), **io}
 
     algo_id = (algo_id or "ppo").lower()
+    # A hand-designed architecture (Network Builder page, or the Designer's
+    # quick layer editor) — see `rl_core/algorithms/native/{ppo,a2c,dqn,
+    # rainbow_dqn}.py`, which all check for this exact key and build the
+    # matching `Spec*Net` instead of their fixed-architecture default. Takes
+    # priority over memory/NoisyNet/distributional, exactly like those
+    # runtime algorithms do, so the preview never disagrees with the actual
+    # run.
+    network_spec = hyperparams.get("network_spec")
     memory_type = memory_type_from_hyperparams(hyperparams) if algo_id in ("dqn", "rainbow_dqn", "ppo", "a2c") else None
     noisy_kwargs = {
         "noisy": int(hyperparams.get("action_exploration", 0) or 0) == 1,
@@ -191,31 +214,48 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
         "hidden_size": int(hyperparams.get("memory_hidden_size", 128)),
         "num_layers": int(hyperparams.get("memory_num_layers", 1)),
     }
-    if algo_id == "dqn":
+    if network_spec and algo_id in ("dqn", "rainbow_dqn", "ppo", "a2c"):
+        from rl_core.netbuilder import SpecActorCriticNet, SpecDuelingQNetwork, SpecQNetwork
+
+        if algo_id == "dqn":
+            module = SpecQNetwork(obs_sp, int(act_sp.n), network_spec)
+        elif algo_id == "rainbow_dqn":
+            module = SpecDuelingQNetwork(obs_sp, int(act_sp.n), network_spec)
+        else:
+            module = SpecActorCriticNet(obs_sp, act_sp, network_spec)
+    elif algo_id == "dqn":
         module = (
-            RecurrentQNetwork(env.observation_space, int(env.action_space.n), memory_type, **memory_kwargs, **noisy_kwargs)
+            RecurrentQNetwork(obs_sp, int(act_sp.n), memory_type, **memory_kwargs, **noisy_kwargs)
             if memory_type
-            else QNetwork(env.observation_space, int(env.action_space.n), **noisy_kwargs)
+            else QNetwork(obs_sp, int(act_sp.n), **noisy_kwargs)
         )
     elif algo_id == "rainbow_dqn":
-        module = (
-            RecurrentDuelingQNetwork(env.observation_space, int(env.action_space.n), memory_type, **memory_kwargs, **noisy_kwargs)
-            if memory_type
-            else DuelingQNetwork(env.observation_space, int(env.action_space.n), **noisy_kwargs)
-        )
-    elif algo_id == "sac":
+        distributional = bool(int(hyperparams.get("distributional", 0) or 0)) and not memory_type
+        if memory_type:
+            module = RecurrentDuelingQNetwork(obs_sp, int(act_sp.n), memory_type, **memory_kwargs, **noisy_kwargs)
+        elif distributional:
+            module = QuantileDuelingQNetwork(
+                obs_sp, int(act_sp.n),
+                num_quantiles=max(2, int(hyperparams.get("num_quantiles", 51))), **noisy_kwargs,
+            )
+        else:
+            module = DuelingQNetwork(obs_sp, int(act_sp.n), **noisy_kwargs)
+    elif algo_id in ("sac", "ddpg", "td3"):
         import numpy as np
 
-        low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
-        high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
-        module = GaussianPolicy(env.observation_space, low, high)
+        low = np.asarray(act_sp.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(act_sp.high, dtype=np.float32).reshape(-1)
+        module = GaussianPolicy(obs_sp, low, high) if algo_id == "sac" else DeterministicPolicy(obs_sp, low, high)
+    elif algo_id == "es":
+        module = ESPolicyNet(obs_sp, act_sp)
     else:
         module = (
-            RecurrentActorCriticNet(env.observation_space, env.action_space, memory_type, **memory_kwargs)
+            RecurrentActorCriticNet(obs_sp, act_sp, memory_type, **memory_kwargs)
             if memory_type
-            else ActorCriticNet(env.observation_space, env.action_space)
+            else ActorCriticNet(obs_sp, act_sp)
         )
-    return {**_network_summary(module, policy_name(env.observation_space)), **io}
+    policy = "custom-net" if (network_spec and algo_id in ("dqn", "rainbow_dqn", "ppo", "a2c")) else policy_name(obs_sp)
+    return {**_network_summary(module, policy), **io}
 
 
 def inspect_alphazero(env_id: str, algo_id: str, hyperparams: dict[str, Any]) -> dict[str, Any]:

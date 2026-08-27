@@ -19,3 +19,9 @@ torch>=2.2
 gymnasium[box2d,mujoco,atari]>=0.29
 stable-baselines3>=2.3
 pillow>=10.0
+# gymnasium.wrappers.ResizeObservation (Resize Observation in the wrapper
+# catalog — see rl_core/envs/wrappers.py) shells out to OpenCV to resize
+# frames. Listed explicitly rather than relying on some other dependency
+# pulling it in transitively — headless build since this never touches a
+# display/GUI.
+opencv-python-headless>=4.8

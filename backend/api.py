@@ -11,7 +11,10 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.routes import alphazero, environments, models, networks, plugins, system, training
+import asyncio
+
+from backend import sweep_manager
+from backend.routes import alphazero, environments, models, networks, plugins, scenes, sweeps, system, training
 from backend.ws import router as ws_router
 
 app = FastAPI(title="Reinforcement Studio API", version="0.1.0")
@@ -31,4 +34,16 @@ app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(alphazero.router, prefix="/api/alphazero", tags=["alphazero"])
 app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
 app.include_router(networks.router, prefix="/api/networks", tags=["networks"])
+app.include_router(scenes.router, prefix="/api/scenes", tags=["scenes"])
+app.include_router(sweeps.router, prefix="/api/sweeps", tags=["sweeps"])
 app.include_router(ws_router)
+
+
+@app.on_event("startup")
+async def _start_sweep_scheduler() -> None:
+    # Picks up the next queued run of any sweep (see
+    # `backend/sweep_manager.py`) whenever the previous member of that same
+    # sweep finishes — runs for the lifetime of the app, restarted for free
+    # on every backend restart since sweep state lives entirely in
+    # `RUNS_DIR`, not in memory.
+    asyncio.create_task(sweep_manager.scheduler_loop())

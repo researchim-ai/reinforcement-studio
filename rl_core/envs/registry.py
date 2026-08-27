@@ -15,9 +15,8 @@ register_pomdp_envs()
 
 ActionKind = Literal["discrete", "continuous"]
 
-_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c"]
-_CONTINUOUS = ["ppo", "a2c", "sac"]
-
+_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es"]
+_CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es"]
 
 @dataclass
 class EnvSpec:
@@ -37,6 +36,30 @@ class EnvSpec:
     # dozens of iterations, which reads as "training is broken" rather than
     # "this board needs a bigger budget".
     default_hyperparams: dict[str, float] | None = None
+    # Suggested `total_timesteps` for the Designer to pre-fill when this env
+    # is selected, overriding the flat 50k UI default. Exists because that
+    # 50k default is a reasonable budget for CartPole-class envs but wildly
+    # too small for pixel-input/hardcore envs — a user hitting "Run" with
+    # the default on e.g. CarRacing only ever sees the "car spins in place"
+    # stage and reasonably concludes training is broken, when it just never
+    # ran long enough to show anything else. `None` keeps the flat default.
+    recommended_total_timesteps: int | None = None
+    # Suggested `training.num_envs` (parallel env copies, see
+    # `rl_core/algorithms/vec_env.py`) for the Designer to pre-fill — set
+    # for envs heavy/slow enough per-step that batching several lanes'
+    # worth of experience per network update meaningfully helps (Atari,
+    # Box2D, MuJoCo). `None` keeps the flat default of 1.
+    recommended_num_envs: int | None = None
+    # Wrapper-graph nodes to pre-fill when this env is selected (see
+    # `handleEnvChange` in ExperimentDesigner.tsx) — `[{"type": ..., "params":
+    # {...}}, ...]` in the exact order they should be chained. Exists for
+    # pixel-input envs where the "right" preprocessing pipeline (frame
+    # skip/resize/grayscale/stack) is both non-obvious and, if skipped,
+    # silently leaves the CNN fed 3x more raw pixels than it needs — a user
+    # dropping CarRacing onto the canvas gets the whole rl-baselines3-zoo-
+    # tuned pipeline for free instead of having to know it exists.
+    # `None`/`[]` leaves wrappers empty like every other env.
+    recommended_wrappers: list[dict] | None = None
 
 
 def _env(
@@ -46,6 +69,8 @@ def _env(
     description: str,
     action_kind: ActionKind = "discrete",
     extra: str | None = None,
+    recommended_total_timesteps: int | None = None,
+    recommended_num_envs: int | None = None,
 ) -> EnvSpec:
     return EnvSpec(
         id=env_id,
@@ -55,6 +80,8 @@ def _env(
         action_kind=action_kind,
         compatible_algorithms=_CONTINUOUS if action_kind == "continuous" else _DISCRETE,
         extra_requirement=extra,
+        recommended_total_timesteps=recommended_total_timesteps,
+        recommended_num_envs=recommended_num_envs,
     )
 
 
@@ -97,10 +124,140 @@ GYM_ENVIRONMENTS: list[EnvSpec] = [
          action_kind="continuous", extra="box2d"),
     _env("BipedalWalkerHardcore-v3", "Bipedal Walker Hardcore", "box2d",
          "Ходьба с ямами, ступеньками и шипами — заметно сложнее обычного Walker.",
-         action_kind="continuous", extra="box2d"),
-    _env("CarRacing-v3", "Car Racing", "box2d",
-         "Пиксельная трасса сверху: руль и газ. Непрерывное управление + картинка.",
-         action_kind="continuous", extra="box2d"),
+         action_kind="continuous", extra="box2d", recommended_total_timesteps=5_000_000),
+    EnvSpec(
+        id="CarRacing-v3",
+        name="Car Racing",
+        category="box2d",
+        description="Пиксельная трасса сверху: руль, газ и тормоз — непрерывное управление по одной "
+                     "картинке 96×96. Одна из самых требовательных сред в галерее: (1) сеть должна сама "
+                     "выучить CNN-признаки трассы с нуля, (2) один кадр не показывает скорость/занос — "
+                     "без этого сигнала политика учится намного хуже, (3) экшены несимметричны (руль "
+                     "[-1,1], газ и тормоз [0,1]), (4) эпизод длинный (~1000 шагов), а сигнал вознаграждения "
+                     "разреженный (плюс за новую плитку трассы, минус за каждый шаг). Лучший выбор из "
+                     "наших алгоритмов — PPO: он самый устойчивый на pixel-input и continuous-actions "
+                     "одновременно, и именно его использует тюнинг rl-baselines3-zoo для этой среды. При "
+                     "выборе среды граф враппером заполняется автоматически цепочкой Frame Skip → Resize "
+                     "→ Grayscale → Frame Stack — как в zoo, это одновременно ускоряет шаг симуляции и "
+                     "даёт сети сигнал скорости/заноса, который один кадр физически не показывает "
+                     "(Normalize Reward сюда специально не входит — при нашей архитектуре враппером он "
+                     "искажает и график reward в мониторинге, а не только сигнал для обучения). SAC "
+                     "тоже работает, но на картинках он гораздо капризнее к learning_rate/buffer_size и "
+                     "учится медленнее из-за replay-буфера с картинками. Даже с этим тюнингом это честно "
+                     "трудная задача для model-free PPO: независимые воспроизведения community чаще "
+                     "выходят на плато в районе 350-700 (это не брак настройки — это типичный результат "
+                     "для Гауссовой continuous-политики здесь), надёжные 900+ — редкость без "
+                     "дополнительных трюков вроде Beta-распределения ниже. Рассчитывайте на 3-5 млн шагов "
+                     "до первых уверенных проездов круга; до пары сотен тысяч шагов машина обычно просто "
+                     "крутится на месте или улетает с трассы — это нормальная стадия обучения, а не баг. "
+                     "По умолчанию политика — Beta-распределение, а не Гауссиана: газ/тормоз "
+                     "односторонние [0,1], Гауссиана там систематически перескакивает границу и требует "
+                     "clip, который градиент не видит (в статьях это отдельно измерено на CarRacing: "
+                     "+63% успешности). Застряли на плато и дальше не растёт даже после нескольких млн "
+                     "шагов? Попробуйте увеличить 'Отдельный скрытый слой pi/value' до 256 (уже включено "
+                     "по умолчанию) или до 512 — по чужим воспроизведениям статей на этой среде большего "
+                     "размера головы иногда даёт больше, чем упор в саму CNN.",
+        action_kind="continuous",
+        compatible_algorithms=_CONTINUOUS,
+        extra_requirement="box2d",
+        default_hyperparams={
+            # SB3-zoo-tuned PPO settings for pixel CarRacing (see
+            # hyperparams/ppo.yml in DLR-RM/rl-baselines3-zoo):
+            # - Shorter rollouts collected more often beat the
+            #   CartPole/MuJoCo-sized default of 2048 steps, since each env
+            #   step here is much more expensive to simulate/render and the
+            #   CNN needs many more gradient updates per environment step to
+            #   make sense of raw pixels.
+            "n_steps": 512,
+            "batch_size": 128,
+            # zoo uses a lower, linearly-decaying LR (lin_1e-4) rather than
+            # the flat 3e-4 PPO default — a smaller, annealed LR keeps the
+            # CNN's late-training updates from overwriting an
+            # already-decent driving policy with one noisy rollout.
+            "learning_rate": 1e-4,
+            "lr_schedule": 1,
+            # gSDE (generalized State-Dependent Exploration, Raffin et al.
+            # 2021) samples one exploration noise matrix per
+            # `sde_sample_freq` steps instead of independent per-step
+            # Gaussian noise — for a continuous steering/gas/brake action
+            # this means multi-step-coherent exploration (e.g. "steer
+            # slightly left for the next few steps") instead of frame-to-
+            # frame jitter, which both explores more usefully and drives
+            # more smoothly. `sde_log_std_init=-2` starts exploration
+            # fairly tight, matching the zoo config.
+            # Beta (not gSDE) is the default exploration/action distribution
+            # here: CarRacing's action box is hard-bounded and one-sided on
+            # 2 of its 3 dims (gas/brake in [0,1]), and a Gaussian sampling
+            # outside that box needs a hard clip that the policy gradient
+            # never sees — a documented real bottleneck for exactly this
+            # env (Petrazzini & Antonelo 2021, +63% success rate on
+            # CarRacing swapping Gaussian -> Beta with PPO). Beta's support
+            # is exactly `[0,1]` so every sample is already valid, no clip
+            # needed. Mutually exclusive with gSDE in `ActorCriticNet`
+            # (Beta wins) since gSDE is specifically a Gaussian scheme —
+            # `use_sde` is left off rather than just unused so switching
+            # this back to 0 doesn't silently re-enable it.
+            "use_beta": 1,
+            "use_sde": 0,
+            "sde_sample_freq": 4,
+            "sde_log_std_init": -2.0,
+            # zoo's `net_arch=dict(pi=[256], vf=[256])` — a dedicated 256-
+            # wide layer per head instead of `mu_head`/`value_head` reading
+            # directly off the 512-dim CNN output (see `ActorCriticNet` in
+            # networks.py). Matters more here than on most envs: one frame
+            # has a lot going on (track curvature, edges, car pose) to
+            # compress into 3 continuous actions, and a bare linear head
+            # tends to plateau a few hundred points below a solved run.
+            "head_hidden_size": 256,
+            # SAC's replay buffer stores raw float32 (H, W, C) frames — at
+            # 96x96x3 that's ~110KB per observation, ~220KB per transition
+            # once you count obs+next_obs. The algorithm-wide default of
+            # 1,000,000 transitions would need ~220GB of RAM; this keeps it
+            # under ~5GB while still giving SAC a reasonably diverse buffer.
+            "buffer_size": 20_000,
+        },
+        # Matches zoo's own `n_timesteps: 4e6` for this exact config —
+        # earlier defaulted lower (2M) on the assumption that was "enough
+        # to see a clear trend", but 2M in practice plateaus well below a
+        # solved run (some real training runs land around ~500) even with
+        # the rest of this tuning; cheaper per-step now (frame skip +
+        # smaller frames) means this budget costs less wall-clock than the
+        # old 2M did before this pipeline existed.
+        recommended_total_timesteps=4_000_000,
+        recommended_num_envs=8,
+        # zoo's env_wrapper + frame_stack for CarRacing-v3, translated to
+        # our wrapper catalog and chained in the order they should wrap the
+        # base env (frame_skip innermost so Resize/Grayscale only ever run
+        # once per skipped block, not on every raw frame) — see
+        # `ChannelStackObservation` in rl_core/envs/wrappers.py for why
+        # Frame Stack needs `num_stack: 2` here to end up as a proper
+        # (64, 64, 2) CNN input rather than a 4-D shape nothing can read as
+        # an image. 2 stacked (already frame-skipped) frames is enough to
+        # recover velocity/drift; zoo uses the same `frame_stack: 2`.
+        #
+        # Deliberately *not* including `normalize_reward` here, unlike the
+        # zoo config's `norm_reward: True`: zoo applies that via
+        # `VecNormalize`, which sits *outside* `Monitor` in its wrapper
+        # stack, so the logged/plotted episode reward stays the real game
+        # score while only the training signal (advantage/return calc) sees
+        # the normalized one. Our `normalize_reward` is just another node
+        # in this same per-env chain with no such split — every consumer,
+        # including the Training Monitor UI and `episode_reward_mean`, ends
+        # up reading the *normalized* number instead of the actual 0-1000
+        # CarRacing score, and that normalization is itself unreliable
+        # early in a fresh run (gymnasium's own docs: "rewards will not be
+        # scaled correctly if the wrapper was newly instantiated"). Net
+        # effect if it were included: the reward chart stops meaning
+        # anything close to "getting closer to 1000" and can even swing
+        # negative on a perfectly fine run, which is exactly backwards from
+        # what this pipeline exists to help with.
+        recommended_wrappers=[
+            {"type": "frame_skip", "params": {"skip": 2}},
+            {"type": "resize_observation", "params": {"height": 64, "width": 64}},
+            {"type": "grayscale_observation", "params": {"keep_dim": True}},
+            {"type": "frame_stack", "params": {"num_stack": 2}},
+        ],
+    ),
     # --- MuJoCo / robotics ---
     _env("InvertedPendulum-v5", "Inverted Pendulum", "mujoco",
          "MuJoCo-версия CartPole: удержать шест непрерывным усилием.",
@@ -131,10 +288,10 @@ GYM_ENVIRONMENTS: list[EnvSpec] = [
          action_kind="continuous", extra="mujoco"),
     _env("Humanoid-v5", "Humanoid", "mujoco",
          "3D-гуманоид: ходить/бежать, не упав. Тяжёлая задача.",
-         action_kind="continuous", extra="mujoco"),
+         action_kind="continuous", extra="mujoco", recommended_total_timesteps=2_000_000),
     _env("HumanoidStandup-v5", "Humanoid Standup", "mujoco",
          "Гуманоид стартует лёжа — нужно встать. Ещё сложнее обычного Humanoid.",
-         action_kind="continuous", extra="mujoco"),
+         action_kind="continuous", extra="mujoco", recommended_total_timesteps=2_000_000),
     # --- Atari 2600 (ALE) ---
     _env("ALE/Pong-v5", "Pong", "atari",
          "Настольный теннис. Классика для проверки pixel-DQN.", extra="atari"),
@@ -403,6 +560,28 @@ GYM_ENVIRONMENTS: list[EnvSpec] = [
     ),
 ]
 
+# Atari/ALE titles are all pixel-input, sparse-reward arcade games — the
+# flat 50k-step Designer default barely covers a handful of lives, let
+# alone enough gradient updates for the CNN to learn anything. 5M steps is
+# a conservative "long enough to see a clear trend" budget (well below the
+# 40-200M frames papers use for fully-tuned scores, but far past the point
+# where a first run still looks like random play).
+for _spec in GYM_ENVIRONMENTS:
+    if _spec.category == "atari" and _spec.recommended_total_timesteps is None:
+        _spec.recommended_total_timesteps = 5_000_000
+
+# Atari/Box2D/MuJoCo envs render/simulate real physics or an emulator per
+# step, so batching several parallel copies (see
+# `rl_core/algorithms/vec_env.py`, `AsyncVectorEnv` with one subprocess
+# worker per lane) meaningfully cuts wall-clock — more, less-correlated
+# experience per network update still trains faster in practice than the
+# same total step budget from one lane. Classic control/toy text/POMDP envs
+# are cheap enough per-step that this rarely matters, so they keep the flat
+# default of 1.
+for _spec in GYM_ENVIRONMENTS:
+    if _spec.category in ("atari", "box2d", "mujoco") and _spec.recommended_num_envs is None:
+        _spec.recommended_num_envs = 8
+
 
 BOARD_GAMES: list[EnvSpec] = [
     EnvSpec(
@@ -510,6 +689,7 @@ def _gym_available(spec: EnvSpec) -> bool:
 def list_environments() -> list[dict]:
     """Returns gym + board game specs, each tagged with live availability."""
     from rl_core.envs.previews import preview_api_path
+    from rl_core import scene_store
 
     out: list[dict] = []
     for spec in GYM_ENVIRONMENTS:
@@ -520,6 +700,28 @@ def list_environments() -> list[dict]:
             "available": available,
             "preview_url": preview_api_path(spec.id),
             "preview_thumb_url": preview_api_path(spec.id, thumb=True),
+        })
+    for meta in scene_store.list_meta():
+        if meta.get("broken"):
+            continue
+        action_kind = meta.get("action_kind", "discrete")
+        out.append({
+            "id": meta["id"],
+            "name": meta.get("name") or meta["slug"],
+            "category": "scene",
+            "description": meta.get("description") or f"Пользовательская 3D-сцена · {meta.get('agent_count', 1)} агент(ов)",
+            "action_kind": action_kind,
+            "compatible_algorithms": _CONTINUOUS if action_kind == "continuous" else _DISCRETE,
+            "extra_requirement": None,
+            "default_hyperparams": None,
+            "recommended_total_timesteps": 50_000,
+            "recommended_num_envs": None,
+            "kind": "gym",
+            "available": True,
+            "preview_url": None,
+            "preview_thumb_url": None,
+            "scene_agent_count": meta.get("agent_count"),
+            "scene_slug": meta.get("slug"),
         })
     for spec in BOARD_GAMES:
         out.append({

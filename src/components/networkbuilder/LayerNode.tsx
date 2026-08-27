@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { ArrowDown, ArrowUp, Lock, X } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
+import { NumericInput } from '@/components/ui/numeric-input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { ACTIVATION_LABELS, LAYER_LABELS, LAYER_TYPES } from '@/lib/networkBuilder'
@@ -80,11 +81,10 @@ export const LayerNode = memo(function LayerNode({ data }: NodeProps & { data: L
             {locked ? (
               <Input disabled value="авто (по среде)" className="nodrag h-6 text-[11px]" />
             ) : (
-              <Input
-                type="number"
-                min={1}
-                value={layer.out_features ?? ''}
-                onChange={(e) => data.onChange({ ...layer, out_features: Math.max(1, Number(e.target.value) || 1) })}
+              <NumericInput
+                integer
+                value={layer.out_features ?? 1}
+                onChange={(v) => data.onChange({ ...layer, out_features: v })}
                 className="nodrag h-6 text-[11px]"
               />
             )}
@@ -95,7 +95,7 @@ export const LayerNode = memo(function LayerNode({ data }: NodeProps & { data: L
             <LabeledNum label="channels" value={layer.out_channels} onChange={(v) => data.onChange({ ...layer, out_channels: v })} />
             <LabeledNum label="kernel" value={layer.kernel_size} onChange={(v) => data.onChange({ ...layer, kernel_size: v })} />
             <LabeledNum label="stride" value={layer.stride} onChange={(v) => data.onChange({ ...layer, stride: v })} />
-            <LabeledNum label="padding" value={layer.padding} onChange={(v) => data.onChange({ ...layer, padding: v })} min={0} />
+            <LabeledNum label="padding" value={layer.padding} onChange={(v) => data.onChange({ ...layer, padding: v })} integer />
           </div>
         )}
         {layer.type === 'maxpool2d' && (
@@ -113,7 +113,7 @@ export const LayerNode = memo(function LayerNode({ data }: NodeProps & { data: L
           />
         )}
         {layer.type === 'dropout' && (
-          <LabeledNum label="p" value={layer.p} step={0.05} min={0} max={0.9} onChange={(v) => data.onChange({ ...layer, p: v })} />
+          <LabeledNum label="p" value={layer.p} onChange={(v) => data.onChange({ ...layer, p: v })} />
         )}
 
         <div className="flex items-center justify-between pt-0.5">
@@ -130,18 +130,15 @@ export const LayerNode = memo(function LayerNode({ data }: NodeProps & { data: L
 }, (prev, next) => prev.data === next.data)
 
 function LabeledNum({
-  label, value, onChange, min = 1, max, step = 1,
-}: { label: string; value: number | null | undefined; onChange: (v: number) => void; min?: number; max?: number; step?: number }) {
+  label, value, onChange, integer = true,
+}: { label: string; value: number | null | undefined; onChange: (v: number) => void; integer?: boolean }) {
   return (
     <div className="space-y-0.5">
       <span className="text-[10px] text-muted-foreground">{label}</span>
-      <Input
-        type="number"
-        min={min}
-        max={max}
-        step={step}
-        value={value ?? ''}
-        onChange={(e) => onChange(Math.max(min, Number(e.target.value) || min))}
+      <NumericInput
+        integer={integer}
+        value={value ?? 0}
+        onChange={onChange}
         className="nodrag h-6 text-[11px]"
       />
     </div>

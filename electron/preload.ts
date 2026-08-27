@@ -106,6 +106,14 @@ const api = {
     pickDirectory: () =>
       ipcRenderer.invoke('dialog:pickDirectory') as Promise<{ canceled: boolean; filePaths: string[] }>,
   },
+  runs: {
+    // The absolute path on *this* machine to a run's folder (weights, GIFs,
+    // logs, config.json/metrics.json/network.json) — resolved in the main
+    // process, not trusted from the backend API, since the backend may be
+    // running inside Docker and only know its own container-internal path.
+    hostPath: (runId: string) => ipcRenderer.invoke('runs:hostPath', runId) as Promise<string>,
+    openFolder: (runId: string) => ipcRenderer.invoke('runs:openFolder', runId) as Promise<void>,
+  },
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)

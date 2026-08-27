@@ -885,10 +885,13 @@ interface CheatRow {
 
 const CHEAT_ROWS: CheatRow[] = [
   { name: 'DQN', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'Простой бейзлайн на дискретных действиях' },
-  { name: 'Rainbow DQN', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'То же, что DQN, но почти всегда лучше' },
+  { name: 'Rainbow DQN', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'То же, что DQN, но почти всегда лучше; +QR-DQN для полного Rainbow' },
   { name: 'A2C', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Быстрый дёшевый бейзлайн' },
   { name: 'PPO', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Рекомендуемый дефолт почти всегда' },
   { name: 'SAC', kind: 'Actor-Critic', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Continuous-задачи, нужна сэмпл-эффективность' },
+  { name: 'DDPG', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Простой бейзлайн для сравнения с TD3/SAC' },
+  { name: 'TD3', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Надёжный дефолт для (почти) детерминированной динамики' },
+  { name: 'Evolution Strategies', kind: 'Gradient-free (чёрный ящик)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Разреженная/недифференцируемая награда, нужна простота' },
   { name: 'AlphaZero', kind: 'Planning + self-play', policy: '—', actions: 'Дискретные (доска)', memory: 'нет', when: 'Настольные игры с полной информацией' },
 ]
 
@@ -933,10 +936,12 @@ const cheatsheet: Lesson = {
       <Section title="Быстрое дерево решений">
         <ul className="ml-4 list-disc space-y-1">
           <li>Настольная игра, полная информация → <b>AlphaZero</b>.</li>
-          <li>Continuous-действия, нужна сэмпл-эффективность → <b>SAC</b>.</li>
+          <li>Continuous-действия, нужна сэмпл-эффективность и стабильная (не строго детерминированная) динамика → <b>SAC</b>.</li>
+          <li>Continuous-действия, динамика близка к детерминированной (MuJoCo-locomotion, Car Racing) → <b>TD3</b> (DDPG — для сравнения/учебных целей).</li>
           <li>Continuous или дискретные, нужен простой стабильный дефолт → <b>PPO</b>.</li>
-          <li>Дискретные действия, важен off-policy replay → <b>Rainbow DQN</b> (или DQN для простоты).</li>
-          <li>Наблюдение может быть неполным (POMDP) → любой из вышеперечисленных Gym-алгоритмов + <b>память (LSTM/GRU)</b>.</li>
+          <li>Дискретные действия, важен off-policy replay → <b>Rainbow DQN</b> (или DQN для простоты); включите <b>distributional (QR-DQN)</b> для полного набора из 6 ингредиентов Rainbow.</li>
+          <li>Награда разреженная/недифференцируемая, или хочется вообще без backprop через среду → <b>Evolution Strategies</b>.</li>
+          <li>Наблюдение может быть неполным (POMDP) → любой из вышеперечисленных Gym-алгоритмов (кроме ES) + <b>память (LSTM/GRU)</b>.</li>
         </ul>
       </Section>
 

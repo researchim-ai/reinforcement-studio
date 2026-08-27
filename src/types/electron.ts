@@ -77,6 +77,10 @@ export interface ElectronAPI {
   dialog: {
     pickDirectory: () => Promise<{ canceled: boolean; filePaths: string[] }>
   }
+  runs: {
+    hostPath: (runId: string) => Promise<string>
+    openFolder: (runId: string) => Promise<void>
+  }
 }
 
 declare global {

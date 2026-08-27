@@ -30,8 +30,13 @@ const Dashboard = lazyWithReload(() => import('@/pages/Dashboard').then((m) => (
 const ExperimentDesigner = lazyWithReload(() => import('@/pages/ExperimentDesigner').then((m) => ({ default: m.ExperimentDesigner })))
 const TrainingMonitor = lazyWithReload(() => import('@/pages/TrainingMonitor').then((m) => ({ default: m.TrainingMonitor })))
 const Environments = lazyWithReload(() => import('@/pages/Environments').then((m) => ({ default: m.Environments })))
-const AlphaZeroArena = lazyWithReload(() => import('@/pages/AlphaZeroArena').then((m) => ({ default: m.AlphaZeroArena })))
+// AlphaZero Arena is temporarily disabled (no route/nav entry) — the page,
+// backend routes, and arena.py logic are all still intact, just not linked
+// from the UI. Re-add the `/arena` route + Sidebar/Dashboard/ModelZoo links
+// below to bring it back.
 const ModelZoo = lazyWithReload(() => import('@/pages/ModelZoo').then((m) => ({ default: m.ModelZoo })))
+const Sweeps = lazyWithReload(() => import('@/pages/Sweeps').then((m) => ({ default: m.Sweeps })))
+const SceneBuilder = lazyWithReload(() => import('@/pages/SceneBuilder').then((m) => ({ default: m.SceneBuilder })))
 const PluginsPage = lazyWithReload(() => import('@/pages/Plugins').then((m) => ({ default: m.PluginsPage })))
 const NetworkBuilderPage = lazyWithReload(() => import('@/pages/NetworkBuilder').then((m) => ({ default: m.NetworkBuilderPage })))
 const Academy = lazyWithReload(() => import('@/pages/Academy').then((m) => ({ default: m.Academy })))
@@ -54,10 +59,11 @@ export default function App() {
           <Route path="/designer" element={<Suspense fallback={<PageFallback />}><ExperimentDesigner /></Suspense>} />
           <Route path="/monitor" element={<Suspense fallback={<PageFallback />}><TrainingMonitor /></Suspense>} />
           <Route path="/environments" element={<Suspense fallback={<PageFallback />}><Environments /></Suspense>} />
-          <Route path="/arena" element={<Suspense fallback={<PageFallback />}><AlphaZeroArena /></Suspense>} />
           <Route path="/models" element={<Suspense fallback={<PageFallback />}><ModelZoo /></Suspense>} />
+          <Route path="/sweeps" element={<Suspense fallback={<PageFallback />}><Sweeps /></Suspense>} />
           <Route path="/plugins" element={<Suspense fallback={<PageFallback />}><PluginsPage /></Suspense>} />
           <Route path="/network-builder" element={<Suspense fallback={<PageFallback />}><NetworkBuilderPage /></Suspense>} />
+          <Route path="/scene-builder" element={<Suspense fallback={<PageFallback />}><SceneBuilder /></Suspense>} />
           <Route path="/academy" element={<Suspense fallback={<PageFallback />}><Academy /></Suspense>} />
           <Route path="/settings" element={<Suspense fallback={<PageFallback />}><SettingsPage /></Suspense>} />
         </Route>

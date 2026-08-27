@@ -52,8 +52,20 @@ class TrainingCallback:
 class CustomAlgorithm(ABC):
     """Full from-scratch RL algorithm contract (Gym track).
 
-    `env` is a fully wrapped `gymnasium.Env` (Monitor + any configured
-    wrappers already applied by the runner) — use it like any Gym env.
+    `env` is a fully wrapped `gymnasium.Env` (any configured wrappers
+    already applied by the runner) — use it like any Gym env. This is true
+    unconditionally when `training.num_envs` is 1 (the default), including
+    for every existing saved config and user-authored plugin.
+
+    When `training.num_envs > 1`, `env` is instead a
+    `gymnasium.vector.VectorEnv` (`AsyncVectorEnv` with one subprocess
+    worker per lane) wrapping the same per-env setup — built-in algorithms use
+    the helpers in `rl_core/algorithms/vec_env.py` (`obs_space`/
+    `action_space`/`vec_reset`/`vec_step`/`is_vector_env`) to write one
+    collection loop that works for both cases; a custom plugin that never
+    reads `training.num_envs` itself simply never sees anything but a
+    plain env, since 1 is always the default when a plugin's own template/
+    config doesn't set it.
     """
 
     def __init__(self, env: Any, hyperparams: dict[str, Any], seed: int | None, device: str) -> None:
@@ -89,4 +101,11 @@ class CustomAlgorithm(ABC):
 
     @classmethod
     @abstractmethod
-    def load(cls, path: Path, env: Any) -> "CustomAlgorithm": ...
+    def load(cls, path: Path, env: Any, device: str = "cpu") -> "CustomAlgorithm":
+        """`device` lets callers resume training (or evaluate) on GPU
+        instead of always reconstructing on CPU — see
+        `rl_core/algorithms/resume.py` and `rl_core/algorithms/evaluate.py`.
+        Existing subclasses that predate this parameter still work as-is
+        (callers introspect the signature before passing it — see
+        `runner_utils.py`/`sb3_runner.py`), but every built-in algorithm
+        accepts it."""

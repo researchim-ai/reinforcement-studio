@@ -23,8 +23,9 @@ from rl_core.algorithms.native.exploration import (
     uses_noisy_net,
     uses_rnd,
 )
-from rl_core.algorithms.native.networks import Hidden, QNetwork, RecurrentQNetwork, memory_type_from_hyperparams
-from rl_core.algorithms.native.preprocessing import obs_to_array
+from rl_core.algorithms.native.networks import Hidden, QNetwork, RecurrentQNetwork, mask_hidden_for_dones, memory_type_from_hyperparams
+from rl_core.algorithms.native.preprocessing import obs_batch_to_array, obs_to_array
+from rl_core.algorithms.vec_env import action_space, num_envs_of, obs_space, vec_reset, vec_step
 from rl_core.netbuilder import SpecQNetwork
 
 DEFAULT_HYPERPARAMS = {
@@ -64,10 +65,11 @@ class NativeDQN(CustomAlgorithm):
         super().__init__(env, hyperparams, seed, device)
         if seed is not None:
             torch.manual_seed(seed)
-        if not isinstance(env.action_space, gym.spaces.Discrete):
+        obs_sp, act_sp = obs_space(env), action_space(env)
+        if not isinstance(act_sp, gym.spaces.Discrete):
             raise ValueError("NativeDQN only supports Discrete action spaces")
 
-        self.n_actions = int(env.action_space.n)
+        self.n_actions = int(act_sp.n)
         network_spec = hyperparams.get("network_spec")
         memory_type = memory_type_from_hyperparams(hyperparams)
         self.recurrent = bool(memory_type) and not network_spec
@@ -78,15 +80,15 @@ class NativeDQN(CustomAlgorithm):
 
         def _build_q_net() -> nn.Module:
             if network_spec:
-                return SpecQNetwork(env.observation_space, self.n_actions, network_spec)
+                return SpecQNetwork(obs_sp, self.n_actions, network_spec)
             if memory_type:
                 return RecurrentQNetwork(
-                    env.observation_space, self.n_actions, memory_type,
+                    obs_sp, self.n_actions, memory_type,
                     hidden_size=int(hyperparams.get("memory_hidden_size", 128)),
                     num_layers=int(hyperparams.get("memory_num_layers", 1)),
                     noisy=self.noisy, noisy_sigma0=noisy_sigma0,
                 )
-            return QNetwork(env.observation_space, self.n_actions, noisy=self.noisy, noisy_sigma0=noisy_sigma0)
+            return QNetwork(obs_sp, self.n_actions, noisy=self.noisy, noisy_sigma0=noisy_sigma0)
 
         self.q_net = _build_q_net().to(device)
         self.target_net = _build_q_net().to(device)
@@ -105,7 +107,7 @@ class NativeDQN(CustomAlgorithm):
         self.memory_seq_len = max(1, int(hyperparams.get("memory_seq_len", 20)))
         self.rnd_bonus_coef = float(hyperparams.get("rnd_bonus_coef", 0.1))
         self.rnd = RNDModule(
-            env.observation_space,
+            obs_sp,
             device,
             feature_dim=int(hyperparams.get("rnd_feature_dim", 128)),
             hidden_dim=int(hyperparams.get("rnd_hidden_dim", 128)),
@@ -115,9 +117,12 @@ class NativeDQN(CustomAlgorithm):
         self.replay_buffer: ReplayBuffer | EpisodeSequenceReplayBuffer | None = None
         self._hidden: Hidden | None = None
         self._predict_hidden: Hidden | None = None
+        self._last_td_loss: float | None = None
+        self._obs_space = obs_sp
+        self._action_space = act_sp
 
     def _obs_arr(self, obs: Any) -> np.ndarray:
-        return obs_to_array(obs, self.env.observation_space)
+        return obs_to_array(obs, self._obs_space)
 
     def _epsilon(self, num_timesteps: int, total_timesteps: int) -> float:
         if self.noisy:
@@ -134,6 +139,8 @@ class NativeDQN(CustomAlgorithm):
         episode_intrinsic: float | None = None,
     ) -> dict[str, float]:
         metrics = {"exploration_epsilon": float(epsilon)}
+        if self._last_td_loss is not None:
+            metrics["td_loss"] = self._last_td_loss
         if self.rnd:
             metrics["rnd_bonus_mean"] = float(self.rnd.bonus_mean)
             metrics["rnd_predictor_loss"] = float(self.rnd.last_loss)
@@ -143,13 +150,14 @@ class NativeDQN(CustomAlgorithm):
             metrics["episode_intrinsic_reward"] = float(episode_intrinsic)
         return metrics
 
-    def _step_q(self, obs_arr: np.ndarray) -> torch.Tensor:
-        """Runs the Q-network forward exactly one step, advancing
-        `self._hidden` if recurrent. Always called — even when ε-greedy
-        ends up picking a random action — because the recurrent core needs
-        to see *every* observation to build a useful hidden state,
-        regardless of which policy chose the action that produced it."""
-        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device).unsqueeze(0)
+    def _step_q_batch(self, obs_arr: np.ndarray) -> torch.Tensor:
+        """Runs the Q-network forward exactly one vec-step, advancing
+        `self._hidden` if recurrent. `obs_arr`: `(num_envs, ...)`. Always
+        called — even when ε-greedy ends up picking a random action for
+        every lane — because the recurrent core needs to see *every*
+        observation to build a useful hidden state, regardless of which
+        policy chose the action that produced it."""
+        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             if self.recurrent:
                 q, self._hidden = self.q_net.step(obs_t, self._hidden)
@@ -158,63 +166,86 @@ class NativeDQN(CustomAlgorithm):
         return q
 
     def learn(self, total_timesteps: int, callback: TrainingCallback) -> None:
-        obs, _ = self.env.reset(seed=self.seed)
-        obs_arr = self._obs_arr(obs)
+        n_envs = num_envs_of(self.env)
+        obs_arr = obs_batch_to_array(vec_reset(self.env, seed=self.seed), self._obs_space)
         if self.replay_buffer is None:
             self.replay_buffer = (
-                EpisodeSequenceReplayBuffer(self.buffer_size, obs_arr.shape)
+                EpisodeSequenceReplayBuffer(self.buffer_size, obs_arr.shape[1:], num_envs=n_envs)
                 if self.recurrent
-                else ReplayBuffer(self.buffer_size, obs_arr.shape)
+                else ReplayBuffer(self.buffer_size, obs_arr.shape[1:])
             )
         if self.recurrent:
-            self._hidden = self.q_net.initial_state(1, self.device)
-        ep_reward, ep_extrinsic, ep_intrinsic, ep_length = 0.0, 0.0, 0.0, 0
+            self._hidden = self.q_net.initial_state(n_envs, self.device)
+        ep_reward = np.zeros(n_envs, dtype=np.float64)
+        ep_extrinsic = np.zeros(n_envs, dtype=np.float64)
+        ep_intrinsic = np.zeros(n_envs, dtype=np.float64)
+        ep_length = np.zeros(n_envs, dtype=np.int64)
+        num_timesteps = 0
 
-        for num_timesteps in range(1, total_timesteps + 1):
+        while num_timesteps < total_timesteps:
             eps = self._epsilon(num_timesteps, total_timesteps)
             if self.noisy:
                 reset_noise(self.q_net)
-            q = self._step_q(obs_arr)
-            if len(self.replay_buffer) < self.learning_starts or np.random.rand() < eps:
-                action = int(self.env.action_space.sample())
-            else:
-                action = int(torch.argmax(q, dim=-1).item())
+            q = self._step_q_batch(obs_arr)
+            greedy = torch.argmax(q, dim=-1).cpu().numpy()
+            actions = np.array(
+                [
+                    int(self._action_space.sample())
+                    if len(self.replay_buffer) < self.learning_starts or np.random.rand() < eps
+                    else int(greedy[i])
+                    for i in range(n_envs)
+                ],
+                dtype=np.int64,
+            )
 
-            next_obs, reward, terminated, truncated, _info = self.env.step(action)
-            done = terminated or truncated
-            next_obs_arr = self._obs_arr(next_obs)
-            extrinsic_reward = float(reward)
-            intrinsic_reward = self.rnd_bonus_coef * self.rnd.bonus(next_obs_arr) if self.rnd else 0.0
+            next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, list(actions))
+            dones = terminated | truncated
+            next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            extrinsic_reward = rewards.astype(np.float64)
+            intrinsic_reward = (
+                np.array([self.rnd_bonus_coef * self.rnd.bonus(next_obs_arr[i]) for i in range(n_envs)])
+                if self.rnd
+                else np.zeros(n_envs)
+            )
             total_reward = extrinsic_reward + intrinsic_reward
-            self.replay_buffer.add(obs_arr, action, total_reward, next_obs_arr, done)
+            for i in range(n_envs):
+                if self.recurrent:
+                    self.replay_buffer.add(obs_arr[i], int(actions[i]), float(total_reward[i]), next_obs_arr[i], bool(dones[i]), lane=i)
+                else:
+                    self.replay_buffer.add(obs_arr[i], int(actions[i]), float(total_reward[i]), next_obs_arr[i], bool(dones[i]))
             obs_arr = next_obs_arr
             ep_reward += total_reward
             ep_extrinsic += extrinsic_reward
             ep_intrinsic += intrinsic_reward
             ep_length += 1
+            prev_num_timesteps = num_timesteps
+            num_timesteps += n_envs
 
-            if len(self.replay_buffer) >= max(self.learning_starts, self.batch_size) and num_timesteps % self.train_freq == 0:
+            if len(self.replay_buffer) >= max(self.learning_starts, self.batch_size) and (
+                num_timesteps // self.train_freq != prev_num_timesteps // self.train_freq
+            ):
                 self._train_step()
-            if num_timesteps % self.target_update_interval == 0:
+            if num_timesteps // self.target_update_interval != prev_num_timesteps // self.target_update_interval:
                 self.target_net.load_state_dict(self.q_net.state_dict())
 
-            if done:
-                finished_reward, finished_length = ep_reward, ep_length
-                finished_extrinsic, finished_intrinsic = ep_extrinsic, ep_intrinsic
-                ep_reward, ep_length = 0.0, 0
-                ep_extrinsic, ep_intrinsic = 0.0, 0.0
-                next_obs2, _ = self.env.reset()
-                obs_arr = self._obs_arr(next_obs2)
-                if self.recurrent:
-                    self._hidden = self.q_net.initial_state(1, self.device)
-                keep_going = callback.on_step(
-                    num_timesteps, finished_reward, finished_length,
-                    self._metrics(eps, finished_extrinsic, finished_intrinsic),
-                )
-            else:
+            if self.recurrent:
+                self._hidden = mask_hidden_for_dones(self._hidden, dones)
+
+            any_finished = False
+            for i in range(n_envs):
+                if dones[i]:
+                    any_finished = True
+                    keep_going = callback.on_step(
+                        num_timesteps, float(ep_reward[i]), int(ep_length[i]),
+                        self._metrics(eps, float(ep_extrinsic[i]), float(ep_intrinsic[i])),
+                    )
+                    ep_reward[i], ep_extrinsic[i], ep_intrinsic[i], ep_length[i] = 0.0, 0.0, 0.0, 0
+                    if not keep_going:
+                        return
+            if not any_finished:
                 keep_going = callback.on_step(num_timesteps, metrics=self._metrics(eps))
-            if not keep_going:
-                return
+                if not keep_going:
+                    return
 
     def _train_step(self) -> None:
         if self.recurrent:
@@ -240,6 +271,7 @@ class NativeDQN(CustomAlgorithm):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
+        self._last_td_loss = float(loss.detach().item())
         if self.rnd:
             self.rnd.update_predictor(batch["next_obs"])
 
@@ -278,6 +310,7 @@ class NativeDQN(CustomAlgorithm):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
+        self._last_td_loss = float(loss.detach().item())
         if self.rnd:
             flat_next_obs = batch["next_obs"].reshape(-1, *batch["next_obs"].shape[2:])
             self.rnd.update_predictor(flat_next_obs, mask=batch["mask"].reshape(-1))
@@ -299,21 +332,27 @@ class NativeDQN(CustomAlgorithm):
         if self.noisy:
             set_noise_enabled(self.q_net, True)
         if not deterministic and not self.noisy and np.random.rand() < self.exploration_final_eps:
-            return int(self.env.action_space.sample()), None
+            return int(self._action_space.sample()), None
         return int(torch.argmax(q, dim=-1).item()), None
 
     def save(self, path: Path) -> None:
-        payload = {"state_dict": self.q_net.state_dict(), "hyperparams": self.hyperparams}
+        payload = {
+            "state_dict": self.q_net.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "hyperparams": self.hyperparams,
+        }
         if self.rnd:
             payload["rnd_state"] = self.rnd.checkpoint_state()
         torch.save(payload, path)
 
     @classmethod
-    def load(cls, path: Path, env: gym.Env) -> "NativeDQN":
+    def load(cls, path: Path, env: gym.Env, device: str = "cpu") -> "NativeDQN":
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        algo = cls(env, payload.get("hyperparams", {}), None, "cpu")
+        algo = cls(env, payload.get("hyperparams", {}), None, device)
         algo.q_net.load_state_dict(payload["state_dict"])
         algo.target_net.load_state_dict(payload["state_dict"])
+        if payload.get("optimizer_state_dict"):
+            algo.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if algo.rnd and payload.get("rnd_state"):
             algo.rnd.load_checkpoint_state(payload["rnd_state"])
         return algo

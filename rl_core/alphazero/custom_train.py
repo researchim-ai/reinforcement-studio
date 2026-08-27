@@ -13,7 +13,7 @@ import torch
 from rl_core.alphazero.loop import run_training_loop
 from rl_core.device import resolve_device
 from rl_core.games import make_game
-from rl_core.netbuilder_store import resolve_network_spec
+from rl_core.netbuilder_store import resolve_network_spec, write_network_snapshot
 from rl_core.plugins.loader import load_alphazero_trainer
 
 
@@ -25,6 +25,7 @@ def run(config: dict[str, Any], run_dir: Path, slug: str) -> None:
     game_id = env_cfg["id"]
     hyperparams = dict(algo_cfg.get("hyperparams") or {})
     network_spec = resolve_network_spec(config)
+    write_network_snapshot(run_dir, config, network_spec)
     if network_spec:
         hyperparams["network_spec"] = network_spec
     seed = training_cfg.get("seed")

@@ -15,10 +15,36 @@ import traceback
 from pathlib import Path
 
 
+def _limit_torch_threads() -> None:
+    """PyTorch defaults its intra-op thread pool to one thread per CPU
+    core — great for the large batched matmuls a vision model does, but
+    actively harmful here: every algorithm in this app (native PPO/DQN/...,
+    AlphaZero's MCTS, even SB3) spends most of its time doing *lots of
+    tiny* forward/backward passes (a 64-unit MLP, a handful of board-game
+    conv layers, ...) where the fixed cost of spinning up/synchronizing N
+    worker threads dwarfs the few microseconds of actual matmul work being
+    parallelized. On an 8+ core machine this alone can make training
+    several times slower than single-threaded, and it gets worse still
+    once `training.num_envs` also has several `AsyncVectorEnv` worker
+    processes competing for the same cores. Set once, as early as
+    possible in this subprocess — before any algorithm module (and thus
+    torch) has done any real work — since `set_num_interop_threads` can
+    only be called once, before torch starts any interop-parallel task."""
+    import torch
+
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already started parallel work somehow — not worth failing the run over
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         print("Usage: python -m rl_core.runner <config.json> <run_dir>", file=sys.stderr)
         sys.exit(1)
+
+    _limit_torch_threads()
 
     config_path = Path(sys.argv[1])
     run_dir = Path(sys.argv[2])

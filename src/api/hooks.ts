@@ -32,6 +32,75 @@ export function useModels() {
   return useQuery({ queryKey: ['models'], queryFn: api.listModels })
 }
 
+/** The exact architecture a run (or a promoted checkpoint) actually
+ * trained with (`network.json`) — used by the "Сохранить архитектуру"
+ * action on the Training Monitor / Model Zoo to feed `api.saveNetwork`
+ * without re-deriving the spec from `config.json`. */
+export function useRunNetwork(runId: string | undefined) {
+  return useQuery({
+    queryKey: ['run-network', runId],
+    queryFn: () => api.getRunNetwork(runId as string),
+    enabled: !!runId,
+  })
+}
+
+export function useCheckpointNetwork(name: string | undefined) {
+  return useQuery({
+    queryKey: ['checkpoint-network', name],
+    queryFn: () => api.getCheckpointNetwork(name as string),
+    enabled: !!name,
+  })
+}
+
+/** The full `config.json` a run started with — used by the "Дообучить"
+ * (resume) flow to preselect/lock the exact environment/wrappers/
+ * hyperparams/network a source run trained with. */
+export function useRunConfig(runId: string | undefined) {
+  return useQuery({
+    queryKey: ['run-config', runId],
+    queryFn: () => api.getRunConfig(runId as string),
+    enabled: !!runId,
+  })
+}
+
+export function useCheckpointConfig(name: string | undefined) {
+  return useQuery({
+    queryKey: ['checkpoint-config', name],
+    queryFn: () => api.getCheckpointConfig(name as string),
+    enabled: !!name,
+  })
+}
+
+/** Full metrics history for several runs at once — powers the Compare Runs
+ * overlay chart (Training Monitor) and the Sweeps results view, both of
+ * which need every selected run's whole curve, not just the latest
+ * snapshot. */
+export function useMultiRunHistory(runIds: string[]) {
+  return useQuery({
+    queryKey: ['multi-run-history', [...runIds].sort()],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        runIds.map(async (id) => [id, (await api.getMetricsHistory(id)).history] as const),
+      )
+      return Object.fromEntries(entries) as Record<string, import('./types').MetricsSnapshot[]>
+    },
+    enabled: runIds.length > 0,
+  })
+}
+
+export function useSweeps(pollMs = 4000) {
+  return useQuery({ queryKey: ['sweeps'], queryFn: api.listSweeps, refetchInterval: pollMs })
+}
+
+export function useSweep(sweepId: string | undefined, pollMs = 3000) {
+  return useQuery({
+    queryKey: ['sweep', sweepId],
+    queryFn: () => api.getSweep(sweepId as string),
+    enabled: !!sweepId,
+    refetchInterval: pollMs,
+  })
+}
+
 export function useGames() {
   return useQuery({ queryKey: ['games'], queryFn: api.listGames })
 }
@@ -64,6 +133,10 @@ export function useNetworks() {
   return useQuery({ queryKey: ['networks'], queryFn: api.listNetworks })
 }
 
+export function useScenes() {
+  return useQuery({ queryKey: ['scenes'], queryFn: api.listScenes })
+}
+
 /** Delays propagating `value` until it's stayed stable for `delayMs` — used
  * to avoid firing a backend request on every keystroke while the user is
  * still tweaking a hyperparameter in the Designer. */
@@ -83,7 +156,12 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 export function useInspectDesign(payload: {
   kind: EnvKind
   environment: { id: string; wrappers?: { type: string; params: Record<string, number | string> }[] }
-  algorithm: { id: string; hyperparams: Record<string, number> }
+  algorithm: {
+    id: string
+    hyperparams: Record<string, number>
+    network_spec_id?: string | null
+    network_spec?: NetworkSpec | null
+  }
 } | null) {
   const debounced = useDebouncedValue(payload, 400)
   const key = debounced ? JSON.stringify(debounced) : null

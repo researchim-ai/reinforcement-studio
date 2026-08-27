@@ -6,6 +6,7 @@ import json
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from rl_core.metrics_history import json_safe
 from rl_core.paths import RUNS_DIR
 
 router = APIRouter()
@@ -33,7 +34,13 @@ async def metrics_ws(websocket: WebSocket, run_id: str):
                         step = data.get("step", 0)
                         if step != last_step or data.get("status") != "running":
                             last_step = step
-                            await websocket.send_json(data)
+                            # `metrics.json` may have been written before this
+                            # sanitization existed (or by an older run) — scrub
+                            # NaN/Infinity here too, not just on write, so a
+                            # single bad value can never make `JSON.parse`
+                            # silently drop the whole message client-side and
+                            # freeze every chart for the rest of the run.
+                            await websocket.send_json(json_safe(data))
                     except (json.JSONDecodeError, IOError):
                         pass
             await asyncio.sleep(1)

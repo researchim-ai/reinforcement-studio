@@ -2,6 +2,7 @@ import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Rocket, Loader2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
+import { NumericInput } from '@/components/ui/numeric-input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -11,6 +12,9 @@ export interface TrainingNodeData {
   kind: EnvKind
   name: string
   totalTimesteps: number
+  recommendedTotalTimesteps?: number | null
+  numEnvs: number
+  recommendedNumEnvs?: number | null
   numIterations: number
   seed: number
   useGpu: boolean
@@ -18,6 +22,7 @@ export interface TrainingNodeData {
   disabled: boolean
   onChangeName: (v: string) => void
   onChangeTotalTimesteps: (v: number) => void
+  onChangeNumEnvs: (v: number) => void
   onChangeNumIterations: (v: number) => void
   onChangeSeed: (v: number) => void
   onChangeUseGpu: (v: boolean) => void
@@ -49,35 +54,76 @@ export const TrainingNode = memo(function TrainingNode({ data }: NodeProps & { d
             <Label className="text-[11px] text-muted-foreground">
               Total timesteps <span className="text-muted-foreground/60">(без ограничений)</span>
             </Label>
-            <Input
-              type="number"
-              min={1}
+            <NumericInput
+              integer
               value={data.totalTimesteps}
-              onChange={(e) => data.onChangeTotalTimesteps(Math.max(1, Number(e.target.value) || 0))}
+              onChange={data.onChangeTotalTimesteps}
               className="h-7 text-xs"
             />
             <p className="text-[10px] text-muted-foreground/60">
               Общая длина обучения — не путать с гиперпараметрами алгоритма слева (например, «Replay buffer size» у DQN).
             </p>
+            {!!data.recommendedTotalTimesteps && data.totalTimesteps < data.recommendedTotalTimesteps && (
+              <p className="text-[10px] text-warning">
+                Эта среда сложная: рекомендуем ≥{data.recommendedTotalTimesteps.toLocaleString('ru-RU')} шагов,
+                иначе прогон скорее всего закончится на стадии «пока ничего не выучил».{' '}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => data.onChangeTotalTimesteps(data.recommendedTotalTimesteps!)}
+                >
+                  Поставить {data.recommendedTotalTimesteps.toLocaleString('ru-RU')}
+                </button>
+              </p>
+            )}
           </div>
         ) : (
           <div className="space-y-1">
             <Label className="text-[11px] text-muted-foreground">Self-play итераций</Label>
-            <Input
-              type="number"
+            <NumericInput
+              integer
               value={data.numIterations}
-              onChange={(e) => data.onChangeNumIterations(Number(e.target.value))}
+              onChange={data.onChangeNumIterations}
               className="h-7 text-xs"
             />
           </div>
         )}
 
+        {data.kind === 'gym' && (
+          <div className="space-y-1">
+            <Label className="text-[11px] text-muted-foreground">Параллельных сред (num_envs)</Label>
+            <NumericInput
+              integer
+              value={data.numEnvs}
+              onChange={data.onChangeNumEnvs}
+              className="h-7 text-xs"
+            />
+            <p className="text-[10px] text-muted-foreground/60">
+              Сколько независимых копий среды крутятся параллельно (отдельный
+              процесс на каждую) — больше опыта за шаг и быстрее сбор данных на
+              CPU. 1 — одна среда, как раньше.
+            </p>
+            {!!data.recommendedNumEnvs && data.numEnvs < data.recommendedNumEnvs && (
+              <p className="text-[10px] text-warning">
+                Эта среда выигрывает от параллелизма: рекомендуем ≥{data.recommendedNumEnvs}.{' '}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => data.onChangeNumEnvs(data.recommendedNumEnvs!)}
+                >
+                  Поставить {data.recommendedNumEnvs}
+                </button>
+              </p>
+            )}
+          </div>
+        )}
+
         <div className="space-y-1">
           <Label className="text-[11px] text-muted-foreground">Seed</Label>
-          <Input
-            type="number"
+          <NumericInput
+            integer
             value={data.seed}
-            onChange={(e) => data.onChangeSeed(Number(e.target.value))}
+            onChange={data.onChangeSeed}
             className="h-7 text-xs"
           />
         </div>

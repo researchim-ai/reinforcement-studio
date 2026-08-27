@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from rl_core.alphazero.base import AlphaZeroTrainer
+from rl_core.metrics_history import append_history, json_safe
 
 
 def run_training_loop(
@@ -58,6 +59,8 @@ def run_training_loop(
         snapshot.update(static_info)
         if extra:
             snapshot.update(extra)
+        snapshot = json_safe(snapshot)
+        append_history(run_dir, snapshot)
         (run_dir / "metrics.json").write_text(json.dumps(snapshot))
 
     write_snapshot(0, "running")

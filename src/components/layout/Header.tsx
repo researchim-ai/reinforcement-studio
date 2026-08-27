@@ -9,7 +9,6 @@ const routeTitles: Record<string, string> = {
   '/designer': 'nav.designer',
   '/monitor': 'nav.monitor',
   '/environments': 'nav.environments',
-  '/arena': 'nav.arena',
   '/models': 'nav.models',
   '/settings': 'nav.settings',
 }

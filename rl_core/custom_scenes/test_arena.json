@@ -1,0 +1,123 @@
+{
+  "name": "Новая сцена",
+  "description": "",
+  "world": {
+    "width": 20.0,
+    "depth": 20.0,
+    "wall_height": 2.0
+  },
+  "objects": [
+    {
+      "id": "wall_n",
+      "type": "wall",
+      "position": [
+        0.0,
+        1.0,
+        -10.0
+      ],
+      "size": [
+        20.0,
+        2.0,
+        1.0
+      ]
+    },
+    {
+      "id": "wall_s",
+      "type": "wall",
+      "position": [
+        0.0,
+        1.0,
+        10.0
+      ],
+      "size": [
+        20.0,
+        2.0,
+        1.0
+      ]
+    },
+    {
+      "id": "wall_w",
+      "type": "wall",
+      "position": [
+        -10.0,
+        1.0,
+        0.0
+      ],
+      "size": [
+        1.0,
+        2.0,
+        20.0
+      ]
+    },
+    {
+      "id": "wall_e",
+      "type": "wall",
+      "position": [
+        10.0,
+        1.0,
+        0.0
+      ],
+      "size": [
+        1.0,
+        2.0,
+        20.0
+      ]
+    }
+  ],
+  "items": [
+    {
+      "id": "coin1",
+      "type": "reward",
+      "position": [
+        4.0,
+        0.0,
+        4.0
+      ],
+      "radius": 0.5,
+      "reward": 1.0,
+      "respawn": true,
+      "cooldown_steps": 40
+    },
+    {
+      "id": "coin2",
+      "type": "reward",
+      "position": [
+        -4.0,
+        0.0,
+        -3.0
+      ],
+      "radius": 0.5,
+      "reward": 1.0,
+      "respawn": true,
+      "cooldown_steps": 40
+    }
+  ],
+  "agents": [
+    {
+      "id": "team_a",
+      "count": 2,
+      "team": "a",
+      "spawn": {
+        "center": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "radius": 4.0
+      },
+      "body_radius": 0.4,
+      "movement": {
+        "type": "discrete4",
+        "speed": 0.5
+      },
+      "sensors": {
+        "type": "nearest_k",
+        "k": 4,
+        "range": 10.0
+      }
+    }
+  ],
+  "episode": {
+    "max_steps": 500
+  }
+}

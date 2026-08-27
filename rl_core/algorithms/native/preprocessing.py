@@ -47,6 +47,15 @@ def obs_to_array(obs, space: gym.Space) -> np.ndarray:
     return arr.reshape(-1).astype(np.float32)
 
 
+def obs_batch_to_array(obs_list: list, space: gym.Space) -> np.ndarray:
+    """`obs_list`: a length-N list of raw (non-batched) per-lane
+    observations, e.g. from `rl_core.algorithms.vec_env.vec_reset`/
+    `vec_step` — stacks `obs_to_array(...)` over each into one `(N, ...)`
+    float32 array. `N=1` (the `num_envs=1` default) degenerates to a
+    length-1 batch of exactly what `obs_to_array` alone would return."""
+    return np.stack([obs_to_array(o, space) for o in obs_list])
+
+
 def action_to_env(action: np.ndarray, action_space: gym.Space):
     """Native nets always produce a small numpy array per action; env.step
     wants a Python int for `Discrete`, a properly-shaped/clamped array for

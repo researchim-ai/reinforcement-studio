@@ -65,20 +65,11 @@ function buildGraph(
     data: { title: 'Вход (наблюдение)', subtitle: inputShape ? `[${inputShape.join('×')}]` : undefined, variant: 'input' } satisfies LabelNodeData,
   })
 
-  // A "+" insertion slot sits in every gap of the chain — before the first
-  // layer, between each pair, and after the last one — so a layer can be
-  // inserted anywhere, not just appended at the end.
   let lastTrunkId = 'input'
   spec.trunk.forEach((layer, i) => {
     const id = `trunk-${i}`
     const built = i < (preview?.trunk.length ?? 0)
     const failed = preview?.trunk_error_index === i
-    nodes.push({
-      id: `add-trunk-${i}`,
-      type: 'add',
-      position: { x: CENTER_X + 190, y: (i + 0.5) * ROW_H },
-      data: { onAdd: () => handlers.addTrunkLayer(i) } satisfies AddLayerNodeData,
-    })
     nodes.push({
       id,
       type: 'layer',
@@ -96,13 +87,6 @@ function buildGraph(
     })
     edges.push({ id: `e-${lastTrunkId}-${id}`, source: lastTrunkId, target: id })
     lastTrunkId = id
-  })
-
-  nodes.push({
-    id: 'add-trunk-end',
-    type: 'add',
-    position: { x: CENTER_X + 190, y: spec.trunk.length * ROW_H },
-    data: { onAdd: () => handlers.addTrunkLayer(spec.trunk.length) } satisfies AddLayerNodeData,
   })
 
   const headStartY = (spec.trunk.length + 2) * ROW_H
@@ -130,14 +114,6 @@ function buildGraph(
       const id = `head-${hi}-${li}`
       const built = li < (headPreview?.layer_shapes.length ?? 0)
       const failed = headPreview?.error_index === li
-      if (!isFinal) {
-        nodes.push({
-          id: `add-head-${hi}-${li}`,
-          type: 'add',
-          position: { x: headX + 190, y: headStartY + (li + 0.5) * ROW_H },
-          data: { onAdd: () => handlers.addHeadLayer(hi, li) } satisfies AddLayerNodeData,
-        })
-      }
       nodes.push({
         id,
         type: 'layer',
@@ -157,16 +133,71 @@ function buildGraph(
       edges.push({ id: `e-${prevId}-${id}`, source: prevId, target: id })
       prevId = id
     })
+  })
 
+  return { nodes, edges }
+}
+
+/** The "+" insertion buttons — one before the first layer, one between each
+ * pair, and one after the last, per chain (trunk + each head) — are built
+ * separately from `buildGraph` so they can track wherever their neighboring
+ * layer/label nodes actually are *right now* (including mid-drag, via
+ * `positions`) without forcing the whole (expensive) layer node list to
+ * rebuild on every drag frame. See useNodePositions.ts and the analogous
+ * split in ExperimentDesigner.tsx. */
+function buildAddNodes(
+  spec: NetworkSpec,
+  positions: Record<string, { x: number; y: number }>,
+  handlers: Pick<GraphHandlers, 'addTrunkLayer' | 'addHeadLayer'>,
+): Node[] {
+  const at = (id: string, fallback: { x: number; y: number }) => positions[id] ?? fallback
+  const nodes: Node[] = []
+
+  let prevPos = at('input', { x: CENTER_X, y: 0 })
+  spec.trunk.forEach((_, i) => {
+    const curPos = at(`trunk-${i}`, { x: CENTER_X, y: (i + 1) * ROW_H })
+    nodes.push({
+      id: `add-trunk-${i}`,
+      type: 'add',
+      position: { x: Math.max(prevPos.x, curPos.x) + 190, y: (prevPos.y + curPos.y) / 2 },
+      data: { onAdd: () => handlers.addTrunkLayer(i) } satisfies AddLayerNodeData,
+    })
+    prevPos = curPos
+  })
+  nodes.push({
+    id: 'add-trunk-end',
+    type: 'add',
+    position: { x: prevPos.x + 190, y: prevPos.y },
+    data: { onAdd: () => handlers.addTrunkLayer(spec.trunk.length) } satisfies AddLayerNodeData,
+  })
+
+  const headStartY = (spec.trunk.length + 2) * ROW_H
+  spec.heads.forEach((head, hi) => {
+    const headX = CENTER_X + (hi - (spec.heads.length - 1) / 2) * HEAD_GAP
+    let prevHeadPos = at(`head-label-${hi}`, { x: headX, y: headStartY })
+    const nonFinalCount = head.layers.length - 1
+    head.layers.forEach((_, li) => {
+      const isFinal = li === head.layers.length - 1
+      const curPos = at(`head-${hi}-${li}`, { x: headX, y: headStartY + (li + 1) * ROW_H })
+      if (!isFinal) {
+        nodes.push({
+          id: `add-head-${hi}-${li}`,
+          type: 'add',
+          position: { x: Math.max(prevHeadPos.x, curPos.x) + 190, y: (prevHeadPos.y + curPos.y) / 2 },
+          data: { onAdd: () => handlers.addHeadLayer(hi, li) } satisfies AddLayerNodeData,
+        })
+      }
+      prevHeadPos = curPos
+    })
     nodes.push({
       id: `add-head-${hi}-end`,
       type: 'add',
-      position: { x: headX + 190, y: headStartY + nonFinalCount * ROW_H },
+      position: { x: prevHeadPos.x + 190, y: prevHeadPos.y },
       data: { onAdd: () => handlers.addHeadLayer(hi, nonFinalCount) } satisfies AddLayerNodeData,
     })
   })
 
-  return { nodes, edges }
+  return nodes
 }
 
 export function NetworkBuilderPage() {
@@ -349,7 +380,7 @@ export function NetworkBuilderPage() {
     }))
   }, [])
 
-  const { applyPositions, onNodesChange } = useNodePositions()
+  const { applyPositions, onNodesChange, positions } = useNodePositions()
   const { nodes: rawNodes, edges } = useMemo(
     () =>
       buildGraph(spec, previewResult, {
@@ -364,7 +395,11 @@ export function NetworkBuilderPage() {
       }),
     [spec, previewResult, updateTrunkLayer, removeTrunkLayer, moveTrunkLayer, addTrunkLayer, updateHeadLayer, removeHeadLayer, moveHeadLayer, addHeadLayer],
   )
-  const nodes = applyPositions(rawNodes)
+  const addNodes = useMemo(
+    () => buildAddNodes(spec, positions, { addTrunkLayer, addHeadLayer }),
+    [spec, positions, addTrunkLayer, addHeadLayer],
+  )
+  const nodes = applyPositions([...rawNodes, ...addNodes])
 
   return (
     <div className="flex h-full">

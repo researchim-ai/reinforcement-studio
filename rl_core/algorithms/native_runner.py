@@ -11,8 +11,12 @@ from typing import Any
 
 from rl_core.algorithms.native.a2c import DEFAULT_HYPERPARAMS as A2C_DEFAULTS
 from rl_core.algorithms.native.a2c import NativeA2C
+from rl_core.algorithms.native.ddpg import DEFAULT_HYPERPARAMS as DDPG_DEFAULTS
+from rl_core.algorithms.native.ddpg import NativeDDPG
 from rl_core.algorithms.native.dqn import DEFAULT_HYPERPARAMS as DQN_DEFAULTS
 from rl_core.algorithms.native.dqn import NativeDQN
+from rl_core.algorithms.native.es import DEFAULT_HYPERPARAMS as ES_DEFAULTS
+from rl_core.algorithms.native.es import NativeES
 from rl_core.algorithms.native.networks import policy_name
 from rl_core.algorithms.native.ppo import DEFAULT_HYPERPARAMS as PPO_DEFAULTS
 from rl_core.algorithms.native.ppo import NativePPO
@@ -20,6 +24,8 @@ from rl_core.algorithms.native.rainbow_dqn import DEFAULT_HYPERPARAMS as RAINBOW
 from rl_core.algorithms.native.rainbow_dqn import NativeRainbowDQN
 from rl_core.algorithms.native.sac import DEFAULT_HYPERPARAMS as SAC_DEFAULTS
 from rl_core.algorithms.native.sac import NativeSAC
+from rl_core.algorithms.native.td3 import DEFAULT_HYPERPARAMS as TD3_DEFAULTS
+from rl_core.algorithms.native.td3 import NativeTD3
 from rl_core.algorithms.runner_utils import run_custom_algorithm
 
 ALGO_CLASSES = {
@@ -28,6 +34,9 @@ ALGO_CLASSES = {
     "a2c": NativeA2C,
     "rainbow_dqn": NativeRainbowDQN,
     "sac": NativeSAC,
+    "ddpg": NativeDDPG,
+    "td3": NativeTD3,
+    "es": NativeES,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -35,6 +44,9 @@ DEFAULT_HYPERPARAMS = {
     "a2c": A2C_DEFAULTS,
     "rainbow_dqn": RAINBOW_DQN_DEFAULTS,
     "sac": SAC_DEFAULTS,
+    "ddpg": DDPG_DEFAULTS,
+    "td3": TD3_DEFAULTS,
+    "es": ES_DEFAULTS,
 }
 
 

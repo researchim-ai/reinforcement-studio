@@ -105,6 +105,18 @@ ALGORITHM_CATALOG = [
             {"key": "n_step", "label": "N-step return", "type": "int", "default": 3, "min": 1, "max": 10},
             {"key": "per_alpha", "label": "PER: приоритет (alpha)", "type": "float", "default": 0.6, "min": 0.0, "max": 1.0},
             {"key": "per_beta_start", "label": "PER: IS-коррекция (beta start)", "type": "float", "default": 0.4, "min": 0.0, "max": 1.0},
+            {
+                "key": "distributional", "label": "Distributional RL (QR-DQN)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (скалярный Q)"},
+                    {"value": 1, "label": "Да — предсказывать распределение возврата"},
+                ],
+                "visibleWhen": [{"key": "memory_type", "eq": 0}],
+            },
+            {
+                "key": "num_quantiles", "label": "QR-DQN: число квантилей", "type": "int", "default": 51, "min": 3, "max": 200,
+                "visibleWhen": [{"key": "distributional", "eq": 1}, {"key": "memory_type", "eq": 0}],
+            },
             *_exploration_hyperparams(),
             *_memory_hyperparams(default_seq_len=20),
         ],
@@ -116,10 +128,43 @@ ALGORITHM_CATALOG = [
         "description": "Proximal Policy Optimization — стабильный policy-gradient метод, discrete и continuous.",
         "hyperparams": [
             {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
+            {
+                "key": "lr_schedule", "label": "Learning rate schedule", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Постоянный"},
+                    {"value": 1, "label": "Линейно убывает до 0"},
+                ],
+            },
             {"key": "n_steps", "label": "Steps per update", "type": "int", "default": 2048, "min": 32, "max": 8192},
             {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 1024},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.0, "min": 0.0, "max": 0.1},
+            {
+                "key": "use_sde", "label": "gSDE (гладкое исследование, continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычный per-step шум)"},
+                    {"value": 1, "label": "Да — state-dependent exploration"},
+                ],
+            },
+            {
+                "key": "sde_sample_freq", "label": "gSDE: шагов между пересэмплингом шума", "type": "int", "default": 4, "min": 1, "max": 256,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "sde_log_std_init", "label": "gSDE: начальный log_std", "type": "float", "default": -2.0, "min": -5.0, "max": 1.0,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "head_hidden_size", "label": "Отдельный скрытый слой pi/value поверх признаков", "type": "int",
+                "default": 0, "min": 0, "max": 512,
+            },
+            {
+                "key": "use_beta", "label": "Beta-распределение вместо Гауссианы (continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычная Гауссиана + clip)"},
+                    {"value": 1, "label": "Да — Beta, без клиппинга по границам"},
+                ],
+            },
             *_memory_hyperparams(default_seq_len=32),
         ],
     },
@@ -148,6 +193,60 @@ ALGORITHM_CATALOG = [
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "tau", "label": "Target soft-update (tau)", "type": "float", "default": 0.005, "min": 0.0001, "max": 0.1},
             {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.2, "min": 0.0, "max": 1.0},
+        ],
+    },
+    {
+        "id": "ddpg",
+        "name": "DDPG",
+        "kind": "gym",
+        "description": "Deep Deterministic Policy Gradient — классический off-policy метод для непрерывных действий: "
+                        "детерминированная политика + один critic + Gaussian-шум для исследования. Проще SAC/TD3, "
+                        "но менее устойчив (переоценка Q, чувствителен к масштабу шума) — для новых экспериментов "
+                        "обычно лучше сразу брать TD3.",
+        "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-3, "min": 1e-6, "max": 1e-1},
+            {"key": "buffer_size", "label": "Replay buffer size", "type": "int", "default": 100_000, "min": 1_000, "max": 1_000_000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 256, "min": 8, "max": 1024},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
+            {"key": "tau", "label": "Target soft-update (tau)", "type": "float", "default": 0.005, "min": 0.0001, "max": 0.1},
+            {"key": "exploration_noise", "label": "Шум исследования (доля диапазона действий)", "type": "float", "default": 0.1, "min": 0.0, "max": 1.0},
+        ],
+    },
+    {
+        "id": "td3",
+        "name": "TD3",
+        "kind": "gym",
+        "description": "Twin Delayed DDPG — самый надёжный из наших off-policy алгоритмов для непрерывных действий "
+                        "с (почти) детерминированной динамикой: два critic'а (берём минимум, против переоценки), "
+                        "отложенные обновления актора и сглаживание целевой политики шумом. Хороший дефолт для "
+                        "MuJoCo-подобных задач и Car Racing.",
+        "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-3, "min": 1e-6, "max": 1e-1},
+            {"key": "buffer_size", "label": "Replay buffer size", "type": "int", "default": 100_000, "min": 1_000, "max": 1_000_000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 256, "min": 8, "max": 1024},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
+            {"key": "tau", "label": "Target soft-update (tau)", "type": "float", "default": 0.005, "min": 0.0001, "max": 0.1},
+            {"key": "exploration_noise", "label": "Шум исследования (доля диапазона действий)", "type": "float", "default": 0.1, "min": 0.0, "max": 1.0},
+            {"key": "policy_noise", "label": "Сглаживание целевой политики (σ)", "type": "float", "default": 0.2, "min": 0.0, "max": 1.0},
+            {"key": "noise_clip", "label": "Clip шума целевой политики", "type": "float", "default": 0.5, "min": 0.0, "max": 1.0},
+            {"key": "policy_delay", "label": "Задержка обновления актора (шагов critic)", "type": "int", "default": 2, "min": 1, "max": 10},
+        ],
+    },
+    {
+        "id": "es",
+        "name": "Evolution Strategies",
+        "kind": "gym",
+        "description": "Gradient-free чёрный ящик (OpenAI-ES / диагональный NES, Salimans et al. 2017) — вообще без "
+                        "backprop через среду: популяция случайных возмущений параметров сети оценивается полными "
+                        "эпизодами, обновление — взвешенное по рангу fitness среднее возмущений. Работает и для "
+                        "дискретных, и для непрерывных действий, устойчив к разреженной/недифференцируемой награде, "
+                        "но требует много эпизодов на одно обновление — на маленьких classic-control средах это "
+                        "нормально, на тяжёлых pixel-средах будет намного медленнее градиентных методов.",
+        "hyperparams": [
+            {"key": "population_size", "label": "Размер популяции", "type": "int", "default": 32, "min": 2, "max": 512},
+            {"key": "sigma", "label": "Sigma (масштаб возмущений)", "type": "float", "default": 0.1, "min": 0.001, "max": 1.0},
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 0.02, "min": 1e-4, "max": 1.0},
+            {"key": "episodes_per_eval", "label": "Эпизодов на оценку кандидата", "type": "int", "default": 1, "min": 1, "max": 10},
         ],
     },
     {
@@ -250,12 +349,21 @@ async def inspect(req: InspectRequest):
     without running any training, so the UI can show input/output dims,
     layer summary and parameter count while the user is still designing."""
     from rl_core import inspect as inspect_core
+    from rl_core.netbuilder_store import resolve_network_spec
 
     env_id = req.environment.get("id")
     if not env_id:
         raise HTTPException(status_code=400, detail="environment.id is required")
     algo_id = req.algorithm.get("id", "ppo")
     hyperparams = req.algorithm.get("hyperparams") or {}
+
+    # A saved (`network_spec_id`) or inline/unsaved (`network_spec` — the
+    # Designer's quick layer editor) hand-designed architecture, resolved
+    # exactly like a real run would (see `runner_utils.py`) so this preview
+    # reflects it instead of always showing the algorithm's hardcoded net.
+    network_spec = resolve_network_spec({"algorithm": req.algorithm})
+    if network_spec:
+        hyperparams = {**hyperparams, "network_spec": network_spec}
 
     if req.kind == "alphazero":
         return inspect_core.inspect_alphazero(env_id, algo_id, hyperparams)

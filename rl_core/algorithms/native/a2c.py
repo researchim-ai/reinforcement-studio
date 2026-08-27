@@ -12,7 +12,8 @@ import gymnasium as gym
 
 from rl_core.algorithms.native.buffers import RolloutBuffer
 from rl_core.algorithms.native.networks import ActorCriticNet, Hidden, RecurrentActorCriticNet, detach_hidden, memory_type_from_hyperparams
-from rl_core.algorithms.native.on_policy import OnPolicyAlgorithm
+from rl_core.algorithms.native.on_policy import OnPolicyAlgorithm, _LossAccumulator
+from rl_core.algorithms.vec_env import action_space, obs_space
 from rl_core.netbuilder import SpecActorCriticNet
 
 DEFAULT_HYPERPARAMS = {
@@ -37,18 +38,19 @@ class NativeA2C(OnPolicyAlgorithm):
         super().__init__(env, hyperparams, seed, device)
         if seed is not None:
             torch.manual_seed(seed)
+        obs_sp, act_sp = obs_space(env), action_space(env)
         network_spec = hyperparams.get("network_spec")
         memory_type = memory_type_from_hyperparams(hyperparams)
         if network_spec:
-            self.net = SpecActorCriticNet(env.observation_space, env.action_space, network_spec)
+            self.net = SpecActorCriticNet(obs_sp, act_sp, network_spec)
         elif memory_type:
             self.net = RecurrentActorCriticNet(
-                env.observation_space, env.action_space, memory_type,
+                obs_sp, act_sp, memory_type,
                 hidden_size=int(hyperparams.get("memory_hidden_size", 128)),
                 num_layers=int(hyperparams.get("memory_num_layers", 1)),
             )
         else:
-            self.net = ActorCriticNet(env.observation_space, env.action_space)
+            self.net = ActorCriticNet(obs_sp, act_sp)
         self.net = self.net.to(device)
         self.recurrent = isinstance(self.net, RecurrentActorCriticNet)
         self.memory_seq_len = max(1, int(hyperparams.get("memory_seq_len", 32)))
@@ -82,6 +84,9 @@ class NativeA2C(OnPolicyAlgorithm):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        acc = _LossAccumulator()
+        acc.add(policy_loss, value_loss, entropy)
+        self._last_metrics = acc.means()
 
     def _update_recurrent(self, buf: RolloutBuffer, rollout_hidden: Hidden | None) -> None:
         """A2C wants a *single* full-batch update per rollout — chunking is
@@ -92,12 +97,14 @@ class NativeA2C(OnPolicyAlgorithm):
         self.optimizer.zero_grad()
         hidden = rollout_hidden
         num_chunks = 0
+        acc = _LossAccumulator()
         for batch in buf.sequences(self.memory_seq_len):
-            obs_t = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device).unsqueeze(0)
-            actions_t = torch.as_tensor(batch["actions"], device=self.device).unsqueeze(0)
-            advantages = torch.as_tensor(batch["advantages"], dtype=torch.float32, device=self.device).unsqueeze(0)
-            returns = torch.as_tensor(batch["returns"], dtype=torch.float32, device=self.device).unsqueeze(0)
-            episode_starts = torch.as_tensor(batch["episode_starts"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            # `batch["obs"]` etc. are already `(num_envs, chunk_len, ...)`.
+            obs_t = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device)
+            actions_t = torch.as_tensor(batch["actions"], device=self.device)
+            advantages = torch.as_tensor(batch["advantages"], dtype=torch.float32, device=self.device)
+            returns = torch.as_tensor(batch["returns"], dtype=torch.float32, device=self.device)
+            episode_starts = torch.as_tensor(batch["episode_starts"], dtype=torch.float32, device=self.device)
 
             dist, values, hidden = self.net.distribution_sequence(obs_t, hidden, episode_starts)
             log_probs = self.net.log_prob(dist, actions_t)
@@ -107,6 +114,7 @@ class NativeA2C(OnPolicyAlgorithm):
             value_loss = F.mse_loss(values, returns)
             loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
             loss.backward()
+            acc.add(policy_loss, value_loss, entropy)
 
             hidden = detach_hidden(hidden)
             num_chunks += 1
@@ -117,3 +125,4 @@ class NativeA2C(OnPolicyAlgorithm):
                     p.grad /= num_chunks
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
         self.optimizer.step()
+        self._last_metrics = acc.means()

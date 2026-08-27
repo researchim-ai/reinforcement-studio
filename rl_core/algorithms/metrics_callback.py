@@ -16,6 +16,24 @@ from typing import Any, Callable
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
+from rl_core.metrics_history import append_history, json_safe
+
+# SB3 algorithms log per-update training stats under these dotted keys (not
+# every algorithm reports every key — DQN has no "entropy_loss", PPO has no
+# "loss", etc.) via `model.logger.name_to_value`. Surfacing them generically
+# here (rather than hand-picking per-algorithm) means any SB3-based custom
+# plugin automatically gets a loss chart in the Training Monitor too.
+_SB3_TRAIN_METRIC_KEYS = {
+    "train/policy_loss": "policy_loss",
+    "train/policy_gradient_loss": "policy_loss",
+    "train/value_loss": "value_loss",
+    "train/entropy_loss": "entropy_loss",
+    "train/loss": "loss",
+    "train/approx_kl": "approx_kl",
+    "train/clip_fraction": "clip_fraction",
+    "train/std": "action_std",
+}
+
 # Hard caps on the recorded episode preview, independent of how long the
 # real episode/env actually runs — without these, a slow-to-terminate env
 # (BipedalWalker, MuJoCo, ...) could turn one "occasional" render into a
@@ -29,6 +47,12 @@ _GIF_MAX_SIDE = 320
 # with a smaller/shorter GIF instead of shipping a multi-MB blob through
 # metrics.json and the metrics WebSocket on every render tick.
 _MAX_GIF_BYTES = 3_000_000
+# See the identical constant/reasoning in `runner_utils.py` — `_on_step()`
+# below runs once per env step, so checking `stop.flag` unconditionally
+# every time is a filesystem `stat()` per step that adds up over a long
+# run for no real benefit (a few dozen steps of staleness is still a
+# fraction of a second for any env in this app).
+_STOP_CHECK_EVERY_STEPS = 50
 
 
 def _subsample(frames: list[np.ndarray], max_frames: int) -> list[np.ndarray]:
@@ -61,6 +85,19 @@ def _build_gif_bytes(frames: list[np.ndarray], fps: float, max_frames: int, max_
         duration=durations, optimize=True,
     )
     return buf.getvalue()
+
+
+def persist_episode_gif(run_dir: Path, gif_b64: str, step: int) -> str:
+    """Write the live-preview GIF to disk — always `episode_preview.gif`
+    (latest) plus a step-stamped copy under `previews/` for history."""
+    data = base64.b64decode(gif_b64)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rel_latest = "episode_preview.gif"
+    (run_dir / rel_latest).write_bytes(data)
+    previews = run_dir / "previews"
+    previews.mkdir(exist_ok=True)
+    (previews / f"episode_{step:08d}.gif").write_bytes(data)
+    return rel_latest
 
 
 def _encode_episode_gif(frames: list[np.ndarray], fps: float) -> str:
@@ -152,11 +189,17 @@ class MetricsCallback(BaseCallback):
         self.start_time = time.time()
         self._last_write = 0
         self._last_render = 0
+        self._last_stop_check = 0
+        self._stop_requested_cached = False
         self._last_gif: str | None = None
+        self._last_gif_step = 0
         self._stopped_early = False
 
     def _stop_requested(self) -> bool:
-        return (self.run_dir / "stop.flag").exists()
+        if not self._stop_requested_cached and self.num_timesteps - self._last_stop_check >= _STOP_CHECK_EVERY_STEPS:
+            self._last_stop_check = self.num_timesteps
+            self._stop_requested_cached = (self.run_dir / "stop.flag").exists()
+        return self._stop_requested_cached
 
     def _episode_stats(self) -> tuple[float | None, float | None]:
         buf = getattr(self.model, "ep_info_buffer", None)
@@ -166,19 +209,38 @@ class MetricsCallback(BaseCallback):
         lengths = [ep["l"] for ep in buf]
         return float(np.mean(rewards)), float(np.mean(lengths))
 
-    def _maybe_render(self) -> None:
+    def _train_metrics(self) -> dict[str, float]:
+        """Best-effort pull of whatever SB3's own logger recorded during the
+        most recent `train()` call — see `_SB3_TRAIN_METRIC_KEYS` above."""
+        name_to_value = getattr(getattr(self.model, "logger", None), "name_to_value", None)
+        if not name_to_value:
+            return {}
+        out: dict[str, float] = {}
+        for sb3_key, our_key in _SB3_TRAIN_METRIC_KEYS.items():
+            value = name_to_value.get(sb3_key)
+            if value is not None:
+                try:
+                    out[our_key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def _maybe_render(self) -> bool:
         if not self.make_render_env or self.num_timesteps - self._last_render < self.render_every_steps:
-            return
+            return False
         self._last_render = self.num_timesteps
         # SB3 policies handle their own recurrent state internally when the
         # policy needs it (e.g. sb3-contrib's RecurrentPPO) — this app
         # doesn't use those, so `episode_start` is simply unused here.
         gif = render_episode(self.make_render_env, lambda obs, episode_start: self.model.predict(obs, deterministic=True))
-        if gif:
-            # Only overwrite on a *successful* render — a transient
-            # failure keeps showing the previous episode instead of
-            # blanking the preview.
-            self._last_gif = gif
+        if not gif:
+            # A transient failure (env recreation hiccup, ...) keeps
+            # showing the previous episode instead of blanking the preview.
+            return False
+        self._last_gif = gif
+        self._last_gif_step = self.num_timesteps
+        persist_episode_gif(self.run_dir, gif, self.num_timesteps)
+        return True
 
     def _write_snapshot(self, status: str, extra: dict | None = None) -> None:
         mean_reward, mean_length = self._episode_stats()
@@ -197,16 +259,24 @@ class MetricsCallback(BaseCallback):
             "elapsed_seconds": round(elapsed, 1),
         }
         snapshot.update(self.static_info)
-        self._maybe_render()
-        # Keep re-attaching the last successfully recorded episode to every
-        # snapshot (not just the one that just rendered it) — so a run that
-        # finishes between two render ticks, or is reopened later without a
-        # live WebSocket to have carried it forward client-side, still shows
-        # its most recent episode instead of nothing at all.
+        snapshot.update(self._train_metrics())
+        just_rendered = self._maybe_render()
         if self._last_gif:
-            snapshot["episode_gif_base64"] = self._last_gif
+            # `episode_gif_file`/`episode_gif_step` are cheap to re-attach
+            # to every snapshot — the Training Monitor fetches/cache-busts
+            # `GET .../preview.gif` off them whenever the (up to a few MB)
+            # base64 blob itself isn't present. That blob is only included
+            # on the exact write that just captured it (or the run's very
+            # last write, belt-and-suspenders in case serving the file back
+            # ever fails) — see the identical comment in `runner_utils.py`.
+            snapshot["episode_gif_file"] = "episode_preview.gif"
+            snapshot["episode_gif_step"] = self._last_gif_step
+            if just_rendered or status != "running":
+                snapshot["episode_gif_base64"] = self._last_gif
         if extra:
             snapshot.update(extra)
+        snapshot = json_safe(snapshot)
+        append_history(self.run_dir, snapshot)
         (self.run_dir / "metrics.json").write_text(json.dumps(snapshot))
 
     def _on_training_start(self) -> None:

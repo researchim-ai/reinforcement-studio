@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import gymnasium as gym
 
 from rl_core.algorithms.native.exploration.noisy import NoisyLinear
@@ -198,6 +199,20 @@ def detach_hidden(hidden: Hidden) -> Hidden:
     return hidden.detach()
 
 
+def mask_hidden_for_dones(hidden: Hidden, dones) -> Hidden:
+    """Zeroes out exactly the batch rows (lanes) whose episode just ended —
+    used between vectorized collection steps (`num_envs>1`) so a lane that
+    reset doesn't carry another lane's still-running episode's memory into
+    its next hidden state, while every other lane's hidden state carries
+    over untouched. `dones`: any array-like of length `batch_size` (e.g. a
+    numpy bool array from `vec_env.vec_step`)."""
+    ref = hidden[0] if isinstance(hidden, tuple) else hidden
+    keep_mask = torch.as_tensor(
+        [0.0 if d else 1.0 for d in dones], dtype=ref.dtype, device=ref.device,
+    ).view(1, -1, 1)
+    return RecurrentCore._mask_hidden(hidden, keep_mask)
+
+
 def _flatten_time(features: nn.Module, obs_seq: torch.Tensor) -> torch.Tensor:
     """Applies a (per-timestep) feature extractor to a (B, T, *obs_shape)
     tensor by folding B and T together for one batched forward pass, then
@@ -209,42 +224,249 @@ def _flatten_time(features: nn.Module, obs_seq: torch.Tensor) -> torch.Tensor:
     return feat.reshape(batch_size, num_steps, feat.shape[-1])
 
 
+class _StateDependentGaussian:
+    """gSDE ("generalized State-Dependent Exploration", Raffin et al. 2021 —
+    https://arxiv.org/abs/2005.05719) action distribution: same interface
+    (`sample`/`log_prob`/`entropy`) as `torch.distributions.Normal` so
+    `ActorCriticNet.log_prob`/`.entropy` and the collection/update loops in
+    `on_policy.py`/`ppo.py` don't need to know which one they got.
+
+    Ordinary PPO/A2C resample independent per-step, per-action-dim Gaussian
+    noise — fine for e.g. discrete-ish "nudge left/right" control, but for a
+    continuous steering wheel it means the sampled action can flip sign
+    frame to frame, so the *executed* trajectory looks jittery even once the
+    mean action is good. gSDE instead treats the noise as a linear function
+    of the (detached) feature vector, `noise = features @ exploration_mat`,
+    and only resamples `exploration_mat` every few steps (see
+    `ActorCriticNet.reset_noise`/`sde_sample_freq`) — so the noise added
+    stays *correlated* across consecutive steps instead of independent,
+    giving temporally smooth exploration.
+
+    The distribution used for `log_prob`/`entropy` (needed for the PPO
+    ratio/entropy bonus) is the *marginal* Gaussian obtained by integrating
+    out the random `exploration_mat` — `Normal(mean, sqrt(features**2 @
+    std**2))` — which only depends on the trainable `log_std` parameter, not
+    on which exact `exploration_mat` was sampled during collection. That's
+    exactly what lets `_update()` recompute a valid log-prob for PPO's ratio
+    without needing to know/replay the specific noise matrix a given
+    transition was originally collected under."""
+
+    def __init__(
+        self, mean: torch.Tensor, features: torch.Tensor, log_std: torch.Tensor,
+        exploration_mat: torch.Tensor, exploration_mats: torch.Tensor,
+    ) -> None:
+        self.mean = mean
+        self._features = features.detach()
+        std = torch.exp(log_std)
+        variance = (self._features ** 2) @ (std ** 2) + 1e-6
+        self._normal = torch.distributions.Normal(mean, variance.sqrt())
+        self._exploration_mat = exploration_mat
+        self._exploration_mats = exploration_mats
+
+    def _noise(self) -> torch.Tensor:
+        feat = self._features
+        # One shared matrix for a lone/mismatched batch (e.g. `predict()`
+        # sampling a single live env with a batch of exploration matrices
+        # sized for `num_envs` parallel training lanes) — a per-lane matrix
+        # via batched matmul otherwise, so each vectorized env explores
+        # along its own (temporarily fixed) noise direction.
+        if feat.shape[0] == 1 or feat.shape[0] != self._exploration_mats.shape[0]:
+            return feat @ self._exploration_mat
+        return torch.bmm(feat.unsqueeze(1), self._exploration_mats).squeeze(1)
+
+    def sample(self) -> torch.Tensor:
+        return self.mean + self._noise()
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        return self._normal.log_prob(action).sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        return self._normal.entropy().sum(dim=-1)
+
+
+class _BetaPolicyDistribution:
+    """Beta-distribution continuous-action policy (Chou et al. 2017 —
+    https://proceedings.mlr.press/v70/chou17a/chou17a.pdf; Petrazzini &
+    Antonelo 2021 on CarRacing specifically —
+    https://arxiv.org/abs/2111.02202, +63% success rate vs. Gaussian) — same
+    `sample`/`log_prob`/`entropy` interface as `torch.distributions.Normal`
+    so `ActorCriticNet.log_prob`/`.entropy` don't need to know which one
+    they got.
+
+    The usual PPO/A2C Gaussian head has *unbounded* support, so any action
+    space with hard bounds (steering [-1,1], but especially one-sided gas/
+    brake [0,1]) needs every sampled action hard-clipped back into range
+    before it reaches `env.step()`. That clip is a biased, non-smooth
+    operation the policy gradient never sees: the network can keep pushing
+    the raw mean further outside the box (e.g. "gas = 1.4") without the
+    loss ever reflecting that 1.4 and 1.0 execute identically, which both
+    papers above identify as a real source of slower/worse-converged
+    continuous control. A Beta distribution has support exactly on `[0,1]`
+    by construction, so it's affinely rescaled to the action space's
+    `[low, high]` box and *never* needs clipping — every raw sample is
+    already a valid action.
+
+    `alpha, beta > 1` (enforced by the softplus+1 in `ActorCriticNet`
+    below, matching Chou et al.'s parameterization) keeps the density
+    unimodal instead of degenerating into a bathtub/U-shape that piles
+    mass at the two ends of the range — the failure mode you'd get from
+    the same distribution family with `alpha` or `beta` allowed below 1."""
+
+    def __init__(self, alpha: torch.Tensor, beta: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> None:
+        self.alpha = alpha
+        self.beta = beta
+        self._dist = torch.distributions.Beta(alpha, beta)
+        self._low = low
+        self._high = high
+        self._scale = (high - low).clamp(min=1e-6)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._low + self._scale * self._dist.mean
+
+    def sample(self) -> torch.Tensor:
+        x = self._dist.rsample()
+        return self._low + self._scale * x
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        # Constant `-log(scale)` per dim (the affine transform's Jacobian)
+        # is omitted deliberately: it's identical for old and new policy at
+        # a fixed collected action, so it cancels exactly in PPO's
+        # `exp(new_log_prob - old_log_prob)` ratio and would only ever add
+        # noise, never signal, to the loss.
+        x = ((action - self._low) / self._scale).clamp(1e-6, 1.0 - 1e-6)
+        return self._dist.log_prob(x).sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        return self._dist.entropy().sum(dim=-1)
+
+
 class ActorCriticNet(nn.Module):
     """Shared-trunk actor-critic used by both NativePPO and NativeA2C.
     Discrete action spaces get a Categorical head; continuous (`Box`) action
-    spaces get a diagonal Gaussian head with a learned, state-independent
-    log-std (the standard PPO/A2C setup)."""
+    spaces get a diagonal Gaussian head with a learned log-std — either the
+    standard PPO/A2C state-*independent* one, or (`use_sde=True`) gSDE's
+    state-*dependent* one, see `_StateDependentGaussian` above.
 
-    def __init__(self, observation_space: gym.Space, action_space: gym.Space) -> None:
+    `head_hidden_size` optionally inserts one `Linear + GELU` layer between
+    the feature extractor and each head (separate weights for policy vs.
+    value, like SB3's `net_arch=dict(pi=[...], vf=[...])`) instead of
+    attaching `mu_head`/`value_head` directly to the raw feature vector.
+    Off (`0`) by default — matches the previous, simpler architecture for
+    every env that isn't explicitly opting into more capacity — but pixel
+    envs with a lot going on in one frame (CarRacing) can plateau well
+    below a solved score with heads that are just one bare `Linear` layer
+    on 512 CNN features; a per-head hidden layer gives the policy and value
+    function each their own room to specialize instead of both being a
+    single linear readout off shared features."""
+
+    def __init__(
+        self, observation_space: gym.Space, action_space: gym.Space,
+        use_sde: bool = False, sde_log_std_init: float = -2.0, head_hidden_size: int = 0,
+        use_beta: bool = False,
+    ) -> None:
         super().__init__()
         self.features = build_feature_extractor(observation_space)
         feat_dim = self.features.out_dim
         self.discrete = isinstance(action_space, gym.spaces.Discrete)
+        # gSDE/Beta only make sense for continuous action heads — silently
+        # ignored for Discrete so a stale hyperparam left over from
+        # switching envs never breaks a discrete-action run. Beta wins if
+        # both are somehow on at once: gSDE is specifically a *Gaussian*
+        # exploration scheme, incompatible with a Beta head.
+        self.use_beta = use_beta and not self.discrete
+        self.use_sde = use_sde and not self.discrete and not self.use_beta
+        self.head_hidden_size = max(0, int(head_hidden_size))
+        if self.head_hidden_size:
+            self.pi_extra = nn.Sequential(nn.Linear(feat_dim, self.head_hidden_size), nn.GELU())
+            self.vf_extra = nn.Sequential(nn.Linear(feat_dim, self.head_hidden_size), nn.GELU())
+            head_dim = self.head_hidden_size
+        else:
+            self.pi_extra = None
+            self.vf_extra = None
+            head_dim = feat_dim
         if self.discrete:
-            self.action_head = nn.Linear(feat_dim, int(action_space.n))
+            self.action_head = nn.Linear(head_dim, int(action_space.n))
+        elif self.use_beta:
+            assert np.all(np.isfinite(action_space.low)) and np.all(np.isfinite(action_space.high)), (
+                "Beta policy needs a fully bounded (finite low/high) Box action space"
+            )
+            act_dim = int(np.prod(action_space.shape))
+            self.alpha_head = nn.Linear(head_dim, act_dim)
+            self.beta_head = nn.Linear(head_dim, act_dim)
+            self.register_buffer("action_low", torch.as_tensor(action_space.low, dtype=torch.float32))
+            self.register_buffer("action_high", torch.as_tensor(action_space.high, dtype=torch.float32))
         else:
             act_dim = int(np.prod(action_space.shape))
-            self.mu_head = nn.Linear(feat_dim, act_dim)
-            self.log_std = nn.Parameter(torch.zeros(act_dim))
-        self.value_head = nn.Linear(feat_dim, 1)
+            self.mu_head = nn.Linear(head_dim, act_dim)
+            if self.use_sde:
+                # `(head_dim, act_dim)` — "full std" gSDE (one log-std per
+                # policy-latent-feature/action pair) — vs. the plain
+                # `(act_dim,)` below, since the whole point is a
+                # *feature-dependent* std; must match whatever `pi_extra`
+                # actually feeds `mu_head` (raw CNN features if there's no
+                # extra head layer).
+                self.log_std = nn.Parameter(torch.ones(head_dim, act_dim) * sde_log_std_init)
+                self.reset_noise(1)
+            else:
+                self.log_std = nn.Parameter(torch.zeros(act_dim))
+        self.value_head = nn.Linear(head_dim, 1)
+
+    def reset_noise(self, batch_size: int = 1) -> None:
+        """Resamples gSDE's exploration noise matrix — called once up front
+        and then every `sde_sample_freq` env steps during collection (see
+        `on_policy.py::learn`) so consecutive actions share the same noise
+        direction for a few steps instead of it being redrawn every step.
+        A no-op when gSDE isn't in use."""
+        if not self.use_sde:
+            return
+        std = torch.exp(self.log_std)
+        weights_dist = torch.distributions.Normal(torch.zeros_like(std), std)
+        self._sde_exploration_mat = weights_dist.rsample()
+        self._sde_exploration_mats = weights_dist.rsample((max(1, batch_size),))
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (distribution params tensor, value). For discrete this is
         logits; for continuous it's the Gaussian mean."""
+        params, value, _ = self._forward_with_features(obs)
+        return params, value
+
+    def _forward_with_features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self.features(obs)
-        value = self.value_head(feat).squeeze(-1)
+        pi_latent = self.pi_extra(feat) if self.pi_extra is not None else feat
+        vf_latent = self.vf_extra(feat) if self.vf_extra is not None else feat
+        value = self.value_head(vf_latent).squeeze(-1)
         if self.discrete:
-            return self.action_head(feat), value
-        return self.mu_head(feat), value
+            params = self.action_head(pi_latent)
+        elif self.use_beta:
+            # `softplus(...) + 1` keeps both concentration params > 1 (see
+            # `_BetaPolicyDistribution` docstring for why) — packed as a
+            # tuple since a Beta head has two tensors, not one "mean".
+            alpha = F.softplus(self.alpha_head(pi_latent)) + 1.0
+            beta = F.softplus(self.beta_head(pi_latent)) + 1.0
+            params = (alpha, beta)
+        else:
+            params = self.mu_head(pi_latent)
+        return params, value, pi_latent
 
     def distribution(self, obs: torch.Tensor):
-        params, value = self.forward(obs)
+        params, value, pi_latent = self._forward_with_features(obs)
         if self.discrete:
             return torch.distributions.Categorical(logits=params), value
+        if self.use_beta:
+            alpha, beta = params
+            return _BetaPolicyDistribution(alpha, beta, self.action_low, self.action_high), value
+        if self.use_sde:
+            return _StateDependentGaussian(
+                params, pi_latent, self.log_std, self._sde_exploration_mat, self._sde_exploration_mats,
+            ), value
         std = torch.exp(self.log_std).clamp(min=1e-6)
         return torch.distributions.Normal(params, std), value
 
     def deterministic_action(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.use_beta:
+            dist, _ = self.distribution(obs)
+            return dist.mean
         params, _ = self.forward(obs)
         return torch.argmax(params, dim=-1) if self.discrete else params
 
@@ -429,6 +651,57 @@ class DuelingQNetwork(nn.Module):
         return value + (advantage - advantage.mean(dim=-1, keepdim=True))
 
 
+class QuantileDuelingQNetwork(nn.Module):
+    """Distributional Rainbow DQN head — QR-DQN (Dabney et al., 2017) grafted
+    onto the same dueling architecture as `DuelingQNetwork`. Instead of one
+    scalar `Q(s,a)`, this predicts `num_quantiles` quantiles of the *return
+    distribution* for each action; the mean over quantiles recovers the
+    usual scalar Q-value for action selection, but the full distribution is
+    what gets trained against (quantile Huber loss in
+    `NativeRainbowDQN._train_step`), which gives the network a
+    richer training signal than a single expected value — this is the
+    actual "distributional RL" ingredient from the original Rainbow paper
+    (that implementation used the fixed-support C51 instead of quantile
+    regression; QR-DQN needs no projection step and is simpler to get right
+    from scratch, at basically the same benefit).
+
+    Value/advantage streams are duelling *per quantile*: each outputs
+    `num_quantiles` (value) or `n_actions * num_quantiles` (advantage)
+    numbers, recombined exactly like the scalar case but broadcasting over
+    the quantile axis."""
+
+    def __init__(
+        self, observation_space: gym.Space, n_actions: int, num_quantiles: int = 51, hidden: int = 128,
+        noisy: bool = False, noisy_sigma0: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.n_actions = n_actions
+        self.num_quantiles = num_quantiles
+        self.features = build_feature_extractor(observation_space)
+        feat_dim = self.features.out_dim
+        self.value_stream = nn.Sequential(
+            _q_linear(feat_dim, hidden, noisy, noisy_sigma0), nn.ReLU(),
+            _q_linear(hidden, num_quantiles, noisy, noisy_sigma0),
+        )
+        self.advantage_stream = nn.Sequential(
+            _q_linear(feat_dim, hidden, noisy, noisy_sigma0), nn.ReLU(),
+            _q_linear(hidden, n_actions * num_quantiles, noisy, noisy_sigma0),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Returns `(batch, n_actions, num_quantiles)` — the predicted
+        quantiles of each action's return distribution."""
+        feat = self.features(obs)
+        value = self.value_stream(feat).unsqueeze(1)
+        advantage = self.advantage_stream(feat).view(-1, self.n_actions, self.num_quantiles)
+        return value + (advantage - advantage.mean(dim=1, keepdim=True))
+
+    def q_values(self, obs: torch.Tensor) -> torch.Tensor:
+        """Scalar `Q(s,a)` for action selection — the mean of each action's
+        quantile distribution."""
+        return self.forward(obs).mean(dim=-1)
+
+
 class RecurrentDuelingQNetwork(nn.Module):
     """Memory-enabled Rainbow DQN network — `RecurrentQNetwork`'s LSTM/GRU
     core feeding the same dueling value/advantage streams as
@@ -520,6 +793,34 @@ class GaussianPolicy(nn.Module):
         return action, log_prob, deterministic_action
 
 
+class DeterministicPolicy(nn.Module):
+    """Tanh-squashed deterministic policy used by DDPG/TD3 — unlike
+    `GaussianPolicy`, there's no distribution here at all: the network
+    outputs one action vector per observation, full stop. Exploration comes
+    from Gaussian noise added *outside* this module (see `DDPG`/`TD3`
+    `_sample_action`), not from sampling a learned distribution — that's the
+    defining difference between this family and SAC."""
+
+    def __init__(self, observation_space: gym.Space, action_low: np.ndarray, action_high: np.ndarray, hidden: int = 256) -> None:
+        super().__init__()
+        self.features = build_feature_extractor(observation_space)
+        feat_dim = self.features.out_dim
+        action_dim = len(action_low)
+        self.trunk = nn.Sequential(
+            nn.Linear(feat_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, action_dim),
+        )
+        low = np.where(np.isfinite(action_low), action_low, -1.0)
+        high = np.where(np.isfinite(action_high), action_high, 1.0)
+        self.register_buffer("action_scale", torch.as_tensor((high - low) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.as_tensor((high + low) / 2.0, dtype=torch.float32))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        h = self.trunk(self.features(obs))
+        return torch.tanh(h) * self.action_scale + self.action_bias
+
+
 class QCritic(nn.Module):
     """State-action value network for SAC — concatenates the observation
     features with the (continuous) action vector before a small MLP head.
@@ -539,3 +840,54 @@ class QCritic(nn.Module):
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         feat = self.features(obs)
         return self.head(torch.cat([feat, action], dim=-1)).squeeze(-1)
+
+
+class ESPolicyNet(nn.Module):
+    """Policy-only network for Evolution Strategies — no value head at all,
+    since ES never learns a critic; every parameter here is something the
+    black-box search in `rl_core/algorithms/native/es.py` directly perturbs.
+    Deliberately much smaller (single 64-unit hidden layer) than the
+    actor-critic nets used by the gradient-based algorithms: ES's gradient
+    estimate is a Monte-Carlo average over the *population*, so its variance
+    scales with the parameter count — small networks need far fewer
+    episodes per generation to get a usable signal, and still do
+    surprisingly well on this app's classic-control-sized tasks.
+
+    Discrete actions -> raw logits, `act()` takes the argmax (ES supplies
+    its own exploration via parameter-space noise, not action-space
+    sampling, so there's no reason to add softmax noise on top).
+    Continuous actions -> tanh-squashed and rescaled to the env's bounds,
+    same convention as `DeterministicPolicy`.
+    """
+
+    def __init__(self, observation_space: gym.Space, action_space: gym.Space, hidden: int = 64) -> None:
+        super().__init__()
+        self.discrete = isinstance(action_space, gym.spaces.Discrete)
+        self.features = build_feature_extractor(observation_space)
+        feat_dim = self.features.out_dim
+        if self.discrete:
+            out_dim = int(action_space.n)
+        else:
+            out_dim = int(np.prod(action_space.shape))
+            low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+            high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+            low = np.where(np.isfinite(low), low, -1.0)
+            high = np.where(np.isfinite(high), high, 1.0)
+            self.register_buffer("action_scale", torch.as_tensor((high - low) / 2.0, dtype=torch.float32))
+            self.register_buffer("action_bias", torch.as_tensor((high + low) / 2.0, dtype=torch.float32))
+        self.head = nn.Sequential(nn.Linear(feat_dim, hidden), nn.Tanh(), nn.Linear(hidden, out_dim))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        out = self.head(self.features(obs))
+        if self.discrete:
+            return out
+        return torch.tanh(out) * self.action_scale + self.action_bias
+
+    def act(self, obs: torch.Tensor) -> np.ndarray:
+        """Single (unbatched, `obs` already has a leading batch dim of 1)
+        deterministic action — argmax for discrete, the raw (tanh-squashed)
+        output for continuous."""
+        out = self.forward(obs)
+        if self.discrete:
+            return int(torch.argmax(out, dim=-1).item())
+        return out.squeeze(0).detach().cpu().numpy()

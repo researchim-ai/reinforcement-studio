@@ -3,12 +3,13 @@ import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Link } from 'react-router-dom'
 import { Cpu, Network } from 'lucide-react'
 import { Select } from '@/components/ui/select'
-import { Input } from '@/components/ui/input'
+import { NumericInput } from '@/components/ui/numeric-input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
-import { FAMILY_LABELS } from '@/lib/networkBuilder'
-import type { AlgorithmSpec, NetworkFamily, NetworkMeta } from '@/api/types'
+import { QuickNetworkEditor } from '@/components/designer/QuickNetworkEditor'
+import { FAMILY_LABELS, defaultHiddenSizesForFamily, networkFamilyFor, requiredFamilyFor } from '@/lib/networkBuilder'
+import type { AlgorithmSpec, NetworkMeta } from '@/api/types'
 
 export interface AlgorithmNodeData {
   algorithms: AlgorithmSpec[]
@@ -16,22 +17,17 @@ export interface AlgorithmNodeData {
   hyperparams: Record<string, number>
   networks: NetworkMeta[]
   networkSpecId: string | null
+  quickHiddenLayers: number[] | null
   onChangeAlgo: (id: string) => void
   onChangeHyperparam: (key: string, value: number) => void
   onChangeNetworkSpecId: (id: string | null) => void
-}
-
-/** Only built-in algorithms know how to accept a hand-designed spec net
- * (see rl_core/algorithms/native/{ppo,a2c,dqn}.py and
- * rl_core/alphazero/base.py::build_network) — custom plugins ignore
- * `network_spec` unless they opt in themselves, so hide the picker for
- * them rather than implying it does something it doesn't. */
-function requiredFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'): NetworkFamily | null {
-  if (kind === 'alphazero') return algorithmId === 'alphazero' ? 'alphazero' : null
-  if (algorithmId === 'dqn') return 'q_network'
-  if (algorithmId === 'rainbow_dqn') return 'dueling_q'
-  if (algorithmId === 'ppo' || algorithmId === 'a2c') return 'actor_critic'
-  return null
+  onChangeQuickLayers: (layers: number[] | null) => void
+  // Set while "Дообучить" (resume/fine-tune — see ExperimentDesigner.tsx's
+  // `resumeFrom` state) is active: the architecture/hyperparams are fixed
+  // by the source run/checkpoint's saved weights (loading a state_dict
+  // into a differently-shaped network fails outright), so every control
+  // here goes read-only instead of just being pre-filled.
+  locked?: boolean
 }
 
 /** React Flow re-renders a node's component on every position update while
@@ -64,9 +60,15 @@ function conditionsMatch(
 
 export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & { data: AlgorithmNodeData }) {
   const selected = data.algorithms.find((a) => a.id === data.selectedId)
-  const requiredFamily = selected ? requiredFamilyFor(selected.id, selected.kind) : null
+  const requiredFamily = selected ? networkFamilyFor(selected.id, selected.kind) : null
+  // Narrower than `requiredFamily` — excludes `alphazero` (which already has
+  // its own quick architecture knobs, `channels`/`num_blocks`, right in the
+  // hyperparams list above) since the quick *layer* editor only understands
+  // plain MLP trunks.
+  const quickFamily = selected ? requiredFamilyFor(selected.id, selected.kind) : null
   const compatibleNetworks = requiredFamily ? data.networks.filter((n) => n.family === requiredFamily && !n.broken) : []
-  const hasCustomNetwork = requiredFamily != null && data.networkSpecId != null
+  const hasSavedNetwork = requiredFamily != null && data.networkSpecId != null
+  const hasCustomNetwork = hasSavedNetwork || (quickFamily != null && data.quickHiddenLayers != null)
   const visibleHyperparams = selected?.hyperparams.filter((hp) => {
     if (hasCustomNetwork && (hp.key === 'memory_type' || hp.key.startsWith('memory_'))) return false
     if (hp.visibleWhen && !conditionsMatch(hp.visibleWhen, data.hyperparams)) return false
@@ -85,7 +87,14 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
           value={data.selectedId}
           onChange={(e) => data.onChangeAlgo(e.target.value)}
           options={data.algorithms.map((a) => ({ value: a.id, label: a.name }))}
+          disabled={data.locked}
         />
+        {data.locked && (
+          <p className="rounded-md bg-primary/10 px-2 py-1.5 text-[10px] text-primary">
+            Дообучение: алгоритм, гиперпараметры и архитектура сети наследуются от исходной модели
+            и не могут быть изменены.
+          </p>
+        )}
         {selected && (
           <>
             <p className="text-xs text-muted-foreground">{selected.description}</p>
@@ -94,11 +103,6 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                 <div key={hp.key} className="space-y-1">
                   <div className="flex items-baseline justify-between gap-2">
                     <Label className="text-[11px] text-muted-foreground">{hp.label}</Label>
-                    {!hp.options && (hp.min != null || hp.max != null) && (
-                      <span className="text-[10px] text-muted-foreground/60">
-                        {hp.min ?? '−∞'}–{hp.max ?? '∞'}
-                      </span>
-                    )}
                   </div>
                   {hp.options ? (
                     <Select
@@ -108,33 +112,21 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                         .filter((opt) => !(hasCustomNetwork && hp.key === 'action_exploration' && opt.value === 1))
                         .map((opt) => ({ value: String(opt.value), label: opt.label }))}
                       className="h-7 text-xs"
+                      disabled={data.locked}
                     />
                   ) : (
-                    <Input
-                      type="number"
-                      step={hp.type === 'int' ? 1 : 'any'}
-                      min={hp.min}
-                      max={hp.max}
+                    <NumericInput
+                      integer={hp.type === 'int'}
                       value={data.hyperparams[hp.key] ?? hp.default}
-                      onChange={(e) => {
-                        const raw = Number(e.target.value)
-                        // Browsers don't clamp typed (non-spinner) input to
-                        // min/max on their own — without this a stray extra
-                        // digit here (e.g. DQN's "Replay buffer size", which
-                        // happens to share its 50 000 default with "Total
-                        // timesteps" on the Training node) silently sails past
-                        // its declared bound instead of the user's actually
-                        // intended field.
-                        const clamped = hp.max != null ? Math.min(raw, hp.max) : raw
-                        data.onChangeHyperparam(hp.key, hp.min != null ? Math.max(clamped, hp.min) : clamped)
-                      }}
+                      onChange={(v) => data.onChangeHyperparam(hp.key, v)}
                       className="h-7 text-xs"
+                      disabled={data.locked}
                     />
                   )}
                 </div>
               ))}
             </div>
-            {requiredFamily && (
+            {requiredFamily && !data.locked && (
               <div className="space-y-1 border-t border-border pt-2">
                 <div className="flex items-baseline justify-between gap-2">
                   <Label className="text-[11px] text-muted-foreground">Архитектура сети</Label>
@@ -146,7 +138,12 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                   value={data.networkSpecId ?? ''}
                   onChange={(e) => data.onChangeNetworkSpecId(e.target.value || null)}
                   options={[
-                    { value: '', label: `Стандартная (${FAMILY_LABELS[requiredFamily]})` },
+                    {
+                      value: '',
+                      label: data.quickHiddenLayers != null
+                        ? `Быстрая настройка (${FAMILY_LABELS[requiredFamily]})`
+                        : `Стандартная (${FAMILY_LABELS[requiredFamily]})`,
+                    },
                     ...compatibleNetworks.map((n) => ({ value: n.slug, label: n.name })),
                   ]}
                   className="h-7 text-xs"
@@ -157,6 +154,13 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                   </p>
                 )}
               </div>
+            )}
+            {quickFamily && !hasSavedNetwork && !data.locked && (
+              <QuickNetworkEditor
+                defaultSizes={defaultHiddenSizesForFamily(quickFamily)}
+                hiddenLayers={data.quickHiddenLayers}
+                onChange={data.onChangeQuickLayers}
+              />
             )}
             <div className="border-t border-border pt-2">
               <AlgorithmDiagram

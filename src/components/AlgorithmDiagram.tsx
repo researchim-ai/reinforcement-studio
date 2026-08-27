@@ -36,7 +36,7 @@ interface Step {
   detail?: string
 }
 
-type Family = 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'alphazero' | 'generic'
+type Family = 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero' | 'generic'
 
 /** Best-effort family detection from the algorithm id — used to pick which
  * canned "how it learns" loop to render. Custom plugins (`custom:*`) fall
@@ -47,10 +47,13 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (kind === 'alphazero') return 'alphazero'
   const id = algorithmId.replace(/^custom:/, '').toLowerCase()
   if (id.includes('rainbow')) return 'rainbow_dqn'
+  if (id.includes('td3')) return 'td3'
+  if (id.includes('ddpg')) return 'ddpg'
   if (id.includes('sac')) return 'sac'
   if (id.includes('dqn')) return 'dqn'
   if (id.includes('a2c')) return 'a2c'
   if (id.includes('ppo')) return 'ppo'
+  if (id === 'es' || id.includes('evolution') || id.includes('cma-es') || id.includes('cmaes')) return 'es'
   return 'generic'
 }
 
@@ -111,7 +114,8 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
         ],
         loopCaption: 'Повторяется на каждом шаге, пока не наберётся total_timesteps',
       }
-    case 'rainbow_dqn':
+    case 'rainbow_dqn': {
+      const distributional = Number(hyperparams?.distributional ?? 0) === 1
       return {
         steps: [
           actionStep,
@@ -123,13 +127,18 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
           },
           {
             icon: Brain,
-            title: 'Double + Dueling обновление',
-            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
+            title: distributional ? 'Double + Dueling + QR-DQN' : 'Double + Dueling обновление',
+            detail: distributional
+              ? joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'num_quantiles', 'квантилей='))
+              : joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
           },
           { icon: RefreshCw, title: 'Синхронизация target-сети', detail: hp(hyperparams, 'target_update_interval', 'every=') },
         ],
-        loopCaption: 'Rainbow-lite: Double DQN + Dueling-сеть + Prioritized Replay + n-step возврат',
+        loopCaption: distributional
+          ? 'Полный Rainbow: Double DQN + Dueling + Prioritized Replay + n-step + Distributional (QR-DQN)'
+          : 'Rainbow-lite: Double DQN + Dueling-сеть + Prioritized Replay + n-step возврат',
       }
+    }
     case 'sac':
       return {
         steps: [
@@ -143,6 +152,44 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
           { icon: RefreshCw, title: 'Мягкое обновление target-сетей', detail: hp(hyperparams, 'tau', 'τ=') },
         ],
         loopCaption: 'Off-policy: непрерывные действия, максимизация награды + энтропии',
+      }
+    case 'ddpg':
+      return {
+        steps: [
+          { icon: Dices, title: 'Действие + гауссов шум', detail: hp(hyperparams, 'exploration_noise', 'σ=') },
+          { icon: Database, title: 'Replay buffer', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Brain,
+            title: 'Обновление critic + actor (DPG)',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'gamma', 'γ=')),
+          },
+          { icon: RefreshCw, title: 'Мягкое обновление target-сетей', detail: hp(hyperparams, 'tau', 'τ=') },
+        ],
+        loopCaption: 'Off-policy: детерминированная политика + один critic, эксплорация через шум действия',
+      }
+    case 'td3':
+      return {
+        steps: [
+          { icon: Dices, title: 'Действие + гауссов шум', detail: hp(hyperparams, 'exploration_noise', 'σ=') },
+          { icon: Database, title: 'Replay buffer', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Brain,
+            title: '2×critic (min) + сглаживание target',
+            detail: joinDetail(hp(hyperparams, 'batch_size', 'batch='), hp(hyperparams, 'policy_noise', 'smooth σ=')),
+          },
+          { icon: RefreshCw, title: 'Отложенное обновление actor + target', detail: hp(hyperparams, 'policy_delay', 'delay=') },
+        ],
+        loopCaption: 'Off-policy: twin critics + delayed policy updates + target policy smoothing',
+      }
+    case 'es':
+      return {
+        steps: [
+          { icon: Shuffle, title: 'Возмущение популяции', detail: joinDetail(hp(hyperparams, 'population_size', 'N='), hp(hyperparams, 'sigma', 'σ=')) },
+          { icon: Eye, title: 'Полный эпизод на кандидата', detail: hp(hyperparams, 'episodes_per_eval', 'эпизодов=') },
+          { icon: TrendingUp, title: 'Ранжирование fitness популяции' },
+          { icon: Brain, title: 'Adam-шаг по оценке градиента', detail: hp(hyperparams, 'learning_rate', 'lr=') },
+        ],
+        loopCaption: 'Gradient-free: без backprop через среду — параметры сети обновляются по fitness целых эпизодов',
       }
     case 'alphazero':
       return {

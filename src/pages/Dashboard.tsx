@@ -4,12 +4,14 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useRuns } from '@/api/hooks'
 import { useSystemInfo } from '@/api/hooks'
-import { Workflow, LineChart, Swords, Boxes, Cpu, MemoryStick, Gauge } from 'lucide-react'
+import { Workflow, LineChart, Boxes, Cpu, MemoryStick, Gauge } from 'lucide-react'
+import { RunFolderLink } from '@/components/monitor/RunFolderLink'
 
+// AlphaZero Arena card is temporarily removed — see the comment next to its
+// lazy import in App.tsx for how to bring it back.
 const QUICK_LINKS = [
   { to: '/designer', icon: Workflow, title: 'Дизайнер экспериментов', desc: 'Собери граф env → wrappers → алгоритм и запусти обучение' },
   { to: '/environments', icon: Boxes, title: 'Среды', desc: 'Gymnasium классика и настольные игры для AlphaZero' },
-  { to: '/arena', icon: Swords, title: 'AlphaZero Arena', desc: 'Сыграй против своего обученного агента' },
   { to: '/monitor', icon: LineChart, title: 'Мониторинг', desc: 'Живые графики и управление запусками' },
 ]
 
@@ -102,12 +104,13 @@ export function Dashboard() {
           <div className="space-y-2">
             {runs.slice(0, 5).map((run) => (
               <Card key={run.run_id}>
-                <CardContent className="flex items-center justify-between p-4">
-                  <div>
+                <CardContent className="flex items-center justify-between gap-3 p-4">
+                  <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium">{run.name}</div>
                     <div className="text-xs text-muted-foreground">
                       {run.environment_id} · {run.algorithm_id}
                     </div>
+                    <RunFolderLink runId={run.run_id} runDir={run.run_dir} className="mt-1" />
                   </div>
                   <Badge variant={run.running ? 'success' : run.status === 'completed' ? 'secondary' : 'outline'}>
                     {run.status}

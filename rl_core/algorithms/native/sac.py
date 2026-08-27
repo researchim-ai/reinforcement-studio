@@ -25,7 +25,8 @@ import gymnasium as gym
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
 from rl_core.algorithms.native.buffers import ContinuousReplayBuffer
 from rl_core.algorithms.native.networks import GaussianPolicy, QCritic
-from rl_core.algorithms.native.preprocessing import obs_to_array
+from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_to_array
+from rl_core.algorithms.vec_env import action_space, num_envs_of, obs_space, vec_reset, vec_step
 
 DEFAULT_HYPERPARAMS = {
     "learning_rate": 3e-4,
@@ -50,18 +51,19 @@ class NativeSAC(CustomAlgorithm):
         super().__init__(env, hyperparams, seed, device)
         if seed is not None:
             torch.manual_seed(seed)
-        if not isinstance(env.action_space, gym.spaces.Box):
+        obs_sp, act_sp = obs_space(env), action_space(env)
+        if not isinstance(act_sp, gym.spaces.Box):
             raise ValueError("NativeSAC only supports continuous (Box) action spaces")
 
-        self.action_dim = int(np.prod(env.action_space.shape))
-        low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
-        high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+        self.action_dim = int(np.prod(act_sp.shape))
+        low = np.asarray(act_sp.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(act_sp.high, dtype=np.float32).reshape(-1)
 
-        self.policy = GaussianPolicy(env.observation_space, low, high).to(device)
-        self.q1 = QCritic(env.observation_space, self.action_dim).to(device)
-        self.q2 = QCritic(env.observation_space, self.action_dim).to(device)
-        self.q1_target = QCritic(env.observation_space, self.action_dim).to(device)
-        self.q2_target = QCritic(env.observation_space, self.action_dim).to(device)
+        self.policy = GaussianPolicy(obs_sp, low, high).to(device)
+        self.q1 = QCritic(obs_sp, self.action_dim).to(device)
+        self.q2 = QCritic(obs_sp, self.action_dim).to(device)
+        self.q1_target = QCritic(obs_sp, self.action_dim).to(device)
+        self.q2_target = QCritic(obs_sp, self.action_dim).to(device)
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
@@ -77,51 +79,67 @@ class NativeSAC(CustomAlgorithm):
         self.learning_starts = int(hyperparams.get("learning_starts", 1_000))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
         self.replay_buffer: ContinuousReplayBuffer | None = None
+        self._last_metrics: dict[str, float] = {}
+        self._obs_space = obs_sp
+        self._action_space = act_sp
 
     def _obs_arr(self, obs: Any) -> np.ndarray:
-        return obs_to_array(obs, self.env.observation_space)
+        return obs_to_array(obs, self._obs_space)
 
-    def _sample_action(self, obs_arr: np.ndarray, deterministic: bool) -> np.ndarray:
-        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device).unsqueeze(0)
+    def _sample_actions(self, obs_arr: np.ndarray, deterministic: bool) -> np.ndarray:
+        """`obs_arr`: `(num_envs, ...)` -> `(num_envs, action_dim)`."""
+        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             action, _, deterministic_action = self.policy.sample(obs_t)
             chosen = deterministic_action if deterministic else action
-        return chosen.squeeze(0).cpu().numpy()
+        return chosen.cpu().numpy()
 
     def learn(self, total_timesteps: int, callback: TrainingCallback) -> None:
-        obs, _ = self.env.reset(seed=self.seed)
-        obs_arr = self._obs_arr(obs)
+        n_envs = num_envs_of(self.env)
+        obs_arr = obs_batch_to_array(vec_reset(self.env, seed=self.seed), self._obs_space)
         if self.replay_buffer is None:
-            self.replay_buffer = ContinuousReplayBuffer(self.buffer_size, obs_arr.shape, self.action_dim)
-        ep_reward, ep_length = 0.0, 0
+            self.replay_buffer = ContinuousReplayBuffer(self.buffer_size, obs_arr.shape[1:], self.action_dim)
+        ep_reward = np.zeros(n_envs, dtype=np.float64)
+        ep_length = np.zeros(n_envs, dtype=np.int64)
+        num_timesteps = 0
 
-        for num_timesteps in range(1, total_timesteps + 1):
+        while num_timesteps < total_timesteps:
             if len(self.replay_buffer) < self.learning_starts:
-                action = np.asarray(self.env.action_space.sample(), dtype=np.float32).reshape(-1)
+                actions = np.stack(
+                    [np.asarray(self._action_space.sample(), dtype=np.float32).reshape(-1) for _ in range(n_envs)],
+                )
             else:
-                action = self._sample_action(obs_arr, deterministic=False)
+                actions = self._sample_actions(obs_arr, deterministic=False)
 
-            next_obs, reward, terminated, truncated, _info = self.env.step(action.reshape(self.env.action_space.shape))
-            done = terminated or truncated
-            next_obs_arr = self._obs_arr(next_obs)
-            self.replay_buffer.add(obs_arr, action, float(reward), next_obs_arr, done)
+            env_actions = [action_to_env(actions[i], self._action_space) for i in range(n_envs)]
+            next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, env_actions)
+            dones = terminated | truncated
+            next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            for i in range(n_envs):
+                self.replay_buffer.add(obs_arr[i], actions[i], float(rewards[i]), next_obs_arr[i], bool(dones[i]))
             obs_arr = next_obs_arr
-            ep_reward += float(reward)
+            ep_reward += rewards
             ep_length += 1
+            prev_num_timesteps = num_timesteps
+            num_timesteps += n_envs
 
-            if len(self.replay_buffer) >= max(self.learning_starts, self.batch_size) and num_timesteps % self.train_freq == 0:
+            if len(self.replay_buffer) >= max(self.learning_starts, self.batch_size) and (
+                num_timesteps // self.train_freq != prev_num_timesteps // self.train_freq
+            ):
                 self._train_step()
 
-            if done:
-                finished_reward, finished_length = ep_reward, ep_length
-                ep_reward, ep_length = 0.0, 0
-                next_obs2, _ = self.env.reset()
-                obs_arr = self._obs_arr(next_obs2)
-                keep_going = callback.on_step(num_timesteps, finished_reward, finished_length)
-            else:
-                keep_going = callback.on_step(num_timesteps)
-            if not keep_going:
-                return
+            any_finished = False
+            for i in range(n_envs):
+                if dones[i]:
+                    any_finished = True
+                    keep_going = callback.on_step(num_timesteps, float(ep_reward[i]), int(ep_length[i]), self._last_metrics)
+                    ep_reward[i], ep_length[i] = 0.0, 0
+                    if not keep_going:
+                        return
+            if not any_finished:
+                keep_going = callback.on_step(num_timesteps, metrics=self._last_metrics)
+                if not keep_going:
+                    return
 
     def _train_step(self) -> None:
         batch = self.replay_buffer.sample(self.batch_size)
@@ -145,6 +163,7 @@ class NativeSAC(CustomAlgorithm):
         self.q_optimizer.zero_grad()
         q_loss.backward()
         self.q_optimizer.step()
+        critic_loss = float(q_loss.detach().item())
 
         # Policy update: maximize (Q - ent_coef * log_prob), i.e. minimize
         # its negative — reward *and* action entropy both pull the policy,
@@ -162,10 +181,15 @@ class NativeSAC(CustomAlgorithm):
         _soft_update(self.q1_target, self.q1, self.tau)
         _soft_update(self.q2_target, self.q2, self.tau)
 
+        self._last_metrics = {
+            "actor_loss": float(policy_loss.detach().item()),
+            "critic_loss": critic_loss,
+        }
+
     def predict(self, obs: Any, deterministic: bool = True) -> tuple[Any, Any]:
         obs_arr = self._obs_arr(obs)
-        action = self._sample_action(obs_arr, deterministic=deterministic)
-        return action.reshape(self.env.action_space.shape), None
+        action = self._sample_actions(obs_arr[np.newaxis, ...], deterministic=deterministic)[0]
+        return action.reshape(self._action_space.shape), None
 
     def save(self, path: Path) -> None:
         torch.save(
@@ -173,18 +197,24 @@ class NativeSAC(CustomAlgorithm):
                 "policy_state_dict": self.policy.state_dict(),
                 "q1_state_dict": self.q1.state_dict(),
                 "q2_state_dict": self.q2.state_dict(),
+                "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),
+                "q_optimizer_state_dict": self.q_optimizer.state_dict(),
                 "hyperparams": self.hyperparams,
             },
             path,
         )
 
     @classmethod
-    def load(cls, path: Path, env: gym.Env) -> "NativeSAC":
+    def load(cls, path: Path, env: gym.Env, device: str = "cpu") -> "NativeSAC":
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        algo = cls(env, payload.get("hyperparams", {}), None, "cpu")
+        algo = cls(env, payload.get("hyperparams", {}), None, device)
         algo.policy.load_state_dict(payload["policy_state_dict"])
         algo.q1.load_state_dict(payload["q1_state_dict"])
         algo.q2.load_state_dict(payload["q2_state_dict"])
         algo.q1_target.load_state_dict(payload["q1_state_dict"])
         algo.q2_target.load_state_dict(payload["q2_state_dict"])
+        if payload.get("policy_optimizer_state_dict"):
+            algo.policy_optimizer.load_state_dict(payload["policy_optimizer_state_dict"])
+        if payload.get("q_optimizer_state_dict"):
+            algo.q_optimizer.load_state_dict(payload["q_optimizer_state_dict"])
         return algo

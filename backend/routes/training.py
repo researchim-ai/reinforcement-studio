@@ -8,9 +8,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from backend import process_manager
+from rl_core.metrics_history import read_history
+from rl_core.netbuilder_store import read_network_snapshot
 from rl_core.paths import RUNS_DIR, run_dir
 
 router = APIRouter()
@@ -38,9 +41,18 @@ def _run_summary(run_id: str) -> dict[str, Any] | None:
         return None
     metrics = _read_json(rdir / "metrics.json", {}) or {}
     running = process_manager.is_running(run_id)
-    status = metrics.get("status", "running" if running else "unknown")
-    if not running and status == "running":
-        status = "interrupted"
+    # A sweep member (see `backend/sweep_manager.py`) sits with a
+    # `queued.flag` and no `metrics.json` at all until the scheduler starts
+    # it — surfaced as its own status rather than the "unknown" a run with
+    # no metrics yet would otherwise get, so the Sweeps page can show an
+    # accurate progress count.
+    queued = (rdir / "queued.flag").exists()
+    if queued and not running and not metrics:
+        status = "queued"
+    else:
+        status = metrics.get("status", "running" if running else "unknown")
+        if not running and status == "running":
+            status = "interrupted"
     has_model = (rdir / "model.zip").exists() or (rdir / "model.pt").exists()
     return {
         "run_id": run_id,
@@ -52,7 +64,16 @@ def _run_summary(run_id: str) -> dict[str, Any] | None:
         "running": running,
         "metrics": metrics,
         "has_model": has_model,
+        "sweep": config.get("sweep"),
         "created_at": config.get("created_at"),
+        # As seen by *this* (backend) process — correct for native/dev, but
+        # a container-internal path when the backend runs inside Docker.
+        # The Electron Training Monitor resolves+opens the real host path
+        # itself instead (see `runs:hostPath`/`runs:openFolder` in
+        # electron/main.ts); this is only a plain-text fallback for the
+        # browser/web build, which has no way to open a native folder at
+        # all regardless of which path it's shown.
+        "run_dir": str(rdir.resolve()),
     }
 
 
@@ -140,6 +161,66 @@ async def run_logs(run_id: str, lines: int = 200):
         "stderr": tail(rdir / "stderr.log", lines),
         "error": tail(rdir / "error.log", lines),
     }
+
+
+@router.get("/runs/{run_id}/metrics_history")
+async def get_metrics_history(run_id: str):
+    """Full recorded time series for this run (see `rl_core.metrics_history`)
+    — unlike `metrics.json` (only ever the *latest* snapshot), this lets the
+    Training Monitor rebuild the whole reward/loss curve after navigating
+    away, reopening the app, or opening a run that already finished, instead
+    of only ever showing whatever accumulated in memory during this one
+    live websocket connection."""
+    rdir = RUNS_DIR / run_id
+    if not rdir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"history": read_history(rdir)}
+
+
+@router.get("/runs/{run_id}/config")
+async def get_run_config(run_id: str):
+    """The full `config.json` this run was started with (environment +
+    wrappers + algorithm hyperparams/network_spec + training settings) —
+    used by Evaluation mode and by the Designer's "Дообучить" (resume)
+    flow to preselect/lock the exact setup a source run trained with."""
+    rdir = RUNS_DIR / run_id
+    config = _read_json(rdir / "config.json")
+    if config is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return config
+
+
+@router.get("/runs/{run_id}/preview.gif")
+async def run_preview_gif(run_id: str):
+    """Serves the run's latest live-preview episode (`persist_episode_gif`
+    in metrics_callback.py) straight from disk. Exists so the Training
+    Monitor can display it via a plain `<img src>` instead of relying on
+    `metrics.json` re-embedding the (up to a few MB) base64 blob on every
+    periodic write — see `episode_gif_base64`'s throttled inclusion in
+    `runner_utils.py`/`metrics_callback.py`. Always re-fetched (no-cache):
+    this exact path keeps being overwritten with a newer episode as
+    training progresses, unlike the environment gallery's preview GIFs."""
+    path = RUNS_DIR / run_id / "episode_preview.gif"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No preview recorded yet")
+    return FileResponse(path, media_type="image/gif", headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/runs/{run_id}/network")
+async def get_run_network(run_id: str):
+    """The architecture this run actually trained with (`network.json`,
+    written once at run start — see `write_network_snapshot`), so the
+    Training Monitor can offer "save this architecture" without having to
+    re-derive it from `config.json` (which only ever has a slug, or an
+    inline spec never persisted anywhere else). `spec: null` either means
+    the algorithm's own default net was used, or (for runs that predate
+    this file) it's simply unknown — the UI treats both the same way:
+    nothing to save."""
+    rdir = RUNS_DIR / run_id
+    if not rdir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    snapshot = read_network_snapshot(rdir)
+    return snapshot or {"family": None, "spec": None, "source": "unknown"}
 
 
 @router.get("/runs/{run_id}/games")

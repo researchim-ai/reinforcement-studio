@@ -13,17 +13,29 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Union
 
-from stable_baselines3.common.monitor import Monitor
-
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
-from rl_core.algorithms.metrics_callback import render_episode
-from rl_core.algorithms.sb3_runner import _make_env, _space_info
+from rl_core.algorithms.metrics_callback import render_episode, persist_episode_gif
+from rl_core.algorithms.resume import resolve_resume_source
+from rl_core.algorithms.sb3_runner import _make_env, _space_info, make_monitored_env_factory
+from rl_core.algorithms.vec_env import action_space, is_vector_env, make_env_or_vec, num_envs_of, obs_space
 from rl_core.device import resolve_device
+from rl_core.envs.factory import make_training_env
+from rl_core import scene_store
 from rl_core.inspect import _count_params, _describe_layers, _find_torch_module
-from rl_core.netbuilder_store import resolve_network_spec
+from rl_core.metrics_history import append_history, json_safe
+from rl_core.netbuilder_store import resolve_network_spec, write_network_snapshot
 
 _WRITE_EVERY_STEPS = 500
 _RENDER_EVERY_STEPS = 2000
+# `writer()` below runs once per env step (i.e. up to thousands of times a
+# second for fast/cheap envs), and its return value is the *only* signal
+# `learn()` loops check to honor the Stop button — so unlike the write/
+# render throttles above, this can't just be "every N calls" on a fixed
+# cadence measured in wall-clock terms, but it also doesn't need checking
+# every single step: a filesystem `stat()` every step measurably adds up
+# over a long run, while a `stop.flag` a few dozen steps stale is still
+# well under a second of extra delay for any env in this app.
+_STOP_CHECK_EVERY_STEPS = 50
 
 
 def run_custom_algorithm(
@@ -46,9 +58,19 @@ def run_custom_algorithm(
     total_timesteps = int(training_cfg.get("total_timesteps", 50_000))
     seed = training_cfg.get("seed")
     device = resolve_device(training_cfg)
+    num_envs = max(1, int(training_cfg.get("num_envs", 1) or 1))
+    is_scene = scene_store.is_scene_env_id(env_id)
 
-    train_env = Monitor(_make_env(env_id, wrapper_specs))
-    if seed is not None:
+    if is_scene:
+        # One shared world — lane count comes from the scene spec, not
+        # `training.num_envs` (which would mean independent copies elsewhere).
+        train_env = make_training_env(env_id, wrapper_specs)
+        num_envs = num_envs_of(train_env)
+    else:
+        train_env = make_env_or_vec(
+            make_monitored_env_factory(env_id, wrapper_specs), num_envs=num_envs,
+        )
+    if seed is not None and not is_vector_env(train_env):
         train_env.reset(seed=int(seed))
 
     # `network_spec` (a hand-designed architecture from the Network
@@ -61,7 +83,27 @@ def run_custom_algorithm(
     # CustomAlgorithm subclass that doesn't know about it just ignores it.
     network_spec = resolve_network_spec(config)
     construct_hyperparams = {**hyperparams, "network_spec": network_spec} if network_spec else hyperparams
-    algo = cls(train_env, construct_hyperparams, seed, device)
+
+    # `training.resume_from` — fine-tune/continue-training from a previous
+    # run's or Model Zoo checkpoint's weights instead of a fresh network
+    # (see rl_core/algorithms/resume.py). The loaded algorithm keeps *its
+    # own* saved hyperparams/architecture — the Designer only lets you
+    # tweak `total_timesteps`/`num_envs`/`seed` while resuming, exactly
+    # because the network shape can't change once weights are loaded into
+    # it, so `hyperparams`/`network_spec` below are overwritten from
+    # `algo.hyperparams` (what was actually saved) rather than whatever
+    # this new run's own config happened to carry.
+    resume_cfg = training_cfg.get("resume_from")
+    if resume_cfg:
+        algo_id_for_check = config.get("algorithm", {}).get("id", algo_label)
+        model_path = resolve_resume_source(resume_cfg, algo_id_for_check)
+        load_accepts_device = "device" in inspect.signature(cls.load).parameters
+        algo = cls.load(model_path, train_env, device=device) if load_accepts_device else cls.load(model_path, train_env)
+        network_spec = algo.hyperparams.get("network_spec")
+        hyperparams = {k: v for k, v in algo.hyperparams.items() if k != "network_spec"}
+    else:
+        algo = cls(train_env, construct_hyperparams, seed, device)
+    write_network_snapshot(run_dir, config, network_spec)
 
     # Memory-enabled (LSTM/GRU) algorithms need to know when a live-preview
     # rollout starts over so they reset hidden state instead of carrying
@@ -76,16 +118,19 @@ def run_custom_algorithm(
             return algo.predict(obs, deterministic=True, episode_start=episode_start)
         return algo.predict(obs, deterministic=True)
 
-    resolved_policy_label = policy_label(train_env.observation_space) if callable(policy_label) else policy_label
+    resolved_policy_label = policy_label(obs_space(train_env)) if callable(policy_label) else policy_label
     static_info = {
         "policy": resolved_policy_label,
         "device": device,
         "hyperparams": hyperparams,
         "wrappers": wrapper_specs,
         "seed": seed,
-        "observation_space": _space_info(train_env.observation_space),
-        "action_space": _space_info(train_env.action_space),
+        "num_envs": num_envs,
+        "observation_space": _space_info(obs_space(train_env)),
+        "action_space": _space_info(action_space(train_env)),
     }
+    if resume_cfg:
+        static_info["resumed_from"] = resume_cfg
     # Best-effort network introspection so the Training Monitor's "Схема
     # алгоритма" card can draw the actual layer shapes for native PPO/DQN/A2C
     # and from-scratch plugins too, not just the SB3 path (_run_sb3 already
@@ -102,8 +147,16 @@ def run_custom_algorithm(
 
     start_time = time.time()
     state: dict[str, Any] = {
-        "last_write": 0, "last_render": 0, "step": 0, "last_gif": None,
-        "exploration_metrics": {},
+        "last_write": 0, "last_render": 0, "last_stop_check": 0, "stop_requested": False, "step": 0, "last_gif": None,
+        "last_gif_step": 0,
+        # Anything algorithms report via `TrainingCallback.on_step(metrics=...)`
+        # that isn't one of the special episode_*_reward keys handled below —
+        # exploration stats (epsilon, RND bonus/loss) as well as training
+        # losses (policy_loss, value_loss, td_loss, ...) all flow through here
+        # generically, so any algorithm (built-in or a user plugin) that
+        # starts reporting a new metric key gets it in the snapshot/chart for
+        # free, no changes needed on this end.
+        "extra_metrics": {},
     }
     recent_rewards: list[float] = []
     recent_extrinsic_rewards: list[float] = []
@@ -112,14 +165,22 @@ def run_custom_algorithm(
 
     def write_snapshot(step: int, status: str) -> None:
         elapsed = time.time() - start_time
+        just_rendered = False
         if step - state["last_render"] >= _RENDER_EVERY_STEPS:
             state["last_render"] = step
             # Only overwrite `last_gif` on a *successful* render — a
             # transient failure (env recreation hiccup, ...) should keep
             # showing the previous episode rather than blanking the preview.
-            gif = render_episode(lambda: _make_env(env_id, wrapper_specs, render=True), _predict)
+            gif = render_episode(
+                lambda: make_training_env(env_id, wrapper_specs, render=True) if is_scene
+                else _make_env(env_id, wrapper_specs, render=True),
+                _predict,
+            )
             if gif:
                 state["last_gif"] = gif
+                state["last_gif_step"] = step
+                persist_episode_gif(run_dir, gif, step)
+                just_rendered = True
         snapshot = {
             "run_id": run_dir.name,
             "kind": "gym",
@@ -140,14 +201,26 @@ def run_custom_algorithm(
             "elapsed_seconds": round(elapsed, 1),
         }
         snapshot.update(static_info)
-        snapshot.update(state["exploration_metrics"])
-        # Keep re-attaching the last successfully recorded episode to every
-        # snapshot (not just the one that just rendered it) — so a run that
-        # finishes between two render ticks, or is reopened later without a
-        # live WebSocket to have carried it forward client-side, still shows
-        # its most recent episode instead of nothing at all.
+        snapshot.update(state["extra_metrics"])
         if state["last_gif"]:
-            snapshot["episode_gif_base64"] = state["last_gif"]
+            # `episode_gif_file`/`episode_gif_step` (a plain path + int) are
+            # cheap to re-attach to every snapshot — the Training Monitor
+            # uses them to fetch/cache-bust `GET .../preview.gif` whenever
+            # the (up to a few MB) base64 blob itself isn't present. That
+            # blob is only ever included on the exact write that just
+            # captured it (or the run's very last write, as a
+            # belt-and-suspenders fallback in case serving the file back
+            # ever fails) — every write in between would otherwise
+            # re-serialize the exact same bytes into metrics.json/the
+            # metrics WebSocket for no benefit, up to `_RENDER_EVERY_STEPS /
+            # _WRITE_EVERY_STEPS` times as often as the episode it shows
+            # actually changes.
+            snapshot["episode_gif_file"] = "episode_preview.gif"
+            snapshot["episode_gif_step"] = state["last_gif_step"]
+            if just_rendered or status != "running":
+                snapshot["episode_gif_base64"] = state["last_gif"]
+        snapshot = json_safe(snapshot)
+        append_history(run_dir, snapshot)
         (run_dir / "metrics.json").write_text(json.dumps(snapshot))
 
     def writer(
@@ -158,7 +231,7 @@ def run_custom_algorithm(
     ) -> bool:
         state["step"] = num_timesteps
         if metrics:
-            state["exploration_metrics"].update({
+            state["extra_metrics"].update({
                 key: value for key, value in metrics.items()
                 if key not in {"episode_extrinsic_reward", "episode_intrinsic_reward"}
             })
@@ -173,7 +246,10 @@ def run_custom_algorithm(
         if num_timesteps - state["last_write"] >= _WRITE_EVERY_STEPS:
             state["last_write"] = num_timesteps
             write_snapshot(num_timesteps, "running")
-        return not (run_dir / "stop.flag").exists()
+        if not state["stop_requested"] and num_timesteps - state["last_stop_check"] >= _STOP_CHECK_EVERY_STEPS:
+            state["last_stop_check"] = num_timesteps
+            state["stop_requested"] = (run_dir / "stop.flag").exists()
+        return not state["stop_requested"]
 
     write_snapshot(0, "running")
     status = "completed"

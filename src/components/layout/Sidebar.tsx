@@ -7,27 +7,32 @@ import {
   Workflow,
   LineChart,
   Boxes,
-  Swords,
   Archive,
   Settings,
   Activity,
   Puzzle,
   Network,
   GraduationCap,
+  FlaskConical,
+  Cuboid,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { useDockerStore } from '@/stores/dockerStore'
 import appIcon from '@/assets/icon.png'
 
+// AlphaZero Arena ('/arena', Swords icon) is temporarily off the nav —
+// see the comment next to its lazy import in App.tsx for how to bring it
+// back.
 const navItems = [
   { path: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
   { path: '/designer', icon: Workflow, labelKey: 'nav.designer' },
   { path: '/monitor', icon: LineChart, labelKey: 'nav.monitor' },
   { path: '/environments', icon: Boxes, labelKey: 'nav.environments' },
-  { path: '/arena', icon: Swords, labelKey: 'nav.arena' },
   { path: '/models', icon: Archive, labelKey: 'nav.models' },
+  { path: '/sweeps', icon: FlaskConical, labelKey: 'nav.sweeps' },
   { path: '/plugins', icon: Puzzle, labelKey: 'nav.plugins' },
   { path: '/network-builder', icon: Network, labelKey: 'nav.networkBuilder' },
+  { path: '/scene-builder', icon: Cuboid, labelKey: 'nav.sceneBuilder' },
   { path: '/academy', icon: GraduationCap, labelKey: 'nav.academy' },
   { path: '/settings', icon: Settings, labelKey: 'nav.settings' },
 ]

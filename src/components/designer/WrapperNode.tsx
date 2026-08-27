@@ -11,6 +11,7 @@ export interface WrapperNodeData {
   type: string
   onChange: (type: string) => void
   onRemove: () => void
+  disabled?: boolean
 }
 
 // See AlgorithmNode.tsx for why this is memoized against `data` only —
@@ -24,15 +25,18 @@ export const WrapperNode = memo(function WrapperNode({ data }: NodeProps & { dat
         <Layers className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Wrapper</span>
         {spec?.is_custom && <Badge variant="secondary" className="ml-auto text-[9px]">custom</Badge>}
-        <Button variant="ghost" size="icon" className={`h-5 w-5 ${spec?.is_custom ? '' : 'ml-auto'}`} onClick={data.onRemove}>
-          <X className="h-3 w-3" />
-        </Button>
+        {!data.disabled && (
+          <Button variant="ghost" size="icon" className={`h-5 w-5 ${spec?.is_custom ? '' : 'ml-auto'}`} onClick={data.onRemove}>
+            <X className="h-3 w-3" />
+          </Button>
+        )}
       </div>
       <div className="space-y-2 p-3">
         <Select
           value={data.type}
           onChange={(e) => data.onChange(e.target.value)}
           options={data.catalog.map((w) => ({ value: w.type, label: w.label }))}
+          disabled={data.disabled}
         />
         {spec && Object.keys(spec.params).length > 0 && (
           <div className="space-y-1 text-[11px] text-muted-foreground">
