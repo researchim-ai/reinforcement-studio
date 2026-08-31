@@ -31,13 +31,18 @@ __pycache__/
 # ever produce a Python build/ dir here, and electron-builder's buildResources
 # (icons, afterPack.cjs, deb-after-install.sh) deliberately live in ./build/
 # and must be tracked, or packaged installers ship with no icon on a fresh clone.
+# `lib/`/`lib64/` anchored to the repo root (leading `/`) — this project has
+# no top-level Python `lib/` either, but the *unanchored* form from the
+# stock Python template used to also match `src/lib/`, a real (and
+# actively imported-from) frontend source directory, silently keeping its
+# 7 files out of version control on every clone.
 develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/

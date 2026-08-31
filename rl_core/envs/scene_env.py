@@ -6,6 +6,27 @@ each call to `step()`; kinematic movement + AABB/circle collisions; items with
 configurable rewards; NEXT_STEP autoreset per lane (compatible with
 `rl_core/algorithms/vec_env.py` and every native algorithm).
 
+Agents come from one or more *groups* (`spec["agents"]`, a list) — each
+group has its own `count`, `team` (a free-form label; agents that share a
+team are "teammates", everyone else is an "opponent" for sensor/reward
+purposes) and `role` (free-form too, e.g. `"predator"`/`"prey"`; only
+consulted by the optional `rules.tag` mechanic below). Every group still
+shares one `movement`/`sensors` schema scene-wide (taken from the *first*
+group) since a `VectorEnv`'s `single_action_space`/`single_observation_space`
+must be identical for every lane — that's the one thing that can't vary
+per group; body radius/spawn/shape/color all can, per-lane.
+
+`rules` (optional, scene-level) adds two general-purpose multi-agent reward
+mechanics on top of the plain per-agent item rewards below:
+- `rules.tag`: a predator-role agent touching a prey-role agent on a
+  *different* team exchanges a reward (predator gains, prey loses),
+  optionally respawning/terminating the prey — the classic predator-prey
+  MARL benchmark.
+- `rules.team_shared_reward`: every agent's reward for the step is replaced
+  by the sum of its whole team's raw rewards that step — turns any of the
+  above into a fully cooperative (shared-credit) task instead of an
+  individual one.
+
 `SceneRenderEnv` wraps the vector env as a plain `gym.Env` for GIF preview
 (`render_episode`) — controls agent 0, others take no-op actions.
 """
@@ -23,6 +44,8 @@ from gymnasium.vector.utils import batch_space
 
 from rl_core import scene_store
 
+_DEFAULT_COLORS = [(80, 160, 255), (255, 200, 80), (200, 120, 255), (120, 255, 200)]
+
 
 def make_scene_env(
     slug: str,
@@ -39,6 +62,14 @@ def make_scene_env(
     return SceneMultiAgentEnv(spec, render_mode=render_mode)
 
 
+def _agent_groups(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every agent group, `team`/`role` defaulted — never empty (a spec
+    with no `agents` key at all still gets one implicit single-agent
+    group, exactly as before groups/teams existed)."""
+    groups = spec.get("agents") or [{}]
+    return [{"team": "default", "role": "agent", **g} for g in groups]
+
+
 def _movement_cfg(spec: dict[str, Any]) -> dict[str, Any]:
     groups = spec.get("agents") or [{}]
     return groups[0].get("movement") or {"type": "discrete4", "speed": 0.5}
@@ -49,9 +80,23 @@ def _sensor_cfg(spec: dict[str, Any]) -> dict[str, Any]:
     return groups[0].get("sensors") or {"type": "nearest_k", "k": 4, "range": 10.0}
 
 
-def _agent_group(spec: dict[str, Any]) -> dict[str, Any]:
-    groups = spec.get("agents") or [{}]
-    return groups[0]
+def _tag_rule(spec: dict[str, Any]) -> dict[str, Any] | None:
+    rule = (spec.get("rules") or {}).get("tag")
+    if not rule or not rule.get("enabled", True):
+        return None
+    return {
+        "predator_role": str(rule.get("predator_role", "predator")),
+        "prey_role": str(rule.get("prey_role", "prey")),
+        "predator_reward": float(rule.get("predator_reward", 1.0)),
+        "prey_reward": float(rule.get("prey_reward", -1.0)),
+        "prey_terminates": bool(rule.get("prey_terminates", False)),
+        "prey_respawns": bool(rule.get("prey_respawns", True)),
+        "catch_radius_bonus": float(rule.get("catch_radius_bonus", 0.0)),
+    }
+
+
+def _team_shared_reward_enabled(spec: dict[str, Any]) -> bool:
+    return bool((spec.get("rules") or {}).get("team_shared_reward", False))
 
 
 def build_action_space(spec: dict[str, Any]) -> gym.Space:
@@ -131,6 +176,15 @@ def _action_delta(action: int | np.ndarray, movement_type: str, speed: float) ->
     return dirs.get(a, (0.0, 0.0))
 
 
+def _hex_to_rgb(color: str | None) -> tuple[int, int, int] | None:
+    if not color or not color.startswith("#") or len(color) != 7:
+        return None
+    try:
+        return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
+    except ValueError:
+        return None
+
+
 class SceneMultiAgentEnv(VectorEnv):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 15, "autoreset_mode": AutoresetMode.NEXT_STEP}
 
@@ -143,20 +197,56 @@ class SceneMultiAgentEnv(VectorEnv):
         self.half_d = float(self.world.get("depth", 20.0)) / 2.0
         self.walls = _parse_walls(spec.get("objects") or [])
         self.items = list(spec.get("items") or [])
-        self.group = _agent_group(spec)
+        # Movement type/sensor config are scene-wide, not per-group: every
+        # lane shares one `single_action_space`/`single_observation_space`
+        # (a hard `gymnasium.vector.VectorEnv` requirement — lanes can't
+        # have heterogeneous spaces), so MARL scenes get heterogeneous
+        # *behavior* (team/role, rewards, who's "us" vs "them" in the
+        # sensor readout) without needing per-agent Dict/Tuple spaces.
         self.movement_type = _movement_cfg(spec).get("type", "discrete4")
         self.speed = float(_movement_cfg(spec).get("speed", 0.5))
         self.sensor_cfg = _sensor_cfg(spec)
         self.sensor_k = max(1, int(self.sensor_cfg.get("k", 4)))
         self.sensor_range = float(self.sensor_cfg.get("range", 10.0))
-        self.body_radius = float(self.group.get("body_radius", 0.4))
         self.max_steps = int((spec.get("episode") or {}).get("max_steps", 500))
-        self.spawn_center = np.array((self.group.get("spawn") or {}).get("center") or [0.0, 0.0, 0.0], dtype=np.float32)
-        self.spawn_radius = float((self.group.get("spawn") or {}).get("radius", 3.0))
+        self.tag_rule = _tag_rule(spec)
+        self.team_shared_reward = _team_shared_reward_enabled(spec)
 
-        self.num_envs = scene_store.agent_count(spec)
-        if self.num_envs < 1:
-            self.num_envs = 1
+        # Expand every group into per-lane arrays, in group order (group
+        # 0's `count` lanes, then group 1's, ...) — this is the *only*
+        # place lane index <-> group membership is decided, so
+        # `MultiAgentPPO` (native/marl_ppo.py) reading `self.team_ids`
+        # sees exactly the lane order everything below does.
+        groups = _agent_groups(spec)
+        self.num_envs = sum(max(1, int(g.get("count", 1))) for g in groups) or 1
+        self.team_ids: list[str] = []
+        self.roles: list[str] = []
+        self.body_radii = np.zeros(self.num_envs, dtype=np.float32)
+        self.shapes: list[str] = []
+        self.colors: list[tuple[int, int, int]] = []
+        self._spawn_centers = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self._spawn_radii = np.zeros(self.num_envs, dtype=np.float32)
+        lane = 0
+        for gi, g in enumerate(groups):
+            count = max(1, int(g.get("count", 1)))
+            spawn = g.get("spawn") or {}
+            center = spawn.get("center") or [0.0, 0.0, 0.0]
+            radius = float(spawn.get("radius", 3.0))
+            body_radius = float(g.get("body_radius", 0.4))
+            shape = str(g.get("shape") or "capsule")
+            color = _hex_to_rgb((g.get("material") or {}).get("color")) or _DEFAULT_COLORS[gi % len(_DEFAULT_COLORS)]
+            for _ in range(count):
+                if lane >= self.num_envs:
+                    break
+                self.team_ids.append(str(g.get("team", "default")))
+                self.roles.append(str(g.get("role", "agent")))
+                self.body_radii[lane] = body_radius
+                self.shapes.append(shape)
+                self.colors.append(color)
+                self._spawn_centers[lane] = (float(center[0]), float(center[2]))
+                self._spawn_radii[lane] = radius
+                lane += 1
+        self.teams: list[str] = sorted(set(self.team_ids))
 
         self.single_action_space = build_action_space(spec)
         self.single_observation_space = build_observation_space(spec)
@@ -175,26 +265,29 @@ class SceneMultiAgentEnv(VectorEnv):
         self._terminations = np.zeros(self.num_envs, dtype=bool)
         self._truncations = np.zeros(self.num_envs, dtype=bool)
 
-    def _sample_spawn(self, avoid: np.ndarray | None = None) -> tuple[float, float]:
+    def _sample_spawn(self, lane: int, avoid: np.ndarray | None = None) -> tuple[float, float]:
+        center = self._spawn_centers[lane]
+        radius = float(self._spawn_radii[lane])
+        body_radius = float(self.body_radii[lane])
         for _ in range(32):
             ang = self._rng.uniform(0, 2 * math.pi)
-            rad = self._rng.uniform(0, self.spawn_radius)
-            x = float(self.spawn_center[0] + math.cos(ang) * rad)
-            z = float(self.spawn_center[2] + math.sin(ang) * rad)
-            x = float(np.clip(x, -self.half_w + self.body_radius, self.half_w - self.body_radius))
-            z = float(np.clip(z, -self.half_d + self.body_radius, self.half_d - self.body_radius))
+            rad = self._rng.uniform(0, radius)
+            x = float(center[0] + math.cos(ang) * rad)
+            z = float(center[1] + math.sin(ang) * rad)
+            x = float(np.clip(x, -self.half_w + body_radius, self.half_w - body_radius))
+            z = float(np.clip(z, -self.half_d + body_radius, self.half_d - body_radius))
             if avoid is not None and len(avoid) > 0:
                 d = np.sqrt(((avoid[:, 0] - x) ** 2 + (avoid[:, 1] - z) ** 2).min(initial=1e9))
-                if d < self.body_radius * 2.5:
+                if d < body_radius * 2.5:
                     continue
-            blocked = any(_circle_aabb_overlap(x, z, self.body_radius, w) for w in self.walls)
+            blocked = any(_circle_aabb_overlap(x, z, body_radius, w) for w in self.walls)
             if not blocked:
                 return x, z
-        return float(self.spawn_center[0]), float(self.spawn_center[2])
+        return float(center[0]), float(center[1])
 
     def _reset_agent(self, i: int) -> None:
         others = self._positions[np.arange(self.num_envs) != i] if self.num_envs > 1 else None
-        x, z = self._sample_spawn(others)
+        x, z = self._sample_spawn(i, others)
         self._positions[i] = (x, z)
         self._velocities[i] = 0.0
         self._episode_steps[i] = 0
@@ -219,7 +312,12 @@ class SceneMultiAgentEnv(VectorEnv):
         return self._obs_buffer.copy(), {}
 
     def _entities_for_sensors(self, agent_idx: int) -> list[tuple[float, float, float]]:
-        """(x, z, kind) where kind: 1=reward, 2=hazard, 3=other agent."""
+        """(x, z, kind) where kind: 1=reward, 2=hazard, 3=teammate,
+        4=opponent (another agent on a *different* team than `agent_idx`,
+        e.g. predator-vs-prey or red-vs-blue — lets a policy actually tell
+        rivals apart from allies instead of every other agent looking
+        identical, which single-team scenes never needed but any
+        competitive/mixed scene does)."""
         out: list[tuple[float, float, float]] = []
         ax, az = self._positions[agent_idx]
         for j, item in enumerate(self.items):
@@ -228,10 +326,12 @@ class SceneMultiAgentEnv(VectorEnv):
             pos = item.get("position") or [0.0, 0.0, 0.0]
             kind = 1.0 if item.get("type") == "reward" else 2.0
             out.append((float(pos[0]), float(pos[2]), kind))
+        own_team = self.team_ids[agent_idx]
         for j in range(self.num_envs):
             if j == agent_idx:
                 continue
-            out.append((float(self._positions[j, 0]), float(self._positions[j, 1]), 3.0))
+            kind = 3.0 if self.team_ids[j] == own_team else 4.0
+            out.append((float(self._positions[j, 0]), float(self._positions[j, 1]), kind))
         # sort by distance
         out.sort(key=lambda e: (e[0] - ax) ** 2 + (e[1] - az) ** 2)
         return out
@@ -257,7 +357,7 @@ class SceneMultiAgentEnv(VectorEnv):
                 else:
                     obs[off] = np.clip(dx / self.sensor_range, -1.0, 1.0)
                     obs[off + 1] = np.clip(dz / self.sensor_range, -1.0, 1.0)
-                    obs[off + 2] = kind / 3.0
+                    obs[off + 2] = kind / 4.0
                     obs[off + 3] = dist / self.sensor_range
         return obs
 
@@ -268,11 +368,12 @@ class SceneMultiAgentEnv(VectorEnv):
     def _apply_collisions(self) -> None:
         for i in range(self.num_envs):
             x, z = float(self._positions[i, 0]), float(self._positions[i, 1])
+            body_radius = float(self.body_radii[i])
             for wall in self.walls:
-                if _circle_aabb_overlap(x, z, self.body_radius, wall):
-                    x, z = _resolve_circle_aabb(x, z, self.body_radius, wall)
-            x = float(np.clip(x, -self.half_w + self.body_radius, self.half_w - self.body_radius))
-            z = float(np.clip(z, -self.half_d + self.body_radius, self.half_d - self.body_radius))
+                if _circle_aabb_overlap(x, z, body_radius, wall):
+                    x, z = _resolve_circle_aabb(x, z, body_radius, wall)
+            x = float(np.clip(x, -self.half_w + body_radius, self.half_w - body_radius))
+            z = float(np.clip(z, -self.half_d + body_radius, self.half_d - body_radius))
             self._positions[i] = (x, z)
         # agent-agent separation
         for i in range(self.num_envs):
@@ -280,7 +381,7 @@ class SceneMultiAgentEnv(VectorEnv):
                 dx = self._positions[j, 0] - self._positions[i, 0]
                 dz = self._positions[j, 1] - self._positions[i, 1]
                 dist_sq = dx * dx + dz * dz
-                min_dist = self.body_radius * 2
+                min_dist = float(self.body_radii[i] + self.body_radii[j])
                 if dist_sq < min_dist * min_dist and dist_sq > 1e-8:
                     dist = math.sqrt(dist_sq)
                     overlap = (min_dist - dist) / 2
@@ -297,6 +398,41 @@ class SceneMultiAgentEnv(VectorEnv):
                 if self._item_cooldown[j] <= 0:
                     self._item_active[j] = True
 
+    def _apply_tag_rule(self) -> None:
+        """Predator-vs-prey "tag" mechanic (see `_tag_rule()` above) —
+        checked once per env `step()` across every predator/prey pair,
+        *after* movement/collisions/items have already set this step's
+        base rewards, so a tag adds on top of (never replaces) whatever
+        else happened this step."""
+        rule = self.tag_rule
+        if rule is None:
+            return
+        predators = [i for i in range(self.num_envs) if self.roles[i] == rule["predator_role"]]
+        preys = [i for i in range(self.num_envs) if self.roles[i] == rule["prey_role"]]
+        for pi in predators:
+            for qi in preys:
+                if self.team_ids[pi] == self.team_ids[qi]:
+                    continue  # same-team "predator"/"prey" never tags — needs a real rivalry
+                catch_r = float(self.body_radii[pi] + self.body_radii[qi]) + rule["catch_radius_bonus"]
+                dist = math.hypot(self._positions[pi, 0] - self._positions[qi, 0], self._positions[pi, 1] - self._positions[qi, 1])
+                if dist >= catch_r:
+                    continue
+                self._rewards[pi] += rule["predator_reward"]
+                self._rewards[qi] += rule["prey_reward"]
+                if rule["prey_terminates"]:
+                    self._terminations[qi] = True
+                elif rule["prey_respawns"]:
+                    self._reset_agent(qi)
+
+    def _apply_team_shared_reward(self) -> None:
+        if not self.team_shared_reward:
+            return
+        totals: dict[str, float] = {t: 0.0 for t in self.teams}
+        for i in range(self.num_envs):
+            totals[self.team_ids[i]] += float(self._rewards[i])
+        for i in range(self.num_envs):
+            self._rewards[i] = totals[self.team_ids[i]]
+
     def _step_agent(self, i: int, action: Any) -> None:
         dx, dz = _action_delta(action, self.movement_type, self.speed)
         self._velocities[i] = (dx, dz)
@@ -309,11 +445,14 @@ class SceneMultiAgentEnv(VectorEnv):
         for j, item in enumerate(self.items):
             if not self._item_active[j]:
                 continue
+            restrict_team = item.get("restrict_team")
+            if restrict_team and restrict_team != self.team_ids[i]:
+                continue  # this item only rewards a specific team (resource-race scenes)
             pos = item.get("position") or [0.0, 0.0, 0.0]
             ix, iz = float(pos[0]), float(pos[2])
             ir = float(item.get("radius", 0.4))
             dist = math.hypot(self._positions[i, 0] - ix, self._positions[i, 1] - iz)
-            if dist < self.body_radius + ir:
+            if dist < float(self.body_radii[i]) + ir:
                 reward += float(item.get("reward", 0.0))
                 if item.get("terminate"):
                     terminated = True
@@ -345,6 +484,8 @@ class SceneMultiAgentEnv(VectorEnv):
             else:
                 self._step_agent(i, actions_list[i])
 
+        self._apply_tag_rule()
+        self._apply_team_shared_reward()
         self._tick_items()
         self._fill_observations()
         self._autoreset_envs = np.logical_or(self._terminations, self._truncations)
@@ -360,11 +501,9 @@ class SceneMultiAgentEnv(VectorEnv):
     def render(self) -> np.ndarray | None:
         if self.render_mode != "rgb_array":
             return None
-        agent_shape = str(self.group.get("shape") or "capsule")
         return _render_topdown(
             self.half_w, self.half_d, self.walls, self.items,
-            self._item_active, self._positions, self.body_radius,
-            agent_shape=agent_shape,
+            self._item_active, self._positions, self.body_radii, self.shapes, self.colors,
         )
 
     def close(self) -> None:
@@ -438,8 +577,9 @@ def _render_topdown(
     items: list[dict],
     item_active: np.ndarray,
     positions: np.ndarray,
-    body_radius: float,
-    agent_shape: str = "capsule",
+    body_radii: np.ndarray,
+    shapes: list[str],
+    colors: list[tuple[int, int, int]],
     size: int = 256,
 ) -> np.ndarray:
     img = np.ones((size, size, 3), dtype=np.uint8) * 40
@@ -470,10 +610,9 @@ def _render_topdown(
         shape = str(item.get("shape") or ("crystal" if item.get("type") == "reward" else "sphere"))
         _blit_shape(img, px, py, r_px, color, shape)
 
-    colors = [(80, 160, 255), (255, 200, 80), (200, 120, 255), (120, 255, 200)]
     for i in range(len(positions)):
         px, py = to_px(float(positions[i, 0]), float(positions[i, 1]))
-        r_px = max(3, int(body_radius / (2 * half_w) * size))
-        _blit_shape(img, px, py, r_px, colors[i % len(colors)], agent_shape)
+        r_px = max(3, int(float(body_radii[i]) / (2 * half_w) * size))
+        _blit_shape(img, px, py, r_px, colors[i], shapes[i])
 
     return img

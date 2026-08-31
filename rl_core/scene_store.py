@@ -62,6 +62,19 @@ def agent_count(spec: dict[str, Any]) -> int:
     return sum(max(1, int(g.get("count", 1))) for g in spec.get("agents") or [])
 
 
+def team_count(spec: dict[str, Any]) -> int:
+    """Number of *distinct* `team` labels across agent groups — a scene
+    with `team_count() >= 2` is what makes it a genuine MARL environment
+    (independent, potentially adversarial rewards per team) rather than
+    just N parameter-sharing copies of one policy. `team` defaults to
+    `"default"` when unset, so every pre-existing single-group scene
+    (before this field existed) still reports `team_count() == 1` and
+    keeps training with the plain single-policy algorithms exactly as
+    before — `ippo` (see `rl_core/algorithms/native/marl_ppo.py`) only
+    becomes selectable once a scene actually defines 2+ teams."""
+    return len({str(g.get("team") or "default") for g in spec.get("agents") or []}) or 1
+
+
 def action_kind(spec: dict[str, Any]) -> str:
     groups = spec.get("agents") or []
     if not groups:
@@ -80,6 +93,7 @@ def meta(slug: str) -> dict[str, Any]:
         "name": doc.get("name") or slug,
         "description": doc.get("description", ""),
         "agent_count": agent_count(doc),
+        "team_count": team_count(doc),
         "action_kind": action_kind(doc),
     }
 
@@ -96,6 +110,7 @@ def list_meta() -> list[dict[str, Any]]:
                 "name": slug,
                 "description": "",
                 "agent_count": 1,
+                "team_count": 1,
                 "action_kind": "discrete",
                 "broken": True,
                 "error": str(exc),
@@ -161,6 +176,132 @@ def default_spec(name: str = "Новая сцена") -> dict[str, Any]:
             },
         ],
         "episode": {"max_steps": 500},
+    }
+
+
+def default_predator_prey_spec(name: str = "Хищник и жертва") -> dict[str, Any]:
+    """2 teams, 2 roles — the classic predator-prey MARL benchmark: a
+    lone (fast) predator chases 3 (slower) prey, prey survive by grabbing
+    coins while avoiding the predator, predator scores by tagging prey
+    (see `rules.tag` in `rl_core/envs/scene_env.py`). Trains with `ippo`
+    (Multi-Agent PPO, `rl_core/algorithms/native/marl_ppo.py`) — each team
+    gets its *own* policy, so the predator's and prey's rewards never mix
+    into one training signal the way single-policy parameter sharing
+    would."""
+    return {
+        "name": name,
+        "description": "Хищник (команда predator) ловит жертв (команда prey); жертвы собирают монеты и убегают.",
+        "world": {"width": 24.0, "depth": 24.0, "wall_height": 2.0},
+        "objects": [
+            {
+                "id": "wall_n", "type": "wall", "position": [0.0, 1.0, -12.0], "size": [24.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_s", "type": "wall", "position": [0.0, 1.0, 12.0], "size": [24.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_w", "type": "wall", "position": [-12.0, 1.0, 0.0], "size": [1.0, 2.0, 24.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_e", "type": "wall", "position": [12.0, 1.0, 0.0], "size": [1.0, 2.0, 24.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+        ],
+        "items": [
+            {
+                "id": f"coin{i}", "type": "reward",
+                "position": [float(x), 0.0, float(z)], "radius": 0.5,
+                "reward": 1.0, "respawn": True, "cooldown_steps": 30, "shape": "crystal",
+                "restrict_team": "prey",
+                "material": {"pattern": "dots", "color": "#22c55e", "color2": "#14532d", "emissive": True},
+            }
+            for i, (x, z) in enumerate([(6, 6), (-6, 6), (6, -6), (-6, -6), (0, 0)])
+        ],
+        "agents": [
+            {
+                "id": "predator", "count": 1, "team": "predator", "role": "predator",
+                "spawn": {"center": [0.0, 0.0, 0.0], "radius": 2.0}, "body_radius": 0.5,
+                "movement": {"type": "discrete8", "speed": 0.65}, "sensors": {"type": "nearest_k", "k": 6, "range": 14.0},
+                "shape": "cone", "material": {"pattern": "solid", "color": "#ef4444"},
+            },
+            {
+                "id": "prey", "count": 3, "team": "prey", "role": "prey",
+                "spawn": {"center": [0.0, 0.0, 0.0], "radius": 10.0}, "body_radius": 0.35,
+                "movement": {"type": "discrete8", "speed": 0.65}, "sensors": {"type": "nearest_k", "k": 6, "range": 14.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#3b82f6"},
+            },
+        ],
+        "rules": {
+            "tag": {
+                "enabled": True, "predator_role": "predator", "prey_role": "prey",
+                "predator_reward": 2.0, "prey_reward": -2.0,
+                "prey_terminates": False, "prey_respawns": True,
+            },
+            "team_shared_reward": False,
+        },
+        "episode": {"max_steps": 400},
+    }
+
+
+def default_team_battle_spec(name: str = "Команда на команду") -> dict[str, Any]:
+    """2 same-role teams (red vs. blue) racing for the same open coins —
+    whichever agent physically reaches one first collects it (no
+    `restrict_team` lock, unlike predator-prey's per-role item rule), so
+    this is a symmetric competitive resource-race rather than
+    predator-prey's asymmetric chase. `team_shared_reward` is on: a coin
+    any red agent collects counts toward *every* red agent's reward
+    (cooperative within the team, competitive across teams) — the
+    standard CTDE-friendly setup `ippo` is meant for."""
+    return {
+        "name": name,
+        "description": "Команда «красные» против команды «синие» — обе гонятся за одними монетами, награда общая внутри команды.",
+        "world": {"width": 24.0, "depth": 24.0, "wall_height": 2.0},
+        "objects": [
+            {
+                "id": "wall_n", "type": "wall", "position": [0.0, 1.0, -12.0], "size": [24.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_s", "type": "wall", "position": [0.0, 1.0, 12.0], "size": [24.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_w", "type": "wall", "position": [-12.0, 1.0, 0.0], "size": [1.0, 2.0, 24.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_e", "type": "wall", "position": [12.0, 1.0, 0.0], "size": [1.0, 2.0, 24.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+        ],
+        "items": [
+            {
+                "id": f"coin{i}", "type": "reward",
+                "position": [float(x), 0.0, float(z)], "radius": 0.5,
+                "reward": 1.0, "respawn": True, "cooldown_steps": 20, "shape": "crystal",
+                "material": {"pattern": "dots", "color": "#eab308", "color2": "#713f12", "emissive": True},
+            }
+            for i, (x, z) in enumerate([(0, 0), (5, 0), (-5, 0), (0, 5), (0, -5), (5, 5), (-5, -5)])
+        ],
+        "agents": [
+            {
+                "id": "red", "count": 2, "team": "red", "role": "agent",
+                "spawn": {"center": [-8.0, 0.0, 0.0], "radius": 3.0}, "body_radius": 0.4,
+                "movement": {"type": "discrete8", "speed": 0.55}, "sensors": {"type": "nearest_k", "k": 6, "range": 14.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#ef4444"},
+            },
+            {
+                "id": "blue", "count": 2, "team": "blue", "role": "agent",
+                "spawn": {"center": [8.0, 0.0, 0.0], "radius": 3.0}, "body_radius": 0.4,
+                "movement": {"type": "discrete8", "speed": 0.55}, "sensors": {"type": "nearest_k", "k": 6, "range": 14.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#3b82f6"},
+            },
+        ],
+        "rules": {"team_shared_reward": True},
+        "episode": {"max_steps": 400},
     }
 
 

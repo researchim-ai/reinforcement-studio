@@ -30,6 +30,42 @@ from rl_core.envs.pomdp import register_pomdp_envs  # noqa: E402
 
 register_pomdp_envs()
 
+try:
+    from rl_core.envs.minigrid_envs import register_minigrid_envs  # noqa: E402
+
+    register_minigrid_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.highway_envs import register_highway_envs  # noqa: E402
+
+    register_highway_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.nethack_envs import register_nethack_envs  # noqa: E402
+
+    register_nethack_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.robotics_envs import register_robotics_envs  # noqa: E402
+
+    register_robotics_envs()
+except ImportError:
+    pass
+
+from rl_core.envs.finrl_envs import register_finrl_envs  # noqa: E402
+from rl_core.envs.industrial_envs import register_industrial_envs  # noqa: E402
+from rl_core.envs.trading_envs import register_trading_envs  # noqa: E402
+
+register_industrial_envs()
+register_trading_envs()
+register_finrl_envs()
+
 ALGO_CLASSES = {"ppo": PPO, "dqn": DQN, "a2c": A2C}
 
 DEFAULT_HYPERPARAMS = {

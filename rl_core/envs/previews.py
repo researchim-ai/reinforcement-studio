@@ -1,15 +1,34 @@
-"""Official Farama Foundation preview GIFs for the Environments gallery.
+"""Preview media (GIF/SVG thumbnails) for the Environments gallery.
 
-The first ten classic/toy/box2d cards already used these files from the
-Gymnasium repo. New envs use the same source; we proxy + cache them so the
-Electron file:// renderer does not depend on GitHub being reachable from
-<img> tags (and so ALE ids with slashes have a stable URL).
+Three tiers, tried in order for any given env id:
+1. Official Farama Foundation preview GIFs (`PREVIEW_REL`) — the classic/
+   toy/box2d/mujoco/atari cards, proxied + cached from the Gymnasium repo so
+   the Electron file:// renderer does not depend on GitHub being reachable
+   from <img> tags (and so ALE ids with slashes have a stable URL).
+2. Hand-drawn bundled SVGs (`BUNDLED_SVG_PREVIEWS`) — board games and a few
+   from-scratch POMDP tasks with no matching Farama asset.
+3. A locally rendered rollout GIF (see `_ensure_local_rollout_gif` and
+   `rl_core/envs/preview_worker.py` below) —
+   every other env registered in this app (MiniGrid/Highway-env/NetHack/
+   MiniHack/gymnasium-robotics wrappers, and every from-scratch env: JobShop/
+   BinPacking/Trading/FinRL-*) has neither a Farama asset nor a hand-drawn
+   SVG, but *does* implement `render_mode="rgb_array"` (that's what feeds
+   the live GIF preview during training — see
+   `rl_core/algorithms/metrics_callback.py`'s `render_episode`) — so instead
+   of shipping those gallery cards with a permanent placeholder icon, a
+   short random-policy rollout is recorded once and cached to disk exactly
+   like the other two tiers. Not as informative as a trained agent's
+   playthrough, but it's what every one of those envs actually *looks*
+   like, and costs nothing to keep in sync as new envs get added (no per-
+   env id to remember to list here).
 """
 from __future__ import annotations
 
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import numpy as np
 
 from rl_core.paths import PACKAGE_DIR, ROOT
 
@@ -138,8 +157,24 @@ MEDIA_TYPES = {
 }
 
 
+# Env ids known to have neither a Farama asset nor be a real registered
+# gym env we can `render()` (board-game/scene ids that aren't `gym.make()`-
+# able, plus anything that's already failed a local-rollout attempt this
+# process) — cached negatively so a broken/unrenderable id doesn't retry
+# (and re-raise/re-log) on every single gallery request.
+_local_render_unsupported: set[str] = set()
+
+
 def has_preview(env_id: str) -> bool:
-    return env_id in PREVIEW_REL or env_id in BUNDLED_SVG_PREVIEWS
+    if env_id in PREVIEW_REL or env_id in BUNDLED_SVG_PREVIEWS:
+        return True
+    # Every other env id that reaches `preview_api_path()` (see
+    # `list_environments()` in registry.py) is a real, registered
+    # `gym.make()`-able id — board games and Scene Builder scenes are
+    # either already covered above (tier 2) or never call this at all — so
+    # assume tier 3 applies; a bad guess here just costs one wasted 404
+    # from `resolve_preview_file()`, not a crash.
+    return env_id not in _local_render_unsupported
 
 
 def _stem(env_id: str) -> str:
@@ -181,6 +216,15 @@ def _gif_to_thumb(gif_path: Path, dest: Path) -> bool:
         from PIL import Image
 
         with Image.open(gif_path) as img:
+            # A third of the way into the animation, not frame 0 — several
+            # of this app's own envs render an empty/just-reset first frame
+            # (an unscheduled Gantt chart, a flat price history, an empty
+            # bin-packing floor, ...), which makes for a far less
+            # recognizable static thumbnail than a frame with the episode
+            # actually underway. Harmless for Farama's own GIFs too (their
+            # first frame is already mid-episode-ish).
+            n_frames = getattr(img, "n_frames", 1)
+            img.seek(min(n_frames - 1, n_frames // 3))
             frame = img.convert("RGB")
             frame.thumbnail((THUMB_MAX_WIDTH, THUMB_MAX_WIDTH), Image.Resampling.LANCZOS)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -203,14 +247,127 @@ def _ensure_gif(env_id: str) -> Path | None:
     return None
 
 
+# Hard caps on a generated local-rollout preview — independent of the
+# cache-once-forever nature of the result, so one slow-to-render env
+# (MuJoCo/NLE/MiniHack) can't turn a lazy background thumbnail request into
+# a many-second stall the first time its gallery card scrolls into view.
+_LOCAL_ROLLOUT_MAX_STEPS = 150
+_LOCAL_ROLLOUT_MAX_FRAMES = 60
+_LOCAL_ROLLOUT_MAX_SIDE = 320
+_LOCAL_ROLLOUT_SUBPROCESS_TIMEOUT_S = 60
+
+
+def _rollout_frames(env_id: str) -> tuple[list[np.ndarray], float] | None:
+    """A short random-policy rollout, restarting the episode (with a fresh
+    seed) whenever it ends early — several of this app's own from-scratch
+    envs (`JobShop-*-v0`, `BinPacking-v0`, ...) run for well under
+    `_LOCAL_ROLLOUT_MAX_STEPS` steps on a random policy, and a 2-frame GIF
+    is a worse preview than a longer one stitched from a few short
+    episodes back to back.
+
+    Only ever called from `rl_core/envs/preview_worker.py`'s subprocess,
+    never in-process — see `_ensure_local_rollout_gif()`'s docstring for
+    why."""
+    try:
+        from rl_core.envs import registry  # noqa: F401  (import side-effect: registers every custom env id)
+        import gymnasium as gym
+
+        env = gym.make(env_id, render_mode="rgb_array")
+    except Exception:
+        return None
+
+    frames: list[np.ndarray] = []
+    fps = float(getattr(env, "metadata", {}).get("render_fps", 8) or 8)
+    try:
+        env.reset(seed=0)
+        frame = env.render()
+        if frame is not None:
+            frames.append(np.asarray(frame))
+        episode_seed = 1
+        for _ in range(_LOCAL_ROLLOUT_MAX_STEPS):
+            action = env.action_space.sample()
+            _obs, _reward, terminated, truncated, _info = env.step(action)
+            frame = env.render()
+            if frame is not None:
+                frames.append(np.asarray(frame))
+            if terminated or truncated:
+                env.reset(seed=episode_seed)
+                episode_seed += 1
+    except Exception:
+        pass  # keep whatever frames were already collected — a short preview beats none
+    finally:
+        env.close()
+    return (frames, fps) if frames else None
+
+
+def build_local_rollout_gif_bytes(env_id: str) -> bytes | None:
+    """`_rollout_frames()` + GIF encoding — called exclusively from
+    `rl_core/envs/preview_worker.py`'s `__main__`, never in-process (public/
+    unprefixed so that subprocess entry point can import it cleanly)."""
+    result = _rollout_frames(env_id)
+    if result is None:
+        return None
+    frames, fps = result
+    # Lazy import: keeps stable-baselines3 off the import path of every
+    # other function in this module (used by the always-hot /environments
+    # list endpoint) — only the preview_worker subprocess ever needs it.
+    from rl_core.algorithms.metrics_callback import _build_gif_bytes
+
+    return _build_gif_bytes(frames, fps, _LOCAL_ROLLOUT_MAX_FRAMES, _LOCAL_ROLLOUT_MAX_SIDE)
+
+
+def _render_rollout_gif_in_subprocess(env_id: str, dest: Path) -> bool:
+    """Runs the actual rollout+render+encode (`build_local_rollout_gif_bytes`)
+    in a throwaway `python -m rl_core.envs.preview_worker` subprocess rather
+    than in-process.
+
+    Why: some envs' OpenGL rendering backends don't fail with a catchable
+    Python exception when there's no display to render to — verified
+    directly for MuJoCo's default GLFW backend (used by the wrapped
+    `PointMaze`/`AntMaze` envs in `rl_core/envs/robotics_envs.py`) on a
+    headless/no-X-server machine: it segfaults the *entire interpreter*
+    (`Fatal Python error: pygame_parachute: Segmentation Fault`), no
+    `except Exception` anywhere could ever catch that. In-process, one
+    gallery card scrolling into view would be enough to crash the whole
+    FastAPI backend; out-of-process, the exact same crash just means "this
+    subprocess exited non-zero", handled below identically to any other
+    rendering failure."""
+    import subprocess
+    import sys
+
+    from rl_core.paths import PROJECT_ROOT
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "rl_core.envs.preview_worker", env_id, str(dest)],
+            cwd=str(PROJECT_ROOT), capture_output=True, timeout=_LOCAL_ROLLOUT_SUBPROCESS_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 32
+
+
+def _ensure_local_rollout_gif(env_id: str) -> Path | None:
+    cached = _gif_cache_path(env_id)
+    if cached.is_file() and cached.stat().st_size > 32:
+        return cached
+    if env_id in _local_render_unsupported:
+        return None
+    if _render_rollout_gif_in_subprocess(env_id, cached):
+        return cached
+    _local_render_unsupported.add(env_id)
+    return None
+
+
 def resolve_preview_file(env_id: str, *, thumb: bool = False) -> Path | None:
     """Return a local preview file. `thumb=True` is a small first-frame JPEG."""
     if env_id in BUNDLED_SVG_PREVIEWS:
         path = BUNDLED_SVG_PREVIEWS[env_id]
         return path if path.is_file() else None
 
-    if env_id not in PREVIEW_REL:
-        return None
+    # Tier 1 (Farama) if we have one, else tier 3 (local rollout) — see
+    # module docstring.
+    ensure_gif = _ensure_gif if env_id in PREVIEW_REL else _ensure_local_rollout_gif
 
     if thumb:
         bundled = _bundled_thumb(env_id)
@@ -219,12 +376,12 @@ def resolve_preview_file(env_id: str, *, thumb: bool = False) -> Path | None:
         thumb_path = _thumb_cache_path(env_id)
         if thumb_path.is_file() and thumb_path.stat().st_size > 32:
             return thumb_path
-        gif = _ensure_gif(env_id)
+        gif = ensure_gif(env_id)
         if gif and _gif_to_thumb(gif, thumb_path):
             return thumb_path
         return gif
 
-    return _ensure_gif(env_id)
+    return ensure_gif(env_id)
 
 
 def preview_media_type(path: Path) -> str:

@@ -13,6 +13,44 @@ from rl_core.envs.pomdp import register_pomdp_envs
 
 register_pomdp_envs()
 
+try:
+    from rl_core.envs.minigrid_envs import register_minigrid_envs
+
+    register_minigrid_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.highway_envs import register_highway_envs
+
+    register_highway_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.nethack_envs import register_nethack_envs
+
+    register_nethack_envs()
+except ImportError:
+    pass
+
+try:
+    from rl_core.envs.robotics_envs import register_robotics_envs
+
+    register_robotics_envs()
+except ImportError:
+    pass
+
+# No optional third-party dependency (unlike every `register_*_envs` above)
+# — always registered.
+from rl_core.envs.finrl_envs import register_finrl_envs
+from rl_core.envs.industrial_envs import register_industrial_envs
+from rl_core.envs.trading_envs import register_trading_envs
+
+register_industrial_envs()
+register_trading_envs()
+register_finrl_envs()
+
 ActionKind = Literal["discrete", "continuous"]
 
 _DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es"]
@@ -129,34 +167,13 @@ GYM_ENVIRONMENTS: list[EnvSpec] = [
         id="CarRacing-v3",
         name="Car Racing",
         category="box2d",
-        description="Пиксельная трасса сверху: руль, газ и тормоз — непрерывное управление по одной "
-                     "картинке 96×96. Одна из самых требовательных сред в галерее: (1) сеть должна сама "
-                     "выучить CNN-признаки трассы с нуля, (2) один кадр не показывает скорость/занос — "
-                     "без этого сигнала политика учится намного хуже, (3) экшены несимметричны (руль "
-                     "[-1,1], газ и тормоз [0,1]), (4) эпизод длинный (~1000 шагов), а сигнал вознаграждения "
-                     "разреженный (плюс за новую плитку трассы, минус за каждый шаг). Лучший выбор из "
-                     "наших алгоритмов — PPO: он самый устойчивый на pixel-input и continuous-actions "
-                     "одновременно, и именно его использует тюнинг rl-baselines3-zoo для этой среды. При "
-                     "выборе среды граф враппером заполняется автоматически цепочкой Frame Skip → Resize "
-                     "→ Grayscale → Frame Stack — как в zoo, это одновременно ускоряет шаг симуляции и "
-                     "даёт сети сигнал скорости/заноса, который один кадр физически не показывает "
-                     "(Normalize Reward сюда специально не входит — при нашей архитектуре враппером он "
-                     "искажает и график reward в мониторинге, а не только сигнал для обучения). SAC "
-                     "тоже работает, но на картинках он гораздо капризнее к learning_rate/buffer_size и "
-                     "учится медленнее из-за replay-буфера с картинками. Даже с этим тюнингом это честно "
-                     "трудная задача для model-free PPO: независимые воспроизведения community чаще "
-                     "выходят на плато в районе 350-700 (это не брак настройки — это типичный результат "
-                     "для Гауссовой continuous-политики здесь), надёжные 900+ — редкость без "
-                     "дополнительных трюков вроде Beta-распределения ниже. Рассчитывайте на 3-5 млн шагов "
-                     "до первых уверенных проездов круга; до пары сотен тысяч шагов машина обычно просто "
-                     "крутится на месте или улетает с трассы — это нормальная стадия обучения, а не баг. "
-                     "По умолчанию политика — Beta-распределение, а не Гауссиана: газ/тормоз "
-                     "односторонние [0,1], Гауссиана там систематически перескакивает границу и требует "
-                     "clip, который градиент не видит (в статьях это отдельно измерено на CarRacing: "
-                     "+63% успешности). Застряли на плато и дальше не растёт даже после нескольких млн "
-                     "шагов? Попробуйте увеличить 'Отдельный скрытый слой pi/value' до 256 (уже включено "
-                     "по умолчанию) или до 512 — по чужим воспроизведениям статей на этой среде большего "
-                     "размера головы иногда даёт больше, чем упор в саму CNN.",
+        description="Пиксельная трасса сверху 96×96: руль, газ и тормоз — непрерывное управление по "
+                     "картинке, без сигнала скорости в одном кадре. Одна из самых требовательных сред в "
+                     "галерее: разреженная награда, эпизод ~1000 шагов, экшены несимметричны (газ/тормоз "
+                     "в [0,1]). По умолчанию подставляются цепочка враппером Frame Skip → Resize → "
+                     "Grayscale → Frame Stack и Beta-политика (без клиппинга для [0,1]-экшенов). "
+                     "Рассчитывайте на 3-5 млн шагов до уверенных кругов — плато в районе 350-700 без "
+                     "доп. настройки — типичная стадия обучения, а не баг.",
         action_kind="continuous",
         compatible_algorithms=_CONTINUOUS,
         extra_requirement="box2d",
@@ -371,6 +388,161 @@ GYM_ENVIRONMENTS: list[EnvSpec] = [
          "Лабиринт с монстрами и радаром. Кооператив/соревнование.", extra="atari"),
     _env("ALE/Zaxxon-v5", "Zaxxon", "atari",
          "Изометрический шутер: высота имеет значение.", extra="atari"),
+    # --- MiniGrid (частично наблюдаемая навигация/головоломки, egocentric-вид) ---
+    _env("MiniGrid-Empty-8x8-Img-v0", "MiniGrid: пустая комната", "minigrid",
+         "8×8 пустая комната, дойти до угла. Самая простая — для проверки конвейера.",
+         extra="minigrid"),
+    _env("MiniGrid-FourRooms-Img-v0", "MiniGrid: четыре комнаты", "minigrid",
+         "Четыре смежные комнаты со случайной целью — базовая навигационная задача.",
+         extra="minigrid"),
+    _env("MiniGrid-DoorKey-8x8-Img-v0", "MiniGrid: дверь и ключ", "minigrid",
+         "8×8: сначала подобрать ключ, потом открыть дверь и дойти до цели — "
+         "простейшая последовательная под-задача (subgoal).",
+         extra="minigrid"),
+    _env("MiniGrid-LavaCrossingS9N1-Img-v0", "MiniGrid: пересечение лавы", "minigrid",
+         "Пройти через сетку с полосами лавы, не наступив — жёсткий штраф за ошибку.",
+         extra="minigrid"),
+    _env("MiniGrid-Dynamic-Obstacles-8x8-Img-v0", "MiniGrid: движущиеся препятствия", "minigrid",
+         "8×8, препятствия сами двигаются каждый шаг — нужно реагировать, а не запоминать карту.",
+         extra="minigrid"),
+    _env("MiniGrid-MultiRoom-N4-S5-Img-v0", "MiniGrid: мультикомнатный лабиринт", "minigrid",
+         "4 комнаты, соединённые дверными проёмами — hard-exploration задача, награда только в конце.",
+         extra="minigrid"),
+    _env("MiniGrid-MemoryS9-Img-v0", "MiniGrid: память", "minigrid",
+         "Флагманский бенчмарк для памяти (LSTM/GRU): увидеть объект-подсказку в начале коридора, "
+         "затем выбрать одну из двух дверей в конце по цвету/форме подсказки — чисто feed-forward "
+         "политика упирается в потолок, см. рекуррентные сети в Network Builder.",
+         extra="minigrid"),
+    _env("MiniGrid-KeyCorridorS3R1-Img-v0", "MiniGrid: коридор с ключом", "minigrid",
+         "Ключ спрятан в одной из комнат коридора, дверь с сокровищем — в другой. "
+         "Многошаговый exploration + planning.",
+         extra="minigrid"),
+    # --- Highway-env (принятие решений в вождении) ---
+    _env("highway-v0", "Highway: шоссе", "highway_env",
+         "Многополосное шоссе с трафиком: перестроение/ускорение/торможение (5 discrete "
+         "meta-действий), избегать столкновений.", extra="highway_env"),
+    _env("merge-v1", "Highway: слияние полос", "highway_env",
+         "Влиться в основной поток с полосы разгона, не столкнувшись — короче и плотнее, чем шоссе.",
+         extra="highway_env"),
+    _env("roundabout-v1", "Highway: кольцевая развязка", "highway_env",
+         "Проехать кольцевую развязку среди другого трафика, выбрать нужный выезд.",
+         extra="highway_env"),
+    _env("intersection-v1", "Highway: перекрёсток", "highway_env",
+         "Нерегулируемый перекрёсток — самая насыщенная по взаимодействиям сцена, всего "
+         "3 discrete-действия (ждать/ехать/тормозить), но высокий риск столкновения.",
+         extra="highway_env"),
+    _env("parking-Flat-v0", "Highway: парковка", "highway_env",
+         "Continuous control (руль+газ): припарковаться в размеченное место задом. "
+         "Goal-conditioned (цель — часть наблюдения), сплющено в единый Box для совместимости.",
+         action_kind="continuous", extra="highway_env"),
+    # --- NetHack / MiniHack (процедурный dungeon-crawler, hard exploration) ---
+    _env("NetHackScore-Img-v0", "NetHack: очки", "nethack",
+         "Полноценный NetHack — цель максимизировать игровой score. Огромное пространство "
+         "состояний и очень разреженная награда, эталонная задача для long-horizon exploration.",
+         extra="nle", recommended_total_timesteps=2_000_000, recommended_num_envs=8),
+    _env("NetHackEat-Img-v0", "NetHack: голод", "nethack",
+         "NetHack с задачей выживания: следить за голодом и вовремя есть — простой суб-навык "
+         "полной игры, короче эпизоды, чем в NetHackScore.",
+         extra="nle", recommended_total_timesteps=1_000_000, recommended_num_envs=8),
+    _env("MiniHack-Room-5x5-Img-v0", "MiniHack: комната 5×5", "nethack",
+         "Дойти до лестницы в маленькой пустой комнате — самая простая MiniHack-задача, "
+         "для проверки конвейера перед более сложными.",
+         extra="minihack"),
+    _env("MiniHack-Room-15x15-Img-v0", "MiniHack: комната 15×15", "nethack",
+         "Та же задача, но комната в 9 раз больше — требует больше шагов исследования.",
+         extra="minihack"),
+    _env("MiniHack-Corridor-R2-Img-v0", "MiniHack: коридор", "nethack",
+         "Найти путь по системе коридоров, соединяющих комнаты — навигация без визуального "
+         "плана всего уровня (только egocentric crop).",
+         extra="minihack"),
+    _env("MiniHack-MazeWalk-9x9-Img-v0", "MiniHack: лабиринт 9×9", "nethack",
+         "Классический лабиринт: дойти от старта до цели, избегая тупиков.",
+         extra="minihack"),
+    _env("MiniHack-KeyRoom-5x5-Img-v0", "MiniHack: комната с ключом", "nethack",
+         "Подобрать ключ, открыть дверь, дойти до лестницы — многошаговая под-задача, "
+         "как DoorKey в MiniGrid, но на движке NetHack.",
+         extra="minihack"),
+    _env("MiniHack-Eat-Img-v0", "MiniHack: еда", "nethack",
+         "Найти и съесть предмет еды — простая задача на manipulation-команды NetHack "
+         "(в отличие от чисто навигационных MiniHack-задач выше).",
+         extra="minihack"),
+    # --- Robotics (goal-conditioned навигация, MuJoCo-физика) ---
+    _env("PointMaze-UMaze-Flat-v0", "Point Maze: U-образный", "robotics",
+         "Шарик с силовым управлением (2D) должен доехать до цели в U-образном лабиринте. "
+         "Goal-conditioned (наблюдение включает desired_goal) — D4RL-бенчмарк для offline/HER RL.",
+         action_kind="continuous", extra="gymnasium_robotics"),
+    _env("PointMaze-Medium-Flat-v0", "Point Maze: средний", "robotics",
+         "Тот же шарик, но лабиринт заметно больше и запутаннее — дольше exploration.",
+         action_kind="continuous", extra="gymnasium_robotics"),
+    _env("AntMaze-UMaze-Flat-v0", "Ant Maze: U-образный", "robotics",
+         "Четырёхногий MuJoCo-муравей должен САМ научиться ходить и одновременно "
+         "навигировать по U-образному лабиринту до цели — локомоция и навигация в одной "
+         "задаче, заметно сложнее, чем Point Maze или обычный Ant-v5.",
+         action_kind="continuous", extra="gymnasium_robotics",
+         recommended_total_timesteps=3_000_000),
+    _env("AntMaze-Medium-Flat-v0", "Ant Maze: средний", "robotics",
+         "Та же ходьба+навигация, но в заметно большем лабиринте.",
+         action_kind="continuous", extra="gymnasium_robotics",
+         recommended_total_timesteps=5_000_000),
+    # --- Industrial (планирование производства, логистика) ---
+    _env("JobShop-6x6-v0", "Job Shop 6×6", "industrial",
+         "Классическая задача цехового планирования (Job Shop Scheduling): 6 заданий, "
+         "каждое — своя последовательность из 6 операций на 6 станках, нужно расставить "
+         "порядок так, чтобы минимизировать makespan (время завершения последней операции). "
+         "На каждом шаге агент называет одно ещё не завершённое задание — его следующая "
+         "операция встаёт в очередь на нужный станок.",
+         recommended_total_timesteps=300_000),
+    _env("JobShop-10x10-v0", "Job Shop 10×10", "industrial",
+         "Та же задача, но 10 заданий × 10 станков — куда больше комбинаций порядка "
+         "диспетчеризации, классический размер тестовых наборов Taillard.",
+         recommended_total_timesteps=600_000),
+    _env("BinPacking-v0", "Bin Packing (online)", "industrial",
+         "Онлайн-упаковка предметов по контейнерам фиксированной ёмкости (склад/паллеты, "
+         "облачный bin-packing ресурсов): предметы прибывают по одному, каждый нужно сразу "
+         "положить в какой-то открытый контейнер или открыть новый — цель минимизировать "
+         "число использованных контейнеров.",
+         recommended_total_timesteps=300_000),
+    # --- Trading (управление позицией на рынке) ---
+    _env("Trading-Discrete-v0", "Trading: направление", "trading",
+         "Синтетический одноактивный трейдинг: на каждом шаге выбрать шорт/флэт/лонг. "
+         "Цена — regime-switching GBM (бычий/медвежий/боковой режимы со случайными "
+         "переключениями), свежая случайная траектория в каждом эпизоде — учит реагировать "
+         "на паттерн доходностей, а не запоминать один исторический график. Награда = "
+         "доходность позиции минус издержки на смену позиции (turnover cost).",
+         recommended_total_timesteps=500_000),
+    _env("Trading-Continuous-v0", "Trading: размер позиции", "trading",
+         "Та же задача, но действие — точная целевая позиция в [-1, 1] (доля капитала, "
+         "включая шорт) вместо выбора направления — можно частично закрывать/усиливать "
+         "позицию соразмерно уверенности.",
+         action_kind="continuous", recommended_total_timesteps=500_000),
+    _env("FinRL-StockTrading-v0", "FinRL: портфель акций", "trading",
+         "В духе StockTradingEnv из FinRL: портфель из 8 синтетических (коррелированных "
+         "через общий рыночный фактор) акций + денежный остаток. Действие — сколько акций "
+         "каждой купить/продать (± hmax штук), с комиссией за сделку. Награда = изменение "
+         "полной стоимости портфеля (кэш + позиции по текущей цене). Настоящая "
+         "мультиактивная бухгалтерия (кэш, лимиты, диверсификация), а не одна позиция.",
+         action_kind="continuous", recommended_total_timesteps=800_000),
+    EnvSpec(
+        id="FinRL-PortfolioAllocation-v0",
+        name="FinRL: аллокация портфеля",
+        category="trading",
+        description="В духе StockPortfolioEnv из FinRL: всегда полностью инвестированы в 8 "
+                     "коррелированных активов, без кэша и шорта. Действие — вектор оценок, "
+                     "нормализуется softmax'ом в веса портфеля. В наблюдении — реализованная "
+                     "ковариационная матрица доходностей (Markowitz-стиль). Награда = "
+                     "логарифмическая доходность портфеля минус издержки на ребалансировку.",
+        action_kind="continuous",
+        compatible_algorithms=_CONTINUOUS,
+        default_hyperparams={
+            # Action space is Box(0, 1) (raw pre-softmax scores) — one-sided
+            # like CarRacing's gas/brake, so Beta (native [0,1] support, no
+            # clip bias) is the better default distribution here too; see
+            # CarRacing-v3's own `use_beta` comment above for the full
+            # rationale.
+            "use_beta": 1,
+        },
+        recommended_total_timesteps=800_000,
+    ),
     # --- POMDP (нужна память — LSTM/GRU) ---
     _env("POCartPole-v0", "PO-CartPole", "pomdp",
          "CartPole без скоростей в наблюдении (только позиция тележки и угол шеста). "
@@ -632,6 +804,11 @@ _EXTRA_IMPORTS: dict[str, tuple[str, ...]] = {
     "box2d": ("Box2D",),
     "mujoco": ("mujoco",),
     "atari": ("ale_py",),
+    "minigrid": ("minigrid",),
+    "highway_env": ("highway_env",),
+    "nle": ("nle",),
+    "minihack": ("minihack",),
+    "gymnasium_robotics": ("gymnasium_robotics",),
 }
 
 _extra_ok_cache: dict[str, bool] = {}
@@ -705,13 +882,20 @@ def list_environments() -> list[dict]:
         if meta.get("broken"):
             continue
         action_kind = meta.get("action_kind", "discrete")
+        team_count = meta.get("team_count", 1)
+        base_algos = _CONTINUOUS if action_kind == "continuous" else _DISCRETE
+        # `ippo` (Independent PPO, rl_core/algorithms/native/marl_ppo.py)
+        # only makes sense once a scene actually has 2+ teams — for a
+        # single-team scene it would just be a slower, needlessly-split
+        # version of the existing single-policy `ppo`.
+        compatible = [*base_algos, "ippo"] if team_count >= 2 else base_algos
         out.append({
             "id": meta["id"],
             "name": meta.get("name") or meta["slug"],
             "category": "scene",
             "description": meta.get("description") or f"Пользовательская 3D-сцена · {meta.get('agent_count', 1)} агент(ов)",
             "action_kind": action_kind,
-            "compatible_algorithms": _CONTINUOUS if action_kind == "continuous" else _DISCRETE,
+            "compatible_algorithms": compatible,
             "extra_requirement": None,
             "default_hyperparams": None,
             "recommended_total_timesteps": 50_000,
@@ -721,6 +905,7 @@ def list_environments() -> list[dict]:
             "preview_url": None,
             "preview_thumb_url": None,
             "scene_agent_count": meta.get("agent_count"),
+            "scene_team_count": team_count,
             "scene_slug": meta.get("slug"),
         })
     for spec in BOARD_GAMES:

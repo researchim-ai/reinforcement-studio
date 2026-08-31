@@ -2,7 +2,7 @@ import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { Grid, OrbitControls } from '@react-three/drei'
 import { toast } from 'sonner'
-import { Box, BrickWall, Coins, Loader2, Package, Save, Skull, Users } from 'lucide-react'
+import { Box, BrickWall, Coins, Loader2, Package, Plus, Save, Skull, Trash2, Users } from 'lucide-react'
 import type { ThreeEvent } from '@react-three/fiber'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,9 +12,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useScenes } from '@/api/hooks'
 import { api } from '@/api/client'
 import type {
-  SceneItem, SceneMaterial, SceneMaterialPattern, SceneObject, SceneSelection, SceneShape, SceneSpec,
+  SceneAgentGroup, SceneItem, SceneMaterial, SceneMaterialPattern, SceneObject, SceneSelection, SceneShape, SceneSpec,
 } from '@/api/types'
-import { defaultSceneSpec, newId, slugify } from '@/lib/sceneDefaults'
+import { defaultSceneSpec, newAgentGroup, newId, slugify } from '@/lib/sceneDefaults'
 import { PATTERN_OPTIONS, SHAPE_OPTIONS } from '@/lib/sceneMaterials'
 import { SelectableMesh } from '@/components/scenebuilder/SceneMeshes'
 import { useQueryClient } from '@tanstack/react-query'
@@ -82,8 +82,6 @@ function SceneViewport({
   onUpdateObject: (id: string, patch: Partial<SceneObject>) => void
   onUpdateItem: (id: string, patch: Partial<SceneItem>) => void
 }) {
-  const agents = spec.agents[0]
-
   return (
     <Canvas camera={{ position: [18, 16, 18], fov: 45 }} onPointerMissed={() => onSelect(null)} shadows>
       <color attach="background" args={['#1a1a1f']} />
@@ -124,11 +122,14 @@ function SceneViewport({
         />
       ))}
 
-      {agents && (
-        <group onClick={(e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); onSelect({ kind: 'agents' }) }}>
+      {spec.agents.map((agents) => (
+        <group key={agents.id} onClick={(e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); onSelect({ kind: 'agents' }) }}>
           <mesh position={agents.spawn.center}>
             <cylinderGeometry args={[agents.spawn.radius, agents.spawn.radius, 0.05, 32]} />
-            <meshStandardMaterial color={selection?.kind === 'agents' ? '#818cf8' : '#6366f1'} transparent opacity={0.35} />
+            <meshStandardMaterial
+              color={selection?.kind === 'agents' ? '#818cf8' : (agents.material?.color ?? '#6366f1')}
+              transparent opacity={0.35}
+            />
           </mesh>
           {Array.from({ length: Math.min(agents.count, 8) }).map((_, i) => {
             const ang = (i / Math.max(1, agents.count)) * Math.PI * 2
@@ -150,7 +151,7 @@ function SceneViewport({
             )
           })}
         </group>
-      )}
+      ))}
 
       <OrbitControls makeDefault maxPolarAngle={Math.PI / 2.1} target={[0, 0, 0]} />
     </Canvas>
@@ -228,6 +229,7 @@ function Inspector({
     if (!item) return null
     const patch = (p: Partial<SceneItem>) =>
       onChangeSpec({ ...spec, items: spec.items.map((it) => (it.id === item.id ? { ...it, ...p } : it)) })
+    const teams = Array.from(new Set(spec.agents.map((g) => g.team || 'default')))
     return (
       <div className="space-y-2 text-xs">
         <p className="font-medium">{item.type === 'reward' ? 'Награда' : 'Опасность'}</p>
@@ -266,6 +268,19 @@ function Inspector({
           defaultColor={item.type === 'reward' ? '#22c55e' : '#ef4444'}
           onChange={(material) => patch({ material })}
         />
+        {teams.length > 1 && (
+          <div className="space-y-1">
+            <Label>Только для команды</Label>
+            <select
+              className="h-8 w-full rounded-md border border-border bg-background px-2"
+              value={item.restrict_team ?? ''}
+              onChange={(e) => patch({ restrict_team: e.target.value || undefined })}
+            >
+              <option value="">Любая команда</option>
+              {teams.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+        )}
         <Button size="sm" variant="destructive" className="w-full" onClick={() => onChangeSpec({ ...spec, items: spec.items.filter((it) => it.id !== item.id) })}>
           Удалить
         </Button>
@@ -273,32 +288,63 @@ function Inspector({
     )
   }
 
-  const agents = spec.agents[0]
-  if (!agents) return null
-  const patchAgents = (p: Partial<typeof agents>) =>
-    onChangeSpec({ ...spec, agents: [{ ...agents, ...p }] })
+  return <AgentsInspector spec={spec} onChangeSpec={onChangeSpec} />
+}
 
+function AgentGroupEditor({
+  group, onChange, onRemove, removable,
+}: {
+  group: SceneAgentGroup
+  onChange: (p: Partial<SceneAgentGroup>) => void
+  onRemove: () => void
+  removable: boolean
+}) {
   return (
-    <div className="space-y-2 text-xs">
-      <p className="font-medium">Агенты (общая политика)</p>
+    <div className="space-y-2 rounded-md border border-border/60 p-2">
+      <div className="flex items-center justify-between">
+        <Input
+          value={group.id}
+          onChange={(e) => onChange({ id: e.target.value })}
+          className="h-7 w-28 font-mono text-[11px]"
+        />
+        {removable && (
+          <Button size="icon" variant="ghost" className="h-6 w-6" onClick={onRemove}>
+            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+          </Button>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <Label>Команда (team)</Label>
+          <Input value={group.team ?? 'default'} onChange={(e) => onChange({ team: e.target.value })} className="h-7" />
+        </div>
+        <div className="space-y-1">
+          <Label>Роль (role)</Label>
+          <Input value={group.role ?? 'agent'} onChange={(e) => onChange({ role: e.target.value })} className="h-7" />
+        </div>
+      </div>
       <div className="space-y-1">
         <Label>Форма</Label>
-        <ShapeSelect value={agents.shape ?? 'capsule'} onChange={(shape) => patchAgents({ shape })} />
+        <ShapeSelect value={group.shape ?? 'capsule'} onChange={(shape) => onChange({ shape })} />
       </div>
       <div className="space-y-1">
         <Label>Количество</Label>
-        <NumericInput integer value={agents.count} onChange={(count) => patchAgents({ count })} className="h-7" />
+        <NumericInput integer value={group.count} onChange={(count) => onChange({ count })} className="h-7" />
       </div>
       <div className="space-y-1">
         <Label>Радиус спавна</Label>
-        <NumericInput value={agents.spawn.radius} onChange={(radius) => patchAgents({ spawn: { ...agents.spawn, radius } })} className="h-7" />
+        <NumericInput value={group.spawn.radius} onChange={(radius) => onChange({ spawn: { ...group.spawn, radius } })} className="h-7" />
+      </div>
+      <div className="space-y-1">
+        <Label>Радиус тела</Label>
+        <NumericInput value={group.body_radius} onChange={(body_radius) => onChange({ body_radius })} className="h-7" />
       </div>
       <div className="space-y-1">
         <Label>Движение</Label>
         <select
           className="h-8 w-full rounded-md border border-border bg-background px-2"
-          value={agents.movement.type}
-          onChange={(e) => patchAgents({ movement: { ...agents.movement, type: e.target.value as 'discrete4' | 'discrete8' | 'continuous' } })}
+          value={group.movement.type}
+          onChange={(e) => onChange({ movement: { ...group.movement, type: e.target.value as 'discrete4' | 'discrete8' | 'continuous' } })}
         >
           <option value="discrete4">Дискретное 4 направления</option>
           <option value="discrete8">Дискретное 8 направлений</option>
@@ -307,13 +353,117 @@ function Inspector({
       </div>
       <div className="space-y-1">
         <Label>Скорость</Label>
-        <NumericInput value={agents.movement.speed} onChange={(speed) => patchAgents({ movement: { ...agents.movement, speed } })} className="h-7" />
+        <NumericInput value={group.movement.speed} onChange={(speed) => onChange({ movement: { ...group.movement, speed } })} className="h-7" />
       </div>
       <div className="space-y-1">
         <Label>Сенсоры k</Label>
-        <NumericInput integer value={agents.sensors.k} onChange={(k) => patchAgents({ sensors: { ...agents.sensors, k } })} className="h-7" />
+        <NumericInput integer value={group.sensors.k} onChange={(k) => onChange({ sensors: { ...group.sensors, k } })} className="h-7" />
       </div>
-      <MaterialFields material={agents.material} defaultColor="#3b82f6" onChange={(material) => patchAgents({ material })} />
+      <MaterialFields material={group.material} defaultColor="#3b82f6" onChange={(material) => onChange({ material })} />
+    </div>
+  )
+}
+
+function AgentsInspector({ spec, onChangeSpec }: { spec: SceneSpec; onChangeSpec: (next: SceneSpec) => void }) {
+  const patchGroup = (idx: number, p: Partial<SceneAgentGroup>) =>
+    onChangeSpec({ ...spec, agents: spec.agents.map((g, i) => (i === idx ? { ...g, ...p } : g)) })
+  const addGroup = () =>
+    onChangeSpec({ ...spec, agents: [...spec.agents, newAgentGroup(spec.agents.length)] })
+  const removeGroup = (idx: number) =>
+    onChangeSpec({ ...spec, agents: spec.agents.filter((_, i) => i !== idx) })
+
+  const teams = Array.from(new Set(spec.agents.map((g) => g.team || 'default')))
+  const isMarl = teams.length > 1
+  const rules = spec.rules ?? {}
+  const patchRules = (p: typeof rules) => onChangeSpec({ ...spec, rules: { ...rules, ...p } })
+
+  return (
+    <div className="space-y-3 text-xs">
+      <div className="flex items-center justify-between">
+        <p className="font-medium">
+          {isMarl ? `Команды агентов (${teams.length}, MARL)` : 'Агенты (общая политика)'}
+        </p>
+        <Button size="sm" variant="outline" className="h-6 gap-1 px-2" onClick={addGroup}>
+          <Plus className="h-3 w-3" /> команда
+        </Button>
+      </div>
+      {isMarl && (
+        <p className="rounded-md bg-indigo-500/10 p-2 text-[11px] leading-relaxed text-indigo-300">
+          2+ команды с разными <code>team</code> → в Дизайнере эксперимента становится доступен алгоритм
+          <b> Multi-Agent PPO (IPPO)</b> — своя политика на команду.
+        </p>
+      )}
+      {spec.agents.map((group, idx) => (
+        <AgentGroupEditor
+          key={group.id}
+          group={group}
+          onChange={(p) => patchGroup(idx, p)}
+          onRemove={() => removeGroup(idx)}
+          removable={spec.agents.length > 1}
+        />
+      ))}
+
+      {isMarl && (
+        <div className="space-y-2 rounded-md border border-border/60 p-2">
+          <p className="text-[10px] font-semibold uppercase text-muted-foreground">Правила команд</p>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={!!rules.team_shared_reward}
+              onChange={(e) => patchRules({ team_shared_reward: e.target.checked })}
+            />
+            Общая награда внутри команды (team_shared_reward)
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={!!rules.tag?.enabled}
+              onChange={(e) => patchRules({ tag: { ...rules.tag, enabled: e.target.checked } })}
+            />
+            Хищник/жертва (tag): касание ловит жертву
+          </label>
+          {rules.tag?.enabled && (
+            <div className="space-y-2 pl-1">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label>Роль хищника</Label>
+                  <Input value={rules.tag?.predator_role ?? 'predator'} onChange={(e) => patchRules({ tag: { ...rules.tag, predator_role: e.target.value } })} className="h-7" />
+                </div>
+                <div className="space-y-1">
+                  <Label>Роль жертвы</Label>
+                  <Input value={rules.tag?.prey_role ?? 'prey'} onChange={(e) => patchRules({ tag: { ...rules.tag, prey_role: e.target.value } })} className="h-7" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label>Награда хищнику</Label>
+                  <NumericInput value={rules.tag?.predator_reward ?? 1} onChange={(v) => patchRules({ tag: { ...rules.tag, predator_reward: v } })} className="h-7" />
+                </div>
+                <div className="space-y-1">
+                  <Label>Штраф жертве</Label>
+                  <NumericInput value={rules.tag?.prey_reward ?? -1} onChange={(v) => patchRules({ tag: { ...rules.tag, prey_reward: v } })} className="h-7" />
+                </div>
+              </div>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={!!rules.tag?.prey_respawns}
+                  onChange={(e) => patchRules({ tag: { ...rules.tag, prey_respawns: e.target.checked } })}
+                />
+                Жертва возрождается после поимки
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={!!rules.tag?.prey_terminates}
+                  onChange={(e) => patchRules({ tag: { ...rules.tag, prey_terminates: e.target.checked } })}
+                />
+                Поимка завершает эпизод жертвы
+              </label>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -414,6 +564,18 @@ export function SceneBuilder() {
     }
   }
 
+  const loadTemplate = async (template: string) => {
+    try {
+      const doc = await api.getDefaultScene(template)
+      setSpec(doc)
+      setSlug(slugify(doc.name))
+      setSelection(null)
+      toast.success(`Шаблон загружен: «${doc.name}»`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Не удалось загрузить шаблон')
+    }
+  }
+
   const agentCount = useMemo(() => spec.agents.reduce((n, g) => n + (g.count || 1), 0), [spec.agents])
 
   return (
@@ -438,6 +600,15 @@ export function SceneBuilder() {
         <Button size="sm" variant="outline" onClick={() => { setSpec(defaultSceneSpec()); setSelection(null) }}>
           Новая
         </Button>
+        <select
+          className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+          value=""
+          onChange={(e) => { if (e.target.value) loadTemplate(e.target.value) }}
+        >
+          <option value="">Шаблон MARL…</option>
+          <option value="predator_prey">Хищник и жертва</option>
+          <option value="team_battle">Команда на команду</option>
+        </select>
         <span className="ml-auto text-xs text-muted-foreground">{agentCount} агент(ов) · id: scene:{slugify(slug)}</span>
       </div>
 

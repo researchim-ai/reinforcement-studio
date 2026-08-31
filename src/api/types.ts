@@ -32,6 +32,10 @@ export interface EnvSpec {
   // wrapper graph empty like before.
   recommended_wrappers?: WrapperNode[] | null
   scene_agent_count?: number | null
+  // Number of distinct `team` values across the scene's agent groups — 1
+  // for every non-MARL scene. Drives whether `ippo` shows up in
+  // `compatible_algorithms` (see `team_count()` in rl_core/scene_store.py).
+  scene_team_count?: number | null
   scene_slug?: string | null
 }
 
@@ -41,6 +45,9 @@ export interface SceneMeta {
   name: string
   description: string
   agent_count: number
+  // See `EnvSpec.scene_team_count` above — same value, just under the name
+  // `rl_core/scene_store.py::meta()` actually returns.
+  team_count: number
   action_kind: ActionKind
   broken?: boolean
   error?: string
@@ -76,6 +83,29 @@ export interface SceneSpec {
   items: SceneItem[]
   agents: SceneAgentGroup[]
   episode?: { max_steps?: number }
+  // MARL reward rules (predator/prey tagging, cooperative team-shared
+  // reward) — see `_tag_rule`/`_team_shared_reward` in
+  // rl_core/envs/scene_env.py. Empty/absent for every single-team scene.
+  rules?: SceneRules
+}
+
+export interface SceneTagRule {
+  enabled?: boolean
+  predator_role?: string
+  prey_role?: string
+  predator_reward?: number
+  prey_reward?: number
+  prey_terminates?: boolean
+  prey_respawns?: boolean
+}
+
+export interface SceneRules {
+  tag?: SceneTagRule
+  // Pools every team's per-step rewards into one shared total, credited
+  // to every agent on that team — cooperative credit assignment for tasks
+  // where the "right" behavior is a team effort, not something any single
+  // agent could learn to do from its own reward alone.
+  team_shared_reward?: boolean
 }
 
 export interface SceneObject {
@@ -99,12 +129,21 @@ export interface SceneItem {
   terminate?: boolean
   shape?: SceneShape
   material?: SceneMaterial
+  // Only pays out / despawns for agents whose group `team` matches this —
+  // other teams still see/collide with it but never collect it. Unset =
+  // open to every team (the pre-MARL default).
+  restrict_team?: string
 }
 
 export interface SceneAgentGroup {
   id: string
   count: number
   team?: string
+  // Free-form tag consumed by `rules.tag` (predator/prey) — has no effect
+  // on its own beyond distinguishing agents in the sensor readout (see
+  // `_entities_for_sensors` in rl_core/envs/scene_env.py); defaults to
+  // `"agent"` when unset.
+  role?: string
   spawn: { center: [number, number, number]; radius: number }
   body_radius: number
   movement: { type: 'discrete4' | 'discrete8' | 'continuous'; speed: number }

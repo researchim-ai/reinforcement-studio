@@ -185,7 +185,10 @@ export const api = {
     request<NetworkPreviewResult>('/networks/preview', { method: 'POST', body: JSON.stringify(payload) }),
 
   listScenes: () => request<{ scenes: SceneMeta[] }>('/scenes'),
-  getDefaultScene: () => request<SceneSpec>('/scenes/default'),
+  getDefaultScene: (template?: string) =>
+    request<SceneSpec>(`/scenes/default${template ? `?template=${encodeURIComponent(template)}` : ''}`),
+  listSceneTemplates: () =>
+    request<{ templates: { id: string; name: string; description: string }[] }>('/scenes/templates'),
   getScene: (slug: string) => request<{ slug: string } & SceneSpec>(`/scenes/${slug}`),
   saveScene: (slug: string, doc: SceneSpec) =>
     request<{ success: boolean; id: string }>(`/scenes/${slug}`, { method: 'PUT', body: JSON.stringify(doc) }),

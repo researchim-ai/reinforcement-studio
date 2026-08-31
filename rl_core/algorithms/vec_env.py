@@ -33,11 +33,43 @@ def _vector_env_context() -> str:
 
 def _make_registered_gym_env(env_id: str) -> gym.Env:
     """Build a gym env inside an `AsyncVectorEnv` worker — re-registers
-    custom envs (POMDP, Atari, ...) that only exist in the parent process
-    when using the spawn start method."""
+    custom envs (POMDP, MiniGrid, Highway-env, NetHack/MiniHack, robotics
+    mazes, industrial, trading, Atari, ...) that only exist in the parent
+    process when using the spawn start method."""
     from rl_core.envs.pomdp import register_pomdp_envs
 
     register_pomdp_envs()
+    try:
+        from rl_core.envs.minigrid_envs import register_minigrid_envs
+
+        register_minigrid_envs()
+    except ImportError:
+        pass
+    try:
+        from rl_core.envs.highway_envs import register_highway_envs
+
+        register_highway_envs()
+    except ImportError:
+        pass
+    try:
+        from rl_core.envs.nethack_envs import register_nethack_envs
+
+        register_nethack_envs()
+    except ImportError:
+        pass
+    try:
+        from rl_core.envs.robotics_envs import register_robotics_envs
+
+        register_robotics_envs()
+    except ImportError:
+        pass
+    from rl_core.envs.finrl_envs import register_finrl_envs
+    from rl_core.envs.industrial_envs import register_industrial_envs
+    from rl_core.envs.trading_envs import register_trading_envs
+
+    register_industrial_envs()
+    register_trading_envs()
+    register_finrl_envs()
     try:
         import ale_py
 

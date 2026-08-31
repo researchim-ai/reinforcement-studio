@@ -19,6 +19,10 @@ class SceneDoc(BaseModel):
     items: list[dict[str, Any]] = Field(default_factory=list)
     agents: list[dict[str, Any]] = Field(default_factory=list)
     episode: dict[str, Any] = Field(default_factory=dict)
+    # MARL reward rules (predator/prey tagging, cooperative team-shared
+    # reward) — see `_tag_rule`/`_team_shared_reward` in
+    # rl_core/envs/scene_env.py. Empty for every non-MARL (1-team) scene.
+    rules: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("")
@@ -26,9 +30,30 @@ async def list_scenes():
     return {"scenes": scene_store.list_meta()}
 
 
+_TEMPLATES = {
+    "default": scene_store.default_spec,
+    "predator_prey": scene_store.default_predator_prey_spec,
+    "team_battle": scene_store.default_team_battle_spec,
+}
+
+
 @router.get("/default")
-async def default_scene():
-    return scene_store.default_spec()
+async def default_scene(template: str = "default"):
+    factory = _TEMPLATES.get(template)
+    if factory is None:
+        raise HTTPException(status_code=400, detail=f"Неизвестный шаблон сцены: {template}")
+    return factory()
+
+
+@router.get("/templates")
+async def list_templates():
+    return {
+        "templates": [
+            {"id": "default", "name": "Пустая сцена", "description": "Одна команда, коллекционирование монет"},
+            {"id": "predator_prey", "name": "Хищник и жертва", "description": "2 команды, 2 роли — предатор гоняется за жертвами (MARL, ippo)"},
+            {"id": "team_battle", "name": "Команда на команду", "description": "2 команды соревнуются за монеты, общая награда внутри команды (MARL, ippo)"},
+        ],
+    }
 
 
 @router.get("/{slug}")

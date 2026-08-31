@@ -178,6 +178,32 @@ ALGORITHM_CATALOG = [
             {"key": "n_steps", "label": "Steps per update", "type": "int", "default": 5, "min": 1, "max": 256},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.01, "min": 0.0, "max": 0.1},
+            {
+                "key": "use_sde", "label": "gSDE (гладкое исследование, continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычный per-step шум)"},
+                    {"value": 1, "label": "Да — state-dependent exploration"},
+                ],
+            },
+            {
+                "key": "sde_sample_freq", "label": "gSDE: шагов между пересэмплингом шума", "type": "int", "default": 4, "min": 1, "max": 256,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "sde_log_std_init", "label": "gSDE: начальный log_std", "type": "float", "default": -2.0, "min": -5.0, "max": 1.0,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "head_hidden_size", "label": "Отдельный скрытый слой pi/value поверх признаков", "type": "int",
+                "default": 0, "min": 0, "max": 512,
+            },
+            {
+                "key": "use_beta", "label": "Beta-распределение вместо Гауссианы (continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычная Гауссиана + clip)"},
+                    {"value": 1, "label": "Да — Beta, без клиппинга по границам"},
+                ],
+            },
             *_memory_hyperparams(default_seq_len=32),
         ],
     },
@@ -247,6 +273,64 @@ ALGORITHM_CATALOG = [
             {"key": "sigma", "label": "Sigma (масштаб возмущений)", "type": "float", "default": 0.1, "min": 0.001, "max": 1.0},
             {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 0.02, "min": 1e-4, "max": 1.0},
             {"key": "episodes_per_eval", "label": "Эпизодов на оценку кандидата", "type": "int", "default": 1, "min": 1, "max": 10},
+        ],
+    },
+    {
+        "id": "ippo",
+        "name": "Multi-Agent PPO (IPPO)",
+        "kind": "gym",
+        "description": "MARL: независимая PPO-политика на каждую *команду* сцены (Scene Builder), обучаемая "
+                        "параллельно из одного общего мира — агенты внутри команды делят одну сеть "
+                        "(parameter sharing), но разные команды учатся на собственных наградах и никогда не "
+                        "путают чужой опыт со своим, поэтому предатор и жертва (или красная/синяя команда) "
+                        "реально расходятся в поведении. Требует сцену с 2+ группами агентов с разными "
+                        "значениями поля 'team' — обычная сцена с одной группой сюда не подходит, используйте "
+                        "просто PPO/A2C. Готовые шаблоны с двумя командами: Predator-Prey и Team Battle "
+                        "(кнопки в Scene Builder).",
+        "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
+            {
+                "key": "lr_schedule", "label": "Learning rate schedule", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Постоянный"},
+                    {"value": 1, "label": "Линейно убывает до 0"},
+                ],
+            },
+            {"key": "n_steps", "label": "Шагов rollout перед обновлением", "type": "int", "default": 512, "min": 8, "max": 8192},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 2048},
+            {"key": "n_epochs", "label": "Эпох на rollout", "type": "int", "default": 10, "min": 1, "max": 50},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
+            {"key": "gae_lambda", "label": "GAE lambda", "type": "float", "default": 0.95, "min": 0.5, "max": 1.0},
+            {"key": "clip_range", "label": "PPO clip range", "type": "float", "default": 0.2, "min": 0.05, "max": 0.5},
+            {"key": "ent_coef", "label": "Entropy coefficient", "type": "float", "default": 0.0, "min": 0.0, "max": 0.1},
+            {"key": "vf_coef", "label": "Value loss coefficient", "type": "float", "default": 0.5, "min": 0.0, "max": 1.0},
+            {"key": "max_grad_norm", "label": "Max grad norm", "type": "float", "default": 0.5, "min": 0.1, "max": 5.0},
+            {
+                "key": "use_sde", "label": "gSDE (гладкое исследование, continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычный per-step шум)"},
+                    {"value": 1, "label": "Да — state-dependent exploration"},
+                ],
+            },
+            {
+                "key": "sde_sample_freq", "label": "gSDE: шагов между пересэмплингом шума", "type": "int", "default": 4, "min": 1, "max": 256,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "sde_log_std_init", "label": "gSDE: начальный log_std", "type": "float", "default": -2.0, "min": -5.0, "max": 1.0,
+                "visibleWhen": [{"key": "use_sde", "eq": 1}],
+            },
+            {
+                "key": "head_hidden_size", "label": "Отдельный скрытый слой pi/value поверх признаков", "type": "int",
+                "default": 0, "min": 0, "max": 512,
+            },
+            {
+                "key": "use_beta", "label": "Beta-распределение вместо Гауссианы (continuous)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет (обычная Гауссиана + clip)"},
+                    {"value": 1, "label": "Да — Beta, без клиппинга по границам"},
+                ],
+            },
         ],
     },
     {

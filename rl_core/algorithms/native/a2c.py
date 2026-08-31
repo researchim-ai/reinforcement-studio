@@ -13,7 +13,7 @@ import gymnasium as gym
 from rl_core.algorithms.native.buffers import RolloutBuffer
 from rl_core.algorithms.native.networks import ActorCriticNet, Hidden, RecurrentActorCriticNet, detach_hidden, memory_type_from_hyperparams
 from rl_core.algorithms.native.on_policy import OnPolicyAlgorithm, _LossAccumulator
-from rl_core.algorithms.vec_env import action_space, obs_space
+from rl_core.algorithms.vec_env import action_space, num_envs_of, obs_space
 from rl_core.netbuilder import SpecActorCriticNet
 
 DEFAULT_HYPERPARAMS = {
@@ -24,6 +24,19 @@ DEFAULT_HYPERPARAMS = {
     "ent_coef": 0.01,
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
+    # Same continuous-action-space "boosters" as NativePPO (gSDE / Beta
+    # head / extra per-head hidden layer — see their docstrings in
+    # ppo.py's DEFAULT_HYPERPARAMS and `ActorCriticNet` in networks.py):
+    # A2C shares the exact same `ActorCriticNet` architecture and the same
+    # generic collection loop in `OnPolicyAlgorithm.learn` (which already
+    # gates gSDE's periodic `reset_noise()` behind `getattr(self,
+    # "use_sde", False)`), so none of this needed new machinery here —
+    # just wiring the same three hyperparams through to the same net.
+    "use_sde": 0,
+    "sde_sample_freq": 4,
+    "sde_log_std_init": -2.0,
+    "use_beta": 0,
+    "head_hidden_size": 0,
     # Memory (see rl_core/algorithms/native/networks.py:RecurrentActorCriticNet).
     # 0 = no memory (plain ActorCriticNet), 1 = LSTM, 2 = GRU.
     "memory_type": 0,
@@ -41,6 +54,13 @@ class NativeA2C(OnPolicyAlgorithm):
         obs_sp, act_sp = obs_space(env), action_space(env)
         network_spec = hyperparams.get("network_spec")
         memory_type = memory_type_from_hyperparams(hyperparams)
+        # See NativePPO.__init__ — same reasoning: gSDE needs `reset_noise()`
+        # on the concrete `ActorCriticNet` class, so a custom (Network
+        # Builder) or recurrent architecture just never gets it.
+        use_sde = bool(int(hyperparams.get("use_sde", 0)))
+        sde_log_std_init = float(hyperparams.get("sde_log_std_init", -2.0))
+        head_hidden_size = int(hyperparams.get("head_hidden_size", 0))
+        use_beta = bool(int(hyperparams.get("use_beta", 0)))
         if network_spec:
             self.net = SpecActorCriticNet(obs_sp, act_sp, network_spec)
         elif memory_type:
@@ -50,7 +70,10 @@ class NativeA2C(OnPolicyAlgorithm):
                 num_layers=int(hyperparams.get("memory_num_layers", 1)),
             )
         else:
-            self.net = ActorCriticNet(obs_sp, act_sp)
+            self.net = ActorCriticNet(
+                obs_sp, act_sp, use_sde=use_sde, sde_log_std_init=sde_log_std_init,
+                head_hidden_size=head_hidden_size, use_beta=use_beta,
+            )
         self.net = self.net.to(device)
         self.recurrent = isinstance(self.net, RecurrentActorCriticNet)
         self.memory_seq_len = max(1, int(hyperparams.get("memory_seq_len", 32)))
@@ -61,6 +84,13 @@ class NativeA2C(OnPolicyAlgorithm):
         self.ent_coef = float(hyperparams.get("ent_coef", 0.01))
         self.vf_coef = float(hyperparams.get("vf_coef", 0.5))
         self.max_grad_norm = float(hyperparams.get("max_grad_norm", 0.5))
+        # Same `use_sde`/`sde_sample_freq` attributes NativePPO sets — these
+        # are what `OnPolicyAlgorithm.learn`'s collection loop actually
+        # reads (via `getattr`) to drive periodic `reset_noise()` calls.
+        self.use_sde = isinstance(self.net, ActorCriticNet) and self.net.use_sde
+        self.sde_sample_freq = max(1, int(hyperparams.get("sde_sample_freq", 4)))
+        if self.use_sde:
+            self.net.reset_noise(num_envs_of(env))
 
     def _update(self, buf: RolloutBuffer, rollout_hidden: Hidden | None = None) -> None:
         if self.recurrent:

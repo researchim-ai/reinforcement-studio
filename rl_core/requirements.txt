@@ -25,3 +25,35 @@ pillow>=10.0
 # pulling it in transitively — headless build since this never touches a
 # display/GUI.
 opencv-python-headless>=4.8
+# MiniGrid (gridworld navigation/exploration/memory tasks) and Highway-env
+# (autonomous-driving decision-making) — both pure-Python, prebuilt-wheel
+# packages (no swig/compiler, like the box2d/mujoco/atari extras above),
+# unlocking the "minigrid"/"highway_env" categories in the Environments
+# gallery (see rl_core/envs/minigrid_envs.py / highway_envs.py).
+minigrid>=3.0
+highway-env>=1.10
+# Gymnasium-Robotics (rl_core/envs/robotics_envs.py) — AntMaze/PointMaze
+# goal-conditioned maze navigation. Pure-Python wheel itself (no
+# swig/compiler); its own dependencies (PettingZoo core, Jinja2, imageio)
+# are the same. Only actually *uses* the `mujoco` extra already pulled in
+# above by `gymnasium[...,mujoco,...]` — nothing extra to compile.
+gymnasium-robotics>=1.4
+# NetHack Learning Environment / MiniHack (rl_core/envs/nethack_envs.py) —
+# NOT installed by default, unlike every other extra above: `nle` only
+# ships prebuilt wheels for manylinux (Linux x86_64/aarch64), so on macOS/
+# Windows `pip install nle` falls back to building the NetHack C source
+# from a tarball (needs cmake/flex/bison/a C compiler) — exactly the heavy,
+# failure-prone install this file otherwise avoids. Uncomment on Linux, or
+# install manually, to unlock the "nethack" category in the gallery.
+# nle>=1.1
+# minihack>=1.0
+# minihack's own code still does `import pkg_resources` (minihack/base.py)
+# — an API setuptools has fully removed as of 81.0.0 (Nov 2025), so
+# whatever plain `pip install minihack` resolves setuptools to transitively
+# (nothing pins an upper bound) breaks the import with a bare
+# `ModuleNotFoundError: No module named 'pkg_resources'` the moment you
+# actually try to use it. Not our bug to fix (minihack's, upstream), but
+# pinning below is what makes `pip install -r` actually leave a *working*
+# minihack instead of a "looks installed, silently broken until first
+# import" one — uncomment alongside the two lines above.
+# setuptools<81

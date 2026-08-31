@@ -14,6 +14,12 @@ const CATEGORY_LABELS: Record<string, string> = {
   box2d: 'Box2D / Physics',
   mujoco: 'MuJoCo / Robotics',
   atari: 'Atari 2600',
+  minigrid: 'MiniGrid (навигация/память)',
+  highway_env: 'Highway-env (вождение)',
+  nethack: 'NetHack / MiniHack (dungeon crawler)',
+  robotics: 'Robotics (goal-conditioned навигация)',
+  industrial: 'Industrial (планирование/логистика)',
+  trading: 'Trading (позиции и портфели)',
   pomdp: 'POMDP (нужна память)',
   board_game: 'Настольная игра',
 }
@@ -22,9 +28,17 @@ const EXTRA_HINT: Record<string, string> = {
   box2d: 'pip install "gymnasium[box2d]"',
   mujoco: 'pip install "gymnasium[mujoco]"',
   atari: 'pip install "gymnasium[atari]" && ale-import-roms',
+  minigrid: 'pip install minigrid',
+  highway_env: 'pip install highway-env',
+  nle: 'pip install nle (только Linux, готовые wheel-ы)',
+  minihack: 'pip install minihack (только Linux, готовые wheel-ы)',
+  gymnasium_robotics: 'pip install gymnasium-robotics',
 }
 
-const CATEGORY_ORDER = ['classic_control', 'toy_text', 'box2d', 'mujoco', 'atari', 'pomdp', 'board_game']
+const CATEGORY_ORDER = [
+  'classic_control', 'toy_text', 'box2d', 'mujoco', 'atari', 'minigrid', 'highway_env', 'nethack', 'robotics',
+  'industrial', 'trading', 'pomdp', 'board_game',
+]
 
 function EnvPreview({ env }: { env: EnvSpec }) {
   const rootRef = useRef<HTMLDivElement>(null)

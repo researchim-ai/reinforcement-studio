@@ -17,6 +17,8 @@ from rl_core.algorithms.native.dqn import DEFAULT_HYPERPARAMS as DQN_DEFAULTS
 from rl_core.algorithms.native.dqn import NativeDQN
 from rl_core.algorithms.native.es import DEFAULT_HYPERPARAMS as ES_DEFAULTS
 from rl_core.algorithms.native.es import NativeES
+from rl_core.algorithms.native.marl_ppo import DEFAULT_HYPERPARAMS as IPPO_DEFAULTS
+from rl_core.algorithms.native.marl_ppo import MultiAgentPPO
 from rl_core.algorithms.native.networks import policy_name
 from rl_core.algorithms.native.ppo import DEFAULT_HYPERPARAMS as PPO_DEFAULTS
 from rl_core.algorithms.native.ppo import NativePPO
@@ -37,6 +39,7 @@ ALGO_CLASSES = {
     "ddpg": NativeDDPG,
     "td3": NativeTD3,
     "es": NativeES,
+    "ippo": MultiAgentPPO,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -47,6 +50,7 @@ DEFAULT_HYPERPARAMS = {
     "ddpg": DDPG_DEFAULTS,
     "td3": TD3_DEFAULTS,
     "es": ES_DEFAULTS,
+    "ippo": IPPO_DEFAULTS,
 }
 
 
