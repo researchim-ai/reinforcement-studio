@@ -20,9 +20,12 @@ Four MuZero-family ingredients carried over from EfficientZero (V1 and V2):
   2021, SimSiam-style): the dynamics net's predicted next latent is
   pushed towards the representation net's *real* encoding of the actual
   next observation, through an asymmetric projector/predictor pair with a
-  stop-gradient on the real-encoding branch (`_consistency_loss` below) -
-  this is what keeps `s` predictive of the real observation instead of
-  collapsing to whatever is easiest for the reward/value heads alone.
+  stop-gradient on the real-encoding branch, *and* `BatchNorm1d` on both
+  MLPs' hidden layer (`_Projector`/`_Predictor` - stop-gradient alone
+  still collapses in practice per Chen & He, 2021's own ablation; BN is
+  what actually keeps it from happening) - this is what keeps `s`
+  predictive of the real observation instead of collapsing to whatever
+  is easiest for the reward/value heads alone.
 - Value prefix: the dynamics net's reward head is an LSTM carried across
   one training unroll, predicting the *cumulative* real reward since the
   unroll's start at each step rather than each step's reward in
@@ -245,11 +248,21 @@ class _Prediction(nn.Module):
 
 
 class _Projector(nn.Module):
-    """SimSiam-style projector `P1` (module docstring's consistency loss)."""
+    """SimSiam-style projector `P1` (module docstring's consistency loss).
+    `BatchNorm1d` on the hidden layer is not decorative - Chen & He, 2021's
+    own ablation (Table 2c) shows stop-gradient *alone* still collapses in
+    practice (every latent converging to ~the same vector, which trivially
+    "matches" whatever the predictor outputs and costs nothing at all to
+    reach); BN is what empirically keeps that from happening by forcing
+    every batch's projected features to actually spread out (zero mean,
+    unit variance *per feature, across the batch*) instead of letting the
+    optimizer collapse them all together."""
 
     def __init__(self, latent_dim: int, proj_dim: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(latent_dim, proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim))
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        )
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         return self.net(s)
@@ -257,13 +270,15 @@ class _Projector(nn.Module):
 
 class _Predictor(nn.Module):
     """SimSiam-style predictor `P2` - only applied on the *predicted*
-    (dynamics) branch, never the stop-gradiented real-encoding branch,
-    which is what makes the two branches asymmetric and keeps this loss
-    from collapsing to a trivial constant (see Chen & He, 2021)."""
+    (dynamics) branch, never the stop-gradiented real-encoding branch
+    (asymmetry), with the same anti-collapse `BatchNorm1d` as `_Projector`
+    on its hidden layer - see that class's docstring."""
 
     def __init__(self, proj_dim: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(proj_dim, proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim))
+        self.net = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
