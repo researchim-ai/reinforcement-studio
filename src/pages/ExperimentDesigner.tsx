@@ -5,7 +5,7 @@ import '@xyflow/react/dist/style.css'
 import { toast } from 'sonner'
 import { Loader2, Plus, Sparkles, X, FlaskConical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { useAlgorithms, useCheckpointConfig, useEnvironments, useInspectDesign, useNetworks, useRunConfig, useWrappers } from '@/api/hooks'
+import { useAlgorithms, useCheckpointConfig, useEnvironments, useInspectDesign, useNetworks, useRunConfig, useWorldModels, useWrappers } from '@/api/hooks'
 import { api } from '@/api/client'
 import { EnvNode, type EnvNodeData } from '@/components/designer/EnvNode'
 import { WrapperNode, type WrapperNodeData } from '@/components/designer/WrapperNode'
@@ -52,11 +52,13 @@ export function ExperimentDesigner() {
   const { data: wrapperData } = useWrappers()
   const { data: algoData } = useAlgorithms()
   const { data: networkData } = useNetworks()
+  const { data: worldModelData } = useWorldModels()
 
   const environments = envData?.environments ?? []
   const wrapperCatalog = wrapperData?.wrappers ?? []
   const allAlgorithms = algoData?.algorithms ?? []
   const networks = networkData?.networks ?? []
+  const worldModels = worldModelData?.world_models ?? []
 
   const [environmentId, setEnvironmentId] = useState<string>('')
   const [wrappers, setWrappers] = useState<WrapperNodeSpec[]>([])
@@ -64,6 +66,7 @@ export function ExperimentDesigner() {
   const [hyperparams, setHyperparams] = useState<Record<string, number>>({})
   const [networkSpecId, setNetworkSpecId] = useState<string | null>(null)
   const [quickHiddenLayers, setQuickHiddenLayers] = useState<number[] | null>(null)
+  const [worldModelId, setWorldModelId] = useState<string | null>(null)
   const [name, setName] = useState('Мой эксперимент')
   const [totalTimesteps, setTotalTimesteps] = useState(50_000)
   const [numEnvs, setNumEnvs] = useState(1)
@@ -98,6 +101,7 @@ export function ExperimentDesigner() {
     setNetworkSpecId(sourceConfig.algorithm.network_spec_id ?? null)
     setQuickHiddenLayers(null)
     setResumeNetworkSpec(sourceConfig.algorithm.network_spec ?? null)
+    setWorldModelId(sourceConfig.algorithm.world_model_id ?? null)
     if (sourceConfig.training?.num_envs) setNumEnvs(sourceConfig.training.num_envs)
     setResumeFrom({ source: resumeRunId ? 'run' : 'checkpoint', id: (resumeRunId ?? resumeCheckpointName) as string })
     setResumeApplied(true)
@@ -153,20 +157,42 @@ export function ExperimentDesigner() {
     }
   }, [environments, environmentId, requestedEnvId, resumePending, setSearchParams])
 
+  // Which of `compatibleAlgorithms` to auto-select when the current pick
+  // isn't in the list (fresh env, or one just switched to). Plain
+  // `compatibleAlgorithms[0]` would pick whichever algorithm happens to
+  // come first in the *global* catalog (ppo/dqn, defined earliest in
+  // backend/routes/environments.py's ALGORITHM_CATALOG) — for a
+  // multi-agent scene/PettingZoo benchmark (`scene_agent_count >= 2`)
+  // that's a single shared-weights policy applied identically to every
+  // agent/team, which technically runs but isn't what those envs are
+  // *for*. Prefer `ippo` (2+ teams; works for any action kind/reward
+  // shape) over `qmix` (2+ agents, single team is fine too — see
+  // rl_core/algorithms/native/qmix.py's module docstring) over the plain
+  // catalog order — whichever of the two the env's own
+  // `compatible_algorithms` actually offers.
+  const preferredDefaultAlgorithm = useMemo(() => {
+    if (selectedEnv && (selectedEnv.scene_agent_count ?? 1) >= 2) {
+      const marl = compatibleAlgorithms.find((a) => a.id === 'ippo') ?? compatibleAlgorithms.find((a) => a.id === 'qmix')
+      if (marl) return marl
+    }
+    return compatibleAlgorithms[0]
+  }, [compatibleAlgorithms, selectedEnv])
+
   useEffect(() => {
     if (resumePending) return
-    if (compatibleAlgorithms.length > 0 && !compatibleAlgorithms.some((a) => a.id === algorithmId)) {
-      setAlgorithmId(compatibleAlgorithms[0].id)
-      setHyperparams(buildDefaultHyperparams(compatibleAlgorithms[0], selectedEnv))
+    if (preferredDefaultAlgorithm && !compatibleAlgorithms.some((a) => a.id === algorithmId)) {
+      setAlgorithmId(preferredDefaultAlgorithm.id)
+      setHyperparams(buildDefaultHyperparams(preferredDefaultAlgorithm, selectedEnv))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compatibleAlgorithms.map((a) => a.id).join(','), algorithmId, selectedEnv, resumePending])
+  }, [compatibleAlgorithms.map((a) => a.id).join(','), algorithmId, selectedEnv, resumePending, preferredDefaultAlgorithm])
 
   const handleEnvChange = useCallback((id: string) => {
     setEnvironmentId(id)
     setAlgorithmId('')
     setNetworkSpecId(null)
     setQuickHiddenLayers(null)
+    setWorldModelId(null)
     // Pre-fill a per-env recommended step budget (e.g. CarRacing/Atari need
     // millions, not the flat 50k default) — only when the field is set,
     // otherwise leave whatever the user already had.
@@ -187,6 +213,7 @@ export function ExperimentDesigner() {
       setHyperparams(buildDefaultHyperparams(spec, selectedEnv))
       setNetworkSpecId(null)
       setQuickHiddenLayers(null)
+      setWorldModelId(null)
     },
     [allAlgorithms, selectedEnv],
   )
@@ -229,6 +256,10 @@ export function ExperimentDesigner() {
   // editor/`networkSpecId`, both of which are locked in the UI anyway.
   const effectiveNetworkSpecId = resumeFrom ? null : networkSpecId
   const effectiveNetworkSpec = resumeFrom ? resumeNetworkSpec : quickNetworkSpec
+  // Same "locked while resuming" rule as the network spec above — a
+  // resumed run's world model (if it used one at all) is whatever's
+  // already baked into its loaded weights.
+  const effectiveWorldModelId = resumeFrom ? null : worldModelId
 
   const inspectPayload = useMemo(() => {
     if (!environmentId || !algorithmId) return null
@@ -251,7 +282,10 @@ export function ExperimentDesigner() {
         kind,
         name,
         environment: { id: environmentId, wrappers: kind === 'gym' ? wrappers : [] },
-        algorithm: { id: algorithmId, hyperparams, network_spec_id: effectiveNetworkSpecId, network_spec: effectiveNetworkSpec },
+        algorithm: {
+          id: algorithmId, hyperparams, network_spec_id: effectiveNetworkSpecId, network_spec: effectiveNetworkSpec,
+          world_model_id: effectiveWorldModelId,
+        },
         training: {
           total_timesteps: totalTimesteps,
           num_envs: numEnvs,
@@ -269,7 +303,7 @@ export function ExperimentDesigner() {
     } finally {
       setStarting(false)
     }
-  }, [canRun, kind, name, environmentId, wrappers, algorithmId, hyperparams, effectiveNetworkSpecId, effectiveNetworkSpec, totalTimesteps, numEnvs, numIterations, seed, useGpu, resumeFrom, navigate])
+  }, [canRun, kind, name, environmentId, wrappers, algorithmId, hyperparams, effectiveNetworkSpecId, effectiveNetworkSpec, effectiveWorldModelId, totalTimesteps, numEnvs, numIterations, seed, useGpu, resumeFrom, navigate])
 
   const algoColumnIndex = 2
   const trainingColumnIndex = 3
@@ -324,6 +358,8 @@ export function ExperimentDesigner() {
         networks,
         networkSpecId,
         quickHiddenLayers,
+        worldModels,
+        worldModelId,
         locked: !!resumeFrom,
         onChangeAlgo: handleAlgoChange,
         onChangeHyperparam: (key: string, value: number) =>
@@ -354,6 +390,7 @@ export function ExperimentDesigner() {
             ))
           }
         },
+        onChangeWorldModelId: setWorldModelId,
       } satisfies AlgorithmNodeData,
     })
 
@@ -387,7 +424,8 @@ export function ExperimentDesigner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     environments, environmentId, wrappers, wrapperCatalog, compatibleAlgorithms, algorithmId,
-    hyperparams, networks, networkSpecId, quickHiddenLayers, kind, name, totalTimesteps, numEnvs, numIterations, seed, useGpu, starting, canRun, algoX, resumeFrom, inspectData,
+    hyperparams, networks, networkSpecId, quickHiddenLayers, worldModels, worldModelId,
+    kind, name, totalTimesteps, numEnvs, numIterations, seed, useGpu, starting, canRun, algoX, resumeFrom, inspectData,
   ])
 
   // The "+" insertion buttons must track wherever the env/wrapper/algorithm
@@ -474,7 +512,16 @@ export function ExperimentDesigner() {
       <InspectPanel
         data={inspectData}
         isFetching={inspectFetching}
-        sceneAgentCount={environmentId.startsWith('scene:') ? (selectedEnv?.scene_agent_count ?? null) : null}
+        sceneAgentCount={
+          environmentId.startsWith('scene:') || environmentId.startsWith('petting:')
+            ? (selectedEnv?.scene_agent_count ?? null)
+            : null
+        }
+        sceneTeamCount={
+          environmentId.startsWith('scene:') || environmentId.startsWith('petting:')
+            ? (selectedEnv?.scene_team_count ?? null)
+            : null
+        }
       />
       <ReactFlow
         nodes={nodes}

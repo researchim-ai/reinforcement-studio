@@ -1,7 +1,7 @@
 import { memo } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { Link } from 'react-router-dom'
-import { Cpu, Network } from 'lucide-react'
+import { Brain, Cpu, Network } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { NumericInput } from '@/components/ui/numeric-input'
 import { Label } from '@/components/ui/label'
@@ -9,7 +9,8 @@ import { Badge } from '@/components/ui/badge'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
 import { QuickNetworkEditor } from '@/components/designer/QuickNetworkEditor'
 import { FAMILY_LABELS, defaultHiddenSizesForFamily, networkFamilyFor, requiredFamilyFor } from '@/lib/networkBuilder'
-import type { AlgorithmSpec, NetworkMeta } from '@/api/types'
+import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
+import type { AlgorithmSpec, NetworkMeta, WorldModelMeta } from '@/api/types'
 
 export interface AlgorithmNodeData {
   algorithms: AlgorithmSpec[]
@@ -18,10 +19,13 @@ export interface AlgorithmNodeData {
   networks: NetworkMeta[]
   networkSpecId: string | null
   quickHiddenLayers: number[] | null
+  worldModels: WorldModelMeta[]
+  worldModelId: string | null
   onChangeAlgo: (id: string) => void
   onChangeHyperparam: (key: string, value: number) => void
   onChangeNetworkSpecId: (id: string | null) => void
   onChangeQuickLayers: (layers: number[] | null) => void
+  onChangeWorldModelId: (id: string | null) => void
   // Set while "Дообучить" (resume/fine-tune — see ExperimentDesigner.tsx's
   // `resumeFrom` state) is active: the architecture/hyperparams are fixed
   // by the source run/checkpoint's saved weights (loading a state_dict
@@ -67,6 +71,10 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
   // plain MLP trunks.
   const quickFamily = selected ? requiredFamilyFor(selected.id, selected.kind) : null
   const compatibleNetworks = requiredFamily ? data.networks.filter((n) => n.family === requiredFamily && !n.broken) : []
+  const requiredWorldModelType = selected?.world_model_type ?? null
+  const compatibleWorldModels = requiredWorldModelType
+    ? data.worldModels.filter((w) => w.type === requiredWorldModelType && !w.broken)
+    : []
   const hasSavedNetwork = requiredFamily != null && data.networkSpecId != null
   const hasCustomNetwork = hasSavedNetwork || (quickFamily != null && data.quickHiddenLayers != null)
   const visibleHyperparams = selected?.hyperparams.filter((hp) => {
@@ -161,6 +169,28 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                 hiddenLayers={data.quickHiddenLayers}
                 onChange={data.onChangeQuickLayers}
               />
+            )}
+            {requiredWorldModelType && !data.locked && (
+              <div className="space-y-1 border-t border-border pt-2">
+                <div className="flex items-baseline justify-between gap-2">
+                  <Label className="text-[11px] text-muted-foreground">World Model ({WORLD_MODEL_TYPE_LABELS[requiredWorldModelType]})</Label>
+                  <Link to="/world-models" className="flex items-center gap-1 text-[10px] text-primary hover:underline">
+                    <Brain className="h-2.5 w-2.5" /> создать
+                  </Link>
+                </div>
+                <Select
+                  value={data.worldModelId ?? ''}
+                  onChange={(e) => data.onChangeWorldModelId(e.target.value || null)}
+                  options={[
+                    { value: '', label: 'Свежая модель (стандартная конфигурация)' },
+                    ...compatibleWorldModels.map((w) => ({
+                      value: w.slug,
+                      label: `${w.name}${w.trained ? ' ✓' : ''}`,
+                    })),
+                  ]}
+                  className="h-7 text-xs"
+                />
+              </div>
             )}
             <div className="border-t border-border pt-2">
               <AlgorithmDiagram

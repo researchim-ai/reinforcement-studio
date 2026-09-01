@@ -15,6 +15,7 @@ from backend import process_manager
 from rl_core.metrics_history import read_history
 from rl_core.netbuilder_store import read_network_snapshot
 from rl_core.paths import RUNS_DIR, run_dir
+from rl_core.world_models.store import read_world_model_snapshot
 
 router = APIRouter()
 
@@ -221,6 +222,36 @@ async def get_run_network(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found")
     snapshot = read_network_snapshot(rdir)
     return snapshot or {"family": None, "spec": None, "source": "unknown"}
+
+
+@router.get("/runs/{run_id}/world_model")
+async def get_run_world_model(run_id: str):
+    """Counterpart to `get_run_network` for World Model runs (standalone
+    `kind: "world_model"` runs, or any of the four world-model algorithms
+    trained with a `world_model_id`) — the exact spec (`world_model.json`,
+    see `rl_core.world_models.store.write_world_model_snapshot`) a run
+    actually used, so the Training Monitor can offer "save/attach this
+    world model" without re-deriving it from `config.json`."""
+    rdir = RUNS_DIR / run_id
+    if not rdir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    snapshot = read_world_model_snapshot(rdir)
+    return snapshot or {"type": None, "config": None, "world_model_id": None}
+
+
+@router.get("/runs/{run_id}/latent_space.png")
+async def run_latent_space_png(run_id: str):
+    """Latest latent-space scatter (`rl_core.world_models.viz.render_latent_scatter`)
+    for a World Model run using a recurrent-latent type (RSSM/VAE+MDN-RNN;
+    the ensemble type has no single latent vector to plot at all) — written
+    periodically alongside `episode_preview.gif` by both
+    `rl_core/world_models/trainer.py` (standalone runs) and `dreamer.py`/
+    `world_models_ha.py` if they ever grow their own preview generation.
+    Always re-fetched (no-cache), same convention as `/preview.gif`."""
+    path = RUNS_DIR / run_id / "latent_space.png"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No latent space preview recorded yet")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/runs/{run_id}/games")

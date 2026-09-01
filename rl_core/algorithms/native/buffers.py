@@ -435,3 +435,73 @@ class NStepPrioritizedReplayBuffer:
         priorities = np.abs(td_errors) + self.eps
         self.priorities[indices] = priorities
         self._max_priority = max(self._max_priority, float(priorities.max()))
+
+
+class JointReplayBuffer:
+    """Fixed-size circular replay buffer for one *team* of QMIX
+    (`rl_core/algorithms/native/qmix.py`) — every entry is a whole team's
+    joint transition for one real environment step: every teammate's
+    observation/action stacked along a `n_agents` axis, plus a single
+    scalar team reward/done (already pooled across teammates by the
+    caller — see `MultiAgentQMIX.learn`). Structurally identical to
+    `ReplayBuffer` above, just with an extra leading `n_agents` axis on
+    `obs`/`next_obs`/`actions`.
+
+    `n_actions` is optional and only ever passed for a mask-aware env
+    (SMAClite via `rl_core/envs/tuple_marl_envs.py` — see its module
+    docstring) — when set, also stores each transition's *next-state*
+    legal-action mask (`(n_agents, n_actions)` bool), so `_train_step` can
+    mask `next_q_all` before Double-DQN action selection/evaluation. Left
+    `None` (no extra array allocated at all) for every other env, since
+    every action is always legal there and the mask would just be a
+    constant `True` wasting memory for nothing."""
+
+    def __init__(self, capacity: int, n_agents: int, obs_shape: tuple[int, ...], n_actions: int | None = None) -> None:
+        self.capacity = capacity
+        self.n_agents = n_agents
+        self.obs = np.zeros((capacity, n_agents, *obs_shape), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, n_agents, *obs_shape), dtype=np.float32)
+        self.actions = np.zeros((capacity, n_agents), dtype=np.int64)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+        self.next_action_mask = (
+            np.ones((capacity, n_agents, n_actions), dtype=np.bool_) if n_actions is not None else None
+        )
+        self._ptr = 0
+        self._size = 0
+
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+        next_action_mask: np.ndarray | None = None,
+    ) -> None:
+        i = self._ptr
+        self.obs[i] = obs
+        self.actions[i] = action
+        self.rewards[i] = reward
+        self.next_obs[i] = next_obs
+        self.dones[i] = float(done)
+        if self.next_action_mask is not None and next_action_mask is not None:
+            self.next_action_mask[i] = next_action_mask
+        self._ptr = (self._ptr + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def __len__(self) -> int:
+        return self._size
+
+    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
+        idx = np.random.randint(0, self._size, size=batch_size)
+        out = {
+            "obs": self.obs[idx],
+            "actions": self.actions[idx],
+            "rewards": self.rewards[idx],
+            "next_obs": self.next_obs[idx],
+            "dones": self.dones[idx],
+        }
+        if self.next_action_mask is not None:
+            out["next_action_mask"] = self.next_action_mask[idx]
+        return out

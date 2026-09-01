@@ -244,3 +244,159 @@ def test_scene_registry_offers_ippo_only_for_multi_team_scenes():
     finally:
         scene_store.delete("pytest_single_team")
         scene_store.delete("pytest_multi_team")
+
+
+# --------------------------------------------------------------------------
+# MARL: QMIX (value decomposition) — see rl_core/algorithms/native/qmix.py.
+# --------------------------------------------------------------------------
+
+
+def test_scene_registry_offers_qmix_for_any_2plus_agent_discrete_scene_ippo_only_for_2plus_teams():
+    from rl_core.envs import registry
+
+    # `default_spec()` is 1 team of 2 agents (VDN/QMIX's own classic
+    # setting — qmix should apply, ippo shouldn't: see qmix.py's module
+    # docstring for why the two differ here). `solo` is a genuine single
+    # agent, where neither multi-agent algorithm makes sense.
+    single_team_multi_agent = scene_store.default_spec()
+    solo = scene_store.default_spec()
+    solo["agents"][0]["count"] = 1
+    multi_team = scene_store.default_team_battle_spec()
+    scene_store.save("pytest_qmix_single_team", single_team_multi_agent)
+    scene_store.save("pytest_qmix_solo", solo)
+    scene_store.save("pytest_qmix_multi_team", multi_team)
+    try:
+        envs = {e["id"]: e for e in registry.list_environments()}
+        single_team_entry = envs[scene_store.scene_env_id("pytest_qmix_single_team")]
+        solo_entry = envs[scene_store.scene_env_id("pytest_qmix_solo")]
+        multi_team_entry = envs[scene_store.scene_env_id("pytest_qmix_multi_team")]
+        assert "qmix" in single_team_entry["compatible_algorithms"]
+        assert "ippo" not in single_team_entry["compatible_algorithms"]
+        assert "qmix" not in solo_entry["compatible_algorithms"]
+        assert "ippo" in multi_team_entry["compatible_algorithms"]
+        assert "qmix" in multi_team_entry["compatible_algorithms"]
+    finally:
+        scene_store.delete("pytest_qmix_single_team")
+        scene_store.delete("pytest_qmix_solo")
+        scene_store.delete("pytest_qmix_multi_team")
+
+
+def test_multi_agent_qmix_works_for_single_team_multi_agent_env():
+    from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS, MultiAgentQMIX
+
+    spec = scene_store.default_spec()  # 1 team, 2 agents — QMIX/VDN's own classic case
+    env = SceneMultiAgentEnv(spec)
+    try:
+        algo = MultiAgentQMIX(env, DEFAULT_HYPERPARAMS, seed=0, device="cpu")
+        assert len(algo.teams) == 1
+    finally:
+        env.close()
+
+
+def test_multi_agent_qmix_requires_2plus_agents():
+    from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS, MultiAgentQMIX
+
+    spec = scene_store.default_spec()
+    spec["agents"][0]["count"] = 1  # genuine single agent
+    env = SceneMultiAgentEnv(spec)
+    try:
+        with pytest.raises(ValueError):
+            MultiAgentQMIX(env, DEFAULT_HYPERPARAMS, seed=0, device="cpu")
+    finally:
+        env.close()
+
+
+def test_multi_agent_qmix_requires_discrete_actions():
+    from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS, MultiAgentQMIX
+
+    spec = scene_store.default_team_battle_spec()
+    spec["agents"][0]["movement"] = {"type": "continuous", "speed": 0.5}
+    spec["agents"][1]["movement"] = {"type": "continuous", "speed": 0.5}
+    env = SceneMultiAgentEnv(spec)
+    try:
+        with pytest.raises(ValueError):
+            MultiAgentQMIX(env, DEFAULT_HYPERPARAMS, seed=0, device="cpu")
+    finally:
+        env.close()
+
+
+def test_multi_agent_qmix_learns_and_saves_roundtrip():
+    from rl_core.algorithms.base import TrainingCallback
+    from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS, MultiAgentQMIX
+
+    spec = scene_store.default_team_battle_spec()
+    env = SceneMultiAgentEnv(spec)
+    hp = {**DEFAULT_HYPERPARAMS, "buffer_size": 200, "batch_size": 8, "learning_starts": 16, "train_freq": 4, "target_update_interval": 20}
+    algo = MultiAgentQMIX(env, hp, seed=0, device="cpu")
+    assert set(algo.teams) == {"red", "blue"}
+
+    steps: list[int] = []
+
+    def writer(num_timesteps, episode_reward=None, episode_length=None, metrics=None):
+        steps.append(num_timesteps)
+        return num_timesteps < 200
+
+    algo.learn(total_timesteps=200, callback=TrainingCallback(writer))
+    assert steps[-1] >= 200
+
+    obs, _ = env.reset(seed=1)
+    action, _ = algo.predict(obs[0], deterministic=True)
+    assert env.single_action_space.contains(action)
+
+    with tempfile.TemporaryDirectory() as d:
+        model_path = Path(d) / "model.zip"
+        algo.save(model_path)
+        loaded = MultiAgentQMIX.load(model_path, env, device="cpu")
+        assert set(loaded.teams) == {"red", "blue"}
+    env.close()
+
+
+def test_qmix_end_to_end_via_native_runner_on_team_battle():
+    from rl_core.algorithms.native_runner import run
+
+    spec = scene_store.default_team_battle_spec()
+    slug = "pytest_qmix_train"
+    scene_store.save(slug, spec)
+    config = {
+        "kind": "gym",
+        "name": "pytest-qmix",
+        "environment": {"id": scene_store.scene_env_id(slug), "wrappers": []},
+        "algorithm": {"id": "qmix", "hyperparams": {"buffer_size": 200, "batch_size": 8, "learning_starts": 16, "train_freq": 4}},
+        "training": {"total_timesteps": 128, "seed": 0},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        run_dir = Path(d)
+        run(config, run_dir)
+        metrics = json.loads((run_dir / "metrics.json").read_text())
+        assert metrics["status"] == "completed"
+        assert metrics["step"] >= 128
+    scene_store.delete(slug)
+
+
+# --------------------------------------------------------------------------
+# New MARL scene templates: Pack Hunt (cooperative pursuit), Team Battle 3x3.
+# --------------------------------------------------------------------------
+
+
+def test_pack_hunt_template_teams_and_ratio():
+    spec = scene_store.default_pack_hunt_spec()
+    assert scene_store.team_count(spec) == 2
+    assert scene_store.agent_count(spec) == 6
+    env = SceneMultiAgentEnv(spec)
+    try:
+        assert env.team_ids.count("hunters") == 4
+        assert env.team_ids.count("runners") == 2
+    finally:
+        env.close()
+
+
+def test_team_battle_large_template_teams_and_ratio():
+    spec = scene_store.default_team_battle_large_spec()
+    assert scene_store.team_count(spec) == 2
+    assert scene_store.agent_count(spec) == 6
+    env = SceneMultiAgentEnv(spec)
+    try:
+        assert env.team_ids.count("red") == 3
+        assert env.team_ids.count("blue") == 3
+    finally:
+        env.close()

@@ -69,6 +69,15 @@ def main() -> None:
             from rl_core.alphazero import train
 
             train.run(config, run_dir)
+        elif kind == "world_model":
+            # Standalone World Model training (no RL agent at all) — see
+            # rl_core/world_models/trainer.py's module docstring. Reuses
+            # the exact same StartRunRequest shape as a Gym run:
+            # `algorithm.id` is a WORLD_MODEL_TYPES entry instead of a real
+            # algorithm, `algorithm.hyperparams` is that type's config.
+            from rl_core.world_models import trainer as world_model_trainer
+
+            world_model_trainer.run(config, run_dir)
         else:
             from rl_core.algorithms import native_runner
 

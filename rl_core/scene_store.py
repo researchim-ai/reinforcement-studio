@@ -305,6 +305,147 @@ def default_team_battle_spec(name: str = "Команда на команду") -
     }
 
 
+def default_pack_hunt_spec(name: str = "Стая против жертв") -> dict[str, Any]:
+    """2 teams, reversed ratio from `default_predator_prey_spec` (4
+    cooperative hunters vs. 2 evasive runners, not 1-vs-3) — a genuinely
+    cooperative-pursuit MARL benchmark (in the spirit of the classic
+    "Pursuit"/"Predator-Prey" multi-agent particle environments): no
+    single hunter can reliably corner a runner alone, so the hunters'
+    `team_shared_reward` (every tag anyone on the team lands counts for
+    the whole pack) is what actually makes coordination pay off — a good
+    fit for `qmix` (rl_core/algorithms/native/qmix.py), whose mixing
+    network is only interesting once a team has several agents to
+    combine. Larger arena + more obstacles than `default_predator_prey_spec`
+    so a lone hunter chasing head-on is rarely the fastest way to a tag."""
+    return {
+        "name": name,
+        "description": "4 хищника (команда hunters, общая награда) кооперативно окружают 2 быстрых жертв (команда runners).",
+        "world": {"width": 30.0, "depth": 30.0, "wall_height": 2.0},
+        "objects": [
+            {
+                "id": "wall_n", "type": "wall", "position": [0.0, 1.0, -15.0], "size": [30.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_s", "type": "wall", "position": [0.0, 1.0, 15.0], "size": [30.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_w", "type": "wall", "position": [-15.0, 1.0, 0.0], "size": [1.0, 2.0, 30.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_e", "type": "wall", "position": [15.0, 1.0, 0.0], "size": [1.0, 2.0, 30.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "pillar_a", "type": "prop", "position": [7.0, 1.0, 5.0], "size": [1.2, 2.0, 1.2],
+                "shape": "cylinder", "material": {"pattern": "stripes", "color": "#c084fc", "color2": "#4c1d95"},
+            },
+            {
+                "id": "pillar_b", "type": "prop", "position": [-7.0, 1.0, -5.0], "size": [1.2, 2.0, 1.2],
+                "shape": "cylinder", "material": {"pattern": "stripes", "color": "#c084fc", "color2": "#4c1d95"},
+            },
+        ],
+        "items": [
+            {
+                "id": f"coin{i}", "type": "reward",
+                "position": [float(x), 0.0, float(z)], "radius": 0.5,
+                "reward": 1.0, "respawn": True, "cooldown_steps": 30, "shape": "crystal",
+                "restrict_team": "runners",
+                "material": {"pattern": "dots", "color": "#22c55e", "color2": "#14532d", "emissive": True},
+            }
+            for i, (x, z) in enumerate([(8, 8), (-8, 8), (8, -8), (-8, -8), (0, 10), (0, -10)])
+        ],
+        "agents": [
+            {
+                "id": "hunters", "count": 4, "team": "hunters", "role": "predator",
+                "spawn": {"center": [0.0, 0.0, 0.0], "radius": 3.0}, "body_radius": 0.45,
+                "movement": {"type": "discrete8", "speed": 0.6}, "sensors": {"type": "nearest_k", "k": 6, "range": 16.0},
+                "shape": "cone", "material": {"pattern": "solid", "color": "#ef4444"},
+            },
+            {
+                "id": "runners", "count": 2, "team": "runners", "role": "prey",
+                "spawn": {"center": [0.0, 0.0, 0.0], "radius": 13.0}, "body_radius": 0.35,
+                "movement": {"type": "discrete8", "speed": 0.75}, "sensors": {"type": "nearest_k", "k": 6, "range": 16.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#3b82f6"},
+            },
+        ],
+        "rules": {
+            "tag": {
+                "enabled": True, "predator_role": "predator", "prey_role": "prey",
+                "predator_reward": 2.0, "prey_reward": -2.0,
+                "prey_terminates": False, "prey_respawns": True,
+            },
+            "team_shared_reward": True,
+        },
+        "episode": {"max_steps": 500},
+    }
+
+
+def default_team_battle_large_spec(name: str = "Командная битва 3×3") -> dict[str, Any]:
+    """Scaled-up `default_team_battle_spec`: 3 agents per side instead of
+    2, on a bigger arena with more coins and a couple of central obstacles
+    to fight over — the extra teammate per side is exactly what makes
+    `qmix`'s mixing network combine something non-trivial (2 Q-values is
+    the minimum useful case, 3 gives it noticeably more to work with)
+    versus `default_team_battle_spec`'s minimal 2-vs-2."""
+    return {
+        "name": name,
+        "description": "3×3 — команда «красные» против команды «синие» на большой арене, общая награда внутри команды.",
+        "world": {"width": 30.0, "depth": 30.0, "wall_height": 2.0},
+        "objects": [
+            {
+                "id": "wall_n", "type": "wall", "position": [0.0, 1.0, -15.0], "size": [30.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_s", "type": "wall", "position": [0.0, 1.0, 15.0], "size": [30.0, 2.0, 1.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_w", "type": "wall", "position": [-15.0, 1.0, 0.0], "size": [1.0, 2.0, 30.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "wall_e", "type": "wall", "position": [15.0, 1.0, 0.0], "size": [1.0, 2.0, 30.0],
+                "shape": "box", "material": {"pattern": "brick", "color": "#9ca3af", "color2": "#4b5563"},
+            },
+            {
+                "id": "pillar_mid", "type": "prop", "position": [0.0, 1.0, 0.0], "size": [1.5, 2.0, 1.5],
+                "shape": "cylinder", "material": {"pattern": "stripes", "color": "#c084fc", "color2": "#4c1d95"},
+            },
+        ],
+        "items": [
+            {
+                "id": f"coin{i}", "type": "reward",
+                "position": [float(x), 0.0, float(z)], "radius": 0.5,
+                "reward": 1.0, "respawn": True, "cooldown_steps": 20, "shape": "crystal",
+                "material": {"pattern": "dots", "color": "#eab308", "color2": "#713f12", "emissive": True},
+            }
+            for i, (x, z) in enumerate([
+                (0, 0), (6, 0), (-6, 0), (0, 6), (0, -6), (6, 6), (-6, -6), (6, -6), (-6, 6), (0, 11), (0, -11),
+            ])
+        ],
+        "agents": [
+            {
+                "id": "red", "count": 3, "team": "red", "role": "agent",
+                "spawn": {"center": [-10.0, 0.0, 0.0], "radius": 3.5}, "body_radius": 0.4,
+                "movement": {"type": "discrete8", "speed": 0.55}, "sensors": {"type": "nearest_k", "k": 6, "range": 16.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#ef4444"},
+            },
+            {
+                "id": "blue", "count": 3, "team": "blue", "role": "agent",
+                "spawn": {"center": [10.0, 0.0, 0.0], "radius": 3.5}, "body_radius": 0.4,
+                "movement": {"type": "discrete8", "speed": 0.55}, "sensors": {"type": "nearest_k", "k": 6, "range": 16.0},
+                "shape": "capsule", "material": {"pattern": "solid", "color": "#3b82f6"},
+            },
+        ],
+        "rules": {"team_shared_reward": True},
+        "episode": {"max_steps": 500},
+    }
+
+
 def validate_slug(slug: str) -> None:
     if not _SLUG_RE.match(slug):
         raise ValueError(

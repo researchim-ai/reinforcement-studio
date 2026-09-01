@@ -17,11 +17,27 @@ vi.mock('@/api/client', () => ({
           id: 'Pendulum-v1', name: 'Pendulum', category: 'classic_control', description: 'pendulum desc',
           action_kind: 'continuous', compatible_algorithms: ['ppo'], kind: 'gym', available: true,
         },
+        // A stand-in for a `petting:`/`scene:` multi-team env — same
+        // `compatible_algorithms` ordering the real registry produces
+        // (base single-policy algos first, `ippo`/`qmix` appended last;
+        // see `list_environments()` in rl_core/envs/registry.py), so the
+        // Designer can't just default to `compatibleAlgorithms[0]`.
+        {
+          id: 'petting:simple_tag', name: 'MPE: Simple Tag', category: 'marl', description: 'tag desc',
+          action_kind: 'discrete', compatible_algorithms: ['dqn', 'ppo', 'a2c', 'ippo', 'qmix'], kind: 'gym',
+          available: true, scene_team_count: 2, scene_agent_count: 5,
+        },
       ],
     }),
     listWrappers: async () => ({ wrappers: [] }),
     listAlgorithms: async () => ({
-      algorithms: [{ id: 'ppo', name: 'PPO', kind: 'gym', description: '', hyperparams: [] }],
+      algorithms: [
+        { id: 'ppo', name: 'PPO', kind: 'gym', description: '', hyperparams: [] },
+        { id: 'dqn', name: 'DQN', kind: 'gym', description: '', hyperparams: [] },
+        { id: 'a2c', name: 'A2C', kind: 'gym', description: '', hyperparams: [] },
+        { id: 'ippo', name: 'IPPO', kind: 'gym', description: '', hyperparams: [] },
+        { id: 'qmix', name: 'QMIX', kind: 'gym', description: '', hyperparams: [] },
+      ],
     }),
     resolveUrl: async (p: string) => p,
   },
@@ -117,6 +133,20 @@ describe('Environments -> ExperimentDesigner env handoff', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Использовать в дизайнере' })[1])
     await waitFor(() => {
       expect((document.querySelector('select') as HTMLSelectElement).value).toBe('Pendulum-v1')
+    })
+  })
+
+  it('defaults to ippo (not dqn/ppo) when picking a multi-team MARL env', async () => {
+    render(<Harness />)
+
+    await waitFor(() => expect(screen.getAllByText('MPE: Simple Tag').length).toBeGreaterThan(0))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Использовать в дизайнере' })[2])
+
+    await waitFor(() => {
+      const selects = Array.from(document.querySelectorAll('select'))
+      const algoSelect = selects.find((s) => Array.from(s.options).some((o) => o.value === 'ippo'))
+      expect(algoSelect).toBeTruthy()
+      expect(algoSelect!.value).toBe('ippo')
     })
   })
 })

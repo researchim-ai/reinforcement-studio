@@ -26,6 +26,11 @@ import type {
   SweepSummary,
   SystemInfo,
   ValidateResult,
+  WorldModelDoc,
+  WorldModelMeta,
+  WorldModelSnapshot,
+  WorldModelStartRequest,
+  WorldModelTypeInfo,
   WrapperNode,
   WrapperSpec,
 } from './types'
@@ -96,7 +101,7 @@ export const api = {
     return `${base}${path.startsWith('/') ? path : `/${path}`}`
   },
 
-  startRun: (config: ExperimentConfig) =>
+  startRun: (config: ExperimentConfig | WorldModelStartRequest) =>
     request<{ run_id: string }>('/training/start', { method: 'POST', body: JSON.stringify(config) }),
   stopRun: (runId: string) => request<{ success: boolean }>(`/training/stop/${runId}`, { method: 'POST' }),
   listRuns: () => request<{ runs: RunSummary[] }>('/training/runs'),
@@ -109,6 +114,7 @@ export const api = {
   getMetricsHistory: (runId: string) =>
     request<{ history: import('./types').MetricsSnapshot[] }>(`/training/runs/${runId}/metrics_history`),
   getRunNetwork: (runId: string) => request<NetworkSnapshot>(`/training/runs/${runId}/network`),
+  getRunWorldModel: (runId: string) => request<WorldModelSnapshot>(`/training/runs/${runId}/world_model`),
   getRunConfig: (runId: string) => request<ExperimentConfig>(`/training/runs/${runId}/config`),
   listSelfPlayIterations: (runId: string) =>
     request<{ iterations: string[] }>(`/training/runs/${runId}/games`),
@@ -183,6 +189,15 @@ export const api = {
   deleteNetwork: (slug: string) => request<{ success: boolean }>(`/networks/${slug}`, { method: 'DELETE' }),
   previewNetwork: (payload: NetworkPreviewRequest) =>
     request<NetworkPreviewResult>('/networks/preview', { method: 'POST', body: JSON.stringify(payload) }),
+
+  listWorldModelTypes: () => request<{ types: WorldModelTypeInfo[] }>('/world-models/types'),
+  listWorldModels: () => request<{ world_models: WorldModelMeta[] }>('/world-models'),
+  getWorldModel: (slug: string) => request<{ slug: string } & WorldModelDoc>(`/world-models/${slug}`),
+  saveWorldModel: (slug: string, doc: WorldModelDoc) =>
+    request<{ success: boolean }>(`/world-models/${slug}`, { method: 'PUT', body: JSON.stringify(doc) }),
+  deleteWorldModel: (slug: string) => request<{ success: boolean }>(`/world-models/${slug}`, { method: 'DELETE' }),
+  attachWorldModelCheckpoint: (slug: string, runId: string) =>
+    request<{ success: boolean }>(`/world-models/${slug}/attach`, { method: 'POST', body: JSON.stringify({ run_id: runId }) }),
 
   listScenes: () => request<{ scenes: SceneMeta[] }>('/scenes'),
   getDefaultScene: (template?: string) =>

@@ -36,10 +36,22 @@ CUSTOM_NETWORKS_DIR = ROOT / "custom_networks"
 # JSON specs compiled into a `SceneMultiAgentEnv` at train time by
 # rl_core/envs/scene_env.py (not code plugins).
 CUSTOM_SCENES_DIR = ROOT / "custom_scenes"
+# Saved World Model specs from the World Model Builder page
+# (/world-models) — a JSON spec (type + hyperparams) plus, once trained
+# (standalone via `kind: "world_model"` runs, or attached from a finished
+# run's checkpoint), a `<slug>/model.pt` weights file living right next to
+# it. See rl_core/world_models/store.py. Named `custom_world_models`
+# (not `world_models`, unlike every other `CUSTOM_*_DIR` here using its
+# bare feature name) specifically to avoid colliding with the
+# `rl_core/world_models/` *code* package sitting right next to `paths.py`
+# — `ROOT` already equals `PACKAGE_DIR` by default, so `ROOT / "world_models"`
+# would otherwise resolve to that package's own on-disk directory and start
+# writing run data straight into it.
+CUSTOM_WORLD_MODELS_DIR = ROOT / "custom_world_models"
 
 for _d in (
     RUNS_DIR, CHECKPOINTS_DIR, CUSTOM_GYM_ALGOS_DIR, CUSTOM_ALPHAZERO_ALGOS_DIR, CUSTOM_REWARDS_DIR,
-    CUSTOM_NETWORKS_DIR, CUSTOM_SCENES_DIR,
+    CUSTOM_NETWORKS_DIR, CUSTOM_SCENES_DIR, CUSTOM_WORLD_MODELS_DIR,
 ):
     _d.mkdir(parents=True, exist_ok=True)
 

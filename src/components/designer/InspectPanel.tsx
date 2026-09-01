@@ -10,6 +10,7 @@ export interface InspectPanelProps {
   data: InspectResult | undefined
   isFetching: boolean
   sceneAgentCount?: number | null
+  sceneTeamCount?: number | null
 }
 
 /** Live, read-only preview docked over the Designer canvas — shows the
@@ -24,7 +25,7 @@ export interface InspectPanelProps {
  * dozens of times a second when its own props haven't actually changed.
  * That repeated repaint of a blurred, elevated card is what read as a
  * strong flicker while dragging. */
-export const InspectPanel = memo(function InspectPanel({ data, isFetching, sceneAgentCount }: InspectPanelProps) {
+export const InspectPanel = memo(function InspectPanel({ data, isFetching, sceneAgentCount, sceneTeamCount }: InspectPanelProps) {
   const env = data?.environment
   const net = data?.network
   const obsChangedByWrappers =
@@ -47,8 +48,16 @@ export const InspectPanel = memo(function InspectPanel({ data, isFetching, scene
             <>
               {sceneAgentCount != null && sceneAgentCount > 0 && (
                 <p className="rounded-md bg-primary/10 px-2 py-1 text-[10px] text-primary">
-                  3D-сцена: {sceneAgentCount} агент(ов) в одном мире, общая политика (parameter sharing).
+                  Общий мир: {sceneAgentCount} агент(ов) в одном мире, общая политика (parameter sharing).
                   Поле num_envs в узле обучения игнорируется.
+                  {sceneTeamCount != null && (
+                    sceneTeamCount >= 2
+                      ? ` Команд: ${sceneTeamCount} — доступны IPPO (под несколько команд) и, для дискретных `
+                        + 'действий, QMIX.'
+                      : ' Команда одна — IPPO не показывается (нужно 2+ команды), но QMIX доступен и для одной '
+                        + 'команды из 2+ агентов (это его собственный классический случай — общий Q, '
+                        + 'разложенный по агентам). Для непрерывных действий — только обычные PPO/DQN/...'
+                  )}
                 </p>
               )}
               <div className="flex items-baseline justify-between gap-2">

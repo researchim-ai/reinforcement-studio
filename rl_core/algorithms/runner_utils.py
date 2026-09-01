@@ -19,11 +19,12 @@ from rl_core.algorithms.resume import resolve_resume_source
 from rl_core.algorithms.sb3_runner import _make_env, _space_info, make_monitored_env_factory
 from rl_core.algorithms.vec_env import action_space, is_vector_env, make_env_or_vec, num_envs_of, obs_space
 from rl_core.device import resolve_device
-from rl_core.envs.factory import make_training_env
+from rl_core.envs.factory import is_shared_world_env_id, make_training_env
 from rl_core import scene_store
 from rl_core.inspect import _count_params, _describe_layers, _find_torch_module
 from rl_core.metrics_history import append_history, json_safe
 from rl_core.netbuilder_store import resolve_network_spec, write_network_snapshot
+from rl_core.world_models import store as wm_store
 
 _WRITE_EVERY_STEPS = 500
 _RENDER_EVERY_STEPS = 2000
@@ -59,10 +60,11 @@ def run_custom_algorithm(
     seed = training_cfg.get("seed")
     device = resolve_device(training_cfg)
     num_envs = max(1, int(training_cfg.get("num_envs", 1) or 1))
-    is_scene = scene_store.is_scene_env_id(env_id)
+    is_scene = is_shared_world_env_id(env_id)
 
     if is_scene:
-        # One shared world — lane count comes from the scene spec, not
+        # One shared world — lane count comes from the scene spec (or, for
+        # a `petting:` benchmark, the env's own fixed agent count), not
         # `training.num_envs` (which would mean independent copies elsewhere).
         train_env = make_training_env(env_id, wrapper_specs)
         num_envs = num_envs_of(train_env)
@@ -84,6 +86,17 @@ def run_custom_algorithm(
     network_spec = resolve_network_spec(config)
     construct_hyperparams = {**hyperparams, "network_spec": network_spec} if network_spec else hyperparams
 
+    # `world_model_spec` — same "resolve once, merge into construct-time
+    # hyperparams only" convention as `network_spec` just above, for any of
+    # the four algorithms (dreamer/mbpo/pets/world_models_ha, see
+    # `rl_core/algorithms/native_runner.py::WORLD_MODEL_TYPE_FOR_ALGO`) that
+    # can be pointed at a saved World Model via `algorithm.world_model_id`
+    # (or an inline `algorithm.world_model_spec`) instead of always building
+    # a fresh, untrained one of their own default architecture.
+    world_model_spec = wm_store.resolve_world_model_spec(config)
+    if world_model_spec:
+        construct_hyperparams = {**construct_hyperparams, "world_model_spec": world_model_spec}
+
     # `training.resume_from` — fine-tune/continue-training from a previous
     # run's or Model Zoo checkpoint's weights instead of a fresh network
     # (see rl_core/algorithms/resume.py). The loaded algorithm keeps *its
@@ -100,10 +113,12 @@ def run_custom_algorithm(
         load_accepts_device = "device" in inspect.signature(cls.load).parameters
         algo = cls.load(model_path, train_env, device=device) if load_accepts_device else cls.load(model_path, train_env)
         network_spec = algo.hyperparams.get("network_spec")
-        hyperparams = {k: v for k, v in algo.hyperparams.items() if k != "network_spec"}
+        world_model_spec = algo.hyperparams.get("world_model_spec")
+        hyperparams = {k: v for k, v in algo.hyperparams.items() if k not in ("network_spec", "world_model_spec")}
     else:
         algo = cls(train_env, construct_hyperparams, seed, device)
     write_network_snapshot(run_dir, config, network_spec)
+    wm_store.write_world_model_snapshot(run_dir, world_model_spec)
 
     # Memory-enabled (LSTM/GRU) algorithms need to know when a live-preview
     # rollout starts over so they reset hidden state instead of carrying
@@ -259,6 +274,25 @@ def run_custom_algorithm(
             status = "stopped"
     finally:
         algo.save(run_dir / "model.zip")
+        # If this run trained one of the four world-model algorithms
+        # against a *saved* World Model (`world_model_spec["slug"]` set —
+        # an inline one has none to attach to), copy the world model's own
+        # trained weights (not the whole algorithm checkpoint above, which
+        # also has an actor/critic/controller bolted on) back into
+        # `CUSTOM_WORLD_MODELS_DIR`, mirroring what `world_models/trainer.py`
+        # does for standalone `kind: "world_model"` runs. `save_world_model_
+        # checkpoint` is a duck-typed extra method, not part of the
+        # `CustomAlgorithm` contract itself — every plain SAC/PPO/... plugin
+        # (and any world-model algorithm run without a `world_model_id`
+        # at all) simply doesn't have it.
+        save_world_model = getattr(algo, "save_world_model_checkpoint", None)
+        if world_model_spec and world_model_spec.get("slug") and save_world_model is not None:
+            try:
+                wm_checkpoint_path = run_dir / "world_model.pt"
+                save_world_model(wm_checkpoint_path)
+                wm_store.attach_checkpoint(world_model_spec["slug"], wm_checkpoint_path, source_run_id=run_dir.name)
+            except Exception:  # noqa: BLE001 - a broken attach must never fail an otherwise-successful run
+                pass
         train_env.close()
 
     write_snapshot(state["step"], status)

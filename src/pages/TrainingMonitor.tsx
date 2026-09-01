@@ -4,14 +4,14 @@ import { toast } from 'sonner'
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis,
 } from 'recharts'
-import { Loader2, Square, Trash2, Save, FileText, Network, GitCompare, Sparkles, PlayCircle, X } from 'lucide-react'
+import { Loader2, Square, Trash2, Save, FileText, Network, GitCompare, Sparkles, PlayCircle, X, Brain } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { useRuns, useRunNetwork } from '@/api/hooks'
+import { useRuns, useRunNetwork, useRunWorldModel } from '@/api/hooks'
 import { api, createMetricsWebSocket } from '@/api/client'
 import { AlgorithmDiagram, type AlgorithmDiagramNetwork } from '@/components/AlgorithmDiagram'
 import { SaveArchitectureDialog } from '@/components/networkbuilder/SaveArchitectureDialog'
@@ -21,6 +21,7 @@ import { EvaluateDialog } from '@/components/models/EvaluateDialog'
 import type { MetricsSnapshot, SpaceInfo } from '@/api/types'
 import { cn, formatDuration } from '@/lib/utils'
 import { spaceSize } from '@/lib/spaceInfo'
+import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
 
 const STATUS_VARIANT: Record<string, 'success' | 'secondary' | 'destructive' | 'outline'> = {
   running: 'success',
@@ -82,6 +83,51 @@ const LOSS_FIELDS_BY_ALGO: Record<string, LossField[]> = {
     { key: 'policy_loss', label: 'Policy loss', color: 'oklch(0.7 0.15 260)' },
     { key: 'value_loss', label: 'Value loss', color: 'oklch(0.72 0.16 145)' },
   ],
+  // World Models (rl_core/world_models/) — both the three standalone
+  // `kind: "world_model"` types (algorithm_id is the type itself, e.g.
+  // "rssm") and the four algorithms built on top of them.
+  rssm: [
+    { key: 'recon_loss', label: 'Reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'kl_loss', label: 'KL loss', color: 'oklch(0.72 0.16 145)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 55)' },
+    { key: 'continue_loss', label: 'Continue loss', color: 'oklch(0.72 0.16 30)' },
+  ],
+  dreamer: [
+    { key: 'recon_loss', label: 'Reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'kl_loss', label: 'KL loss', color: 'oklch(0.72 0.16 145)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 55)' },
+    { key: 'continue_loss', label: 'Continue loss', color: 'oklch(0.72 0.16 30)' },
+    { key: 'actor_loss', label: 'Actor loss (в воображении)', color: 'oklch(0.65 0.2 300)' },
+    { key: 'critic_loss', label: 'Critic loss (в воображении)', color: 'oklch(0.65 0.2 20)' },
+  ],
+  ensemble: [
+    { key: 'dynamics_loss', label: 'Dynamics loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 55)' },
+  ],
+  mbpo: [
+    { key: 'dynamics_loss', label: 'Dynamics loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 55)' },
+    { key: 'actor_loss', label: 'Actor loss (SAC)', color: 'oklch(0.65 0.2 300)' },
+    { key: 'critic_loss', label: 'Critic loss (SAC)', color: 'oklch(0.65 0.2 20)' },
+  ],
+  pets: [
+    { key: 'dynamics_loss', label: 'Dynamics loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 55)' },
+  ],
+  vae_mdnrnn: [
+    { key: 'vae_recon_loss', label: 'VAE reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'vae_kl_loss', label: 'VAE KL loss', color: 'oklch(0.72 0.16 145)' },
+    { key: 'mdn_loss', label: 'MDN-RNN loss', color: 'oklch(0.72 0.16 55)' },
+    { key: 'reward_loss', label: 'Reward loss', color: 'oklch(0.72 0.16 30)' },
+    { key: 'continue_loss', label: 'Continue loss', color: 'oklch(0.65 0.2 20)' },
+  ],
+  world_models_ha: [
+    { key: 'vae_recon_loss', label: 'VAE reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+    { key: 'vae_kl_loss', label: 'VAE KL loss', color: 'oklch(0.72 0.16 145)' },
+    { key: 'mdn_loss', label: 'MDN-RNN loss', color: 'oklch(0.72 0.16 55)' },
+    { key: 'es_mean_fitness', label: 'ES: mean fitness (контроллер)', color: 'oklch(0.65 0.2 300)' },
+    { key: 'es_best_fitness', label: 'ES: best fitness (контроллер)', color: 'oklch(0.65 0.2 20)' },
+  ],
 }
 
 // Fallback for custom/plugin algorithms the app doesn't recognize by id —
@@ -97,6 +143,13 @@ const ALL_LOSS_FIELDS: LossField[] = [
   { key: 'rnd_predictor_loss', label: 'RND predictor loss', color: 'oklch(0.72 0.16 30)' },
   { key: 'loss', label: 'Loss', color: 'oklch(0.7 0.15 260)' },
   { key: 'entropy_loss', label: 'Entropy loss', color: 'oklch(0.72 0.16 55)' },
+  { key: 'recon_loss', label: 'Reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+  { key: 'kl_loss', label: 'KL loss', color: 'oklch(0.72 0.16 145)' },
+  { key: 'continue_loss', label: 'Continue loss', color: 'oklch(0.72 0.16 30)' },
+  { key: 'dynamics_loss', label: 'Dynamics loss', color: 'oklch(0.7 0.15 260)' },
+  { key: 'vae_recon_loss', label: 'VAE reconstruction loss', color: 'oklch(0.7 0.15 260)' },
+  { key: 'vae_kl_loss', label: 'VAE KL loss', color: 'oklch(0.72 0.16 145)' },
+  { key: 'mdn_loss', label: 'MDN-RNN loss', color: 'oklch(0.72 0.16 55)' },
 ]
 
 export function TrainingMonitor() {
@@ -133,6 +186,7 @@ export function TrainingMonitor() {
   const selectedRun = runs.find((r) => r.run_id === selectedRunId)
   const { data: runNetwork } = useRunNetwork(selectedRunId)
   const canSaveArchitecture = !!runNetwork?.family && !!runNetwork?.spec
+  const { data: runWorldModel } = useRunWorldModel(selectedRunId)
 
   useEffect(() => {
     if (!selectedRunId) return
@@ -234,6 +288,12 @@ export function TrainingMonitor() {
 
   const latest = chartData[chartData.length - 1] ?? (selectedRun?.metrics as MetricsSnapshot | undefined)
   const isAlphaZero = latest?.kind === 'alphazero' || selectedRun?.kind === 'alphazero'
+  // A standalone World Model run (rl_core/world_models/trainer.py) —
+  // "collects experience, fits a model", never an agent at all, so
+  // evaluate/resume (both meant for a real policy) don't apply the way
+  // they do for `dreamer`/`mbpo`/`pets`/`world_models_ha` (plain `kind: "gym"`
+  // runs, unaffected here).
+  const isWorldModel = latest?.kind === 'world_model' || selectedRun?.kind === 'world_model'
 
   // The backend only records a fresh episode/game every couple thousand
   // steps (rendering + encoding is expensive) — most metrics snapshots
@@ -278,6 +338,28 @@ export function TrainingMonitor() {
     })
     return () => { cancelled = true }
   }, [lastGif, lastGifFile, lastGifStep, selectedRunId])
+
+  // Latent-space scatter (rl_core/world_models/viz.py::render_latent_scatter)
+  // — only produced for the two World Model types with an actual single
+  // latent vector (RSSM/VAE+MDN-RNN; the Ensemble type has no shared latent
+  // to plot). Written alongside `episode_preview.gif` on the same cadence
+  // (`_PREVIEW_EVERY_STEPS` in trainer.py), so `lastGifStep` doubles as its
+  // cache-busting key too — no separate metric field needed.
+  const hasLatentSpace = runWorldModel?.type === 'rssm' || runWorldModel?.type === 'vae_mdnrnn'
+  const [latentUrl, setLatentUrl] = useState<string | null>(null)
+  const [latentMissing, setLatentMissing] = useState(false)
+  useEffect(() => {
+    if (!hasLatentSpace || !selectedRunId) {
+      setLatentUrl(null)
+      return
+    }
+    let cancelled = false
+    setLatentMissing(false)
+    api.resolveUrl(`/training/runs/${selectedRunId}/latent_space.png?t=${lastGifStep ?? 0}`).then((url) => {
+      if (!cancelled) setLatentUrl(url)
+    })
+    return () => { cancelled = true }
+  }, [hasLatentSpace, selectedRunId, lastGifStep])
 
   // Only chart a loss field if it actually shows up somewhere in this run's
   // history — e.g. `rnd_predictor_loss` only exists when RND intrinsic
@@ -440,7 +522,7 @@ export function TrainingMonitor() {
                     <Square className="h-3.5 w-3.5" /> Остановить
                   </Button>
                 )}
-                {selectedRun.has_model && !isAlphaZero && (
+                {selectedRun.has_model && !isAlphaZero && !isWorldModel && (
                   <Button variant="outline" size="sm" onClick={() => setEvaluateOpen(true)}>
                     <PlayCircle className="h-3.5 w-3.5" /> Оценить
                   </Button>
@@ -450,7 +532,7 @@ export function TrainingMonitor() {
                     <Sparkles className="h-3.5 w-3.5" /> Дообучить
                   </Button>
                 )}
-                {selectedRun.has_model && (
+                {selectedRun.has_model && !isWorldModel && (
                   <Button variant="outline" size="sm" onClick={() => setPromoteOpen(true)}>
                     <Save className="h-3.5 w-3.5" /> Сохранить в Model Zoo
                   </Button>
@@ -470,6 +552,11 @@ export function TrainingMonitor() {
                   <StatCard label="Win-rate vs prev" value={latest?.win_rate_vs_prev != null ? `${(latest.win_rate_vs_prev * 100).toFixed(0)}%` : '—'} />
                   <StatCard label="Loss" value={latest?.loss?.toFixed(3) ?? '—'} />
                   <StatCard label="Buffer" value={String(latest?.buffer_size ?? '—')} />
+                </>
+              ) : isWorldModel ? (
+                <>
+                  <StatCard label="Награда сбора данных" value={latest?.collect_mean_reward?.toFixed(1) ?? '—'} />
+                  <StatCard label="FPS" value={String(latest?.fps ?? '—')} />
                 </>
               ) : (
                 <>
@@ -509,8 +596,10 @@ export function TrainingMonitor() {
                   <p className="text-xs text-muted-foreground">
                     {isAlphaZero
                       ? 'Самая свежая self-play партия: проигрывается один раз и остаётся на финальной позиции до следующей итерации.'
-                      : 'Самый свежий записанный эпизод: проигрывается один раз и остаётся на финальном кадре до следующей записи.'}
-                    {!isAlphaZero && (
+                      : isWorldModel
+                        ? 'Слева — настоящая траектория из среды, справа — та же самая последовательность действий, "воображённая" (предсказанная) моделью мира.'
+                        : 'Самый свежий записанный эпизод: проигрывается один раз и остаётся на финальном кадре до следующей записи.'}
+                    {!isAlphaZero && !isWorldModel && (
                       <> Также сохраняется в <span className="font-mono">episode_preview.gif</span> и{' '}
                       <span className="font-mono">previews/</span> в папке запуска.</>
                     )}
@@ -532,19 +621,59 @@ export function TrainingMonitor() {
               </Card>
             )}
 
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Схема алгоритма</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <AlgorithmDiagram
-                  algorithmId={selectedRun.algorithm_id}
-                  kind={latest?.kind ?? selectedRun.kind}
-                  hyperparams={latest?.hyperparams}
-                  network={buildDiagramNetwork(latest)}
-                />
-              </CardContent>
-            </Card>
+            {runWorldModel?.type && (
+              <Card>
+                <CardHeader className="flex-row items-center justify-between space-y-0">
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <Brain className="h-4 w-4 text-primary" /> World Model: {WORLD_MODEL_TYPE_LABELS[runWorldModel.type]}
+                  </CardTitle>
+                  {runWorldModel.world_model_id && (
+                    <Button variant="outline" size="sm" onClick={() => navigate('/world-models')}>
+                      <Network className="h-3.5 w-3.5" /> {runWorldModel.world_model_id}
+                    </Button>
+                  )}
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {runWorldModel.config && Object.keys(runWorldModel.config).length > 0 && (
+                    <KeyValueGrid entries={Object.entries(runWorldModel.config)} />
+                  )}
+                  {hasLatentSpace && (
+                    <div className="space-y-1">
+                      <p className="text-xs text-muted-foreground">
+                        Латентное пространство модели (PCA-проекция, цвет = шаг во времени внутри эпизода):
+                      </p>
+                      {latentUrl && !latentMissing ? (
+                        <img
+                          key={latentUrl}
+                          src={latentUrl}
+                          alt="latent space scatter"
+                          className="max-h-64 rounded-lg border border-border"
+                          onError={() => setLatentMissing(true)}
+                        />
+                      ) : (
+                        <p className="text-xs text-muted-foreground">Пока нет ни одного снимка латентного пространства.</p>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {!isWorldModel && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Схема алгоритма</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <AlgorithmDiagram
+                    algorithmId={selectedRun.algorithm_id}
+                    kind={isAlphaZero ? 'alphazero' : 'gym'}
+                    hyperparams={latest?.hyperparams}
+                    network={buildDiagramNetwork(latest)}
+                  />
+                </CardContent>
+              </Card>
+            )}
 
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               {latest?.hyperparams && Object.keys(latest.hyperparams).length > 0 && (

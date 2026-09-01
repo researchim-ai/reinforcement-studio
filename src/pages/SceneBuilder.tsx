@@ -389,8 +389,10 @@ function AgentsInspector({ spec, onChangeSpec }: { spec: SceneSpec; onChangeSpec
       </div>
       {isMarl && (
         <p className="rounded-md bg-indigo-500/10 p-2 text-[11px] leading-relaxed text-indigo-300">
-          2+ команды с разными <code>team</code> → в Дизайнере эксперимента становится доступен алгоритм
-          <b> Multi-Agent PPO (IPPO)</b> — своя политика на команду.
+          2+ команды с разными <code>team</code> → в Дизайнере эксперимента становятся доступны алгоритмы
+          <b> Multi-Agent PPO (IPPO)</b> (своя policy-gradient политика на команду) и, для дискретного
+          движения, <b>QMIX</b> (общий Q_tot команды через монотонную mixing-сеть — сильнее при
+          <code> team_shared_reward</code> и нескольких агентах в команде).
         </p>
       )}
       {spec.agents.map((group, idx) => (
@@ -606,8 +608,10 @@ export function SceneBuilder() {
           onChange={(e) => { if (e.target.value) loadTemplate(e.target.value) }}
         >
           <option value="">Шаблон MARL…</option>
-          <option value="predator_prey">Хищник и жертва</option>
-          <option value="team_battle">Команда на команду</option>
+          <option value="predator_prey">Хищник и жертва (1×3)</option>
+          <option value="team_battle">Команда на команду (2×2)</option>
+          <option value="pack_hunt">Стая против жертв (4×2)</option>
+          <option value="team_battle_large">Командная битва (3×3)</option>
         </select>
         <span className="ml-auto text-xs text-muted-foreground">{agentCount} агент(ов) · id: scene:{slugify(slug)}</span>
       </div>

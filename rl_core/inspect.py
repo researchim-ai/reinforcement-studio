@@ -93,13 +93,12 @@ def _io_shapes(observation_space: Any, action_space: Any) -> dict[str, Any]:
 def inspect_gym(env_id: str, wrapper_specs: list[dict], algo_id: str, hyperparams: dict[str, Any]) -> dict[str, Any]:
     import gymnasium as gym
 
-    from rl_core import scene_store
     from rl_core.algorithms.sb3_runner import _make_env, _space_info
     from rl_core.algorithms.vec_env import action_space as single_action_space, obs_space
-    from rl_core.envs.factory import make_inspect_env
+    from rl_core.envs.factory import is_shared_world_env_id, make_inspect_env
 
     try:
-        if scene_store.is_scene_env_id(env_id):
+        if is_shared_world_env_id(env_id):
             raw_env = make_inspect_env(env_id, wrapper_specs)
             raw_observation_space = _space_info(obs_space(raw_env))
             raw_action_space = _space_info(single_action_space(raw_env))

@@ -21,6 +21,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   industrial: 'Industrial (планирование/логистика)',
   trading: 'Trading (позиции и портфели)',
   pomdp: 'POMDP (нужна память)',
+  marl: 'MARL (PettingZoo, RWARE, LBForaging, SMAC(lite) — готовые бенчмарки)',
   board_game: 'Настольная игра',
 }
 
@@ -33,11 +34,20 @@ const EXTRA_HINT: Record<string, string> = {
   nle: 'pip install nle (только Linux, готовые wheel-ы)',
   minihack: 'pip install minihack (только Linux, готовые wheel-ы)',
   gymnasium_robotics: 'pip install gymnasium-robotics',
+  pettingzoo: 'pip install "pettingzoo[butterfly]" mpe2',
+  'rware/lbforaging': 'pip install rware lbforaging',
+  // Two steps, in this order — smaclite's own setup.py hard-pins
+  // `Rtree==1.0.0`, which has no prebuilt wheel past Python 3.10 (only a
+  // source dist, which then needs a system `libspatialindex` at import
+  // time); installing a newer Rtree first and then smaclite with
+  // `--no-deps` keeps the already-installed wheel instead of pip's
+  // resolver downgrading it back to the source-only pin.
+  smaclite: 'pip install "Rtree>=1.2" && pip install --no-deps "smaclite @ git+https://github.com/uoe-agents/smaclite.git"',
 }
 
 const CATEGORY_ORDER = [
   'classic_control', 'toy_text', 'box2d', 'mujoco', 'atari', 'minigrid', 'highway_env', 'nethack', 'robotics',
-  'industrial', 'trading', 'pomdp', 'board_game',
+  'industrial', 'trading', 'pomdp', 'marl', 'board_game',
 ]
 
 function EnvPreview({ env }: { env: EnvSpec }) {
@@ -157,7 +167,8 @@ export function Environments() {
       <div className="space-y-1">
         <h2 className="text-2xl font-semibold">Галерея сред</h2>
         <p className="text-sm text-muted-foreground">
-          {environments.length} сред: Classic Control, Toy Text, Box2D, MuJoCo, Atari и настольные игры для AlphaZero.
+          {environments.length} сред: Classic Control, Toy Text, Box2D, MuJoCo, Atari, готовые многоагентные
+          бенчмарки PettingZoo/RWARE/LBForaging/SMAC(lite) и настольные игры для AlphaZero.
           Картинки — официальные демо из репозитория Farama Foundation.
         </p>
       </div>

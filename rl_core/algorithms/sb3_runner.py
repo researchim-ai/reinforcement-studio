@@ -15,8 +15,7 @@ from rl_core.algorithms.metrics_callback import MetricsCallback
 from rl_core.algorithms.resume import resolve_resume_source
 from rl_core.device import resolve_device
 from rl_core.envs.wrappers import apply_wrappers
-from rl_core import scene_store
-from rl_core.envs.factory import make_training_env
+from rl_core.envs.factory import is_shared_world_env_id, make_training_env
 from rl_core.inspect import _describe_layers
 
 try:
@@ -96,7 +95,7 @@ def make_monitored_env_factory(env_id: str, wrapper_specs: list[dict] | None = N
 
 
 def _make_env(env_id: str, wrapper_specs: list[dict], render: bool = False) -> gym.Env:
-    if scene_store.is_scene_env_id(env_id):
+    if is_shared_world_env_id(env_id):
         return make_training_env(env_id, wrapper_specs, render=render)
     env = gym.make(env_id, render_mode="rgb_array" if render else None)
     env = apply_wrappers(env, wrapper_specs)

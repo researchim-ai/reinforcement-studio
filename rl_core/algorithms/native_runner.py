@@ -15,19 +15,31 @@ from rl_core.algorithms.native.ddpg import DEFAULT_HYPERPARAMS as DDPG_DEFAULTS
 from rl_core.algorithms.native.ddpg import NativeDDPG
 from rl_core.algorithms.native.dqn import DEFAULT_HYPERPARAMS as DQN_DEFAULTS
 from rl_core.algorithms.native.dqn import NativeDQN
+from rl_core.algorithms.native.dreamer import DEFAULT_HYPERPARAMS as DREAMER_DEFAULTS
+from rl_core.algorithms.native.dreamer import NativeDreamer
+from rl_core.algorithms.native.efficientzero import DEFAULT_HYPERPARAMS as EFFICIENTZERO_DEFAULTS
+from rl_core.algorithms.native.efficientzero import NativeEfficientZero
 from rl_core.algorithms.native.es import DEFAULT_HYPERPARAMS as ES_DEFAULTS
 from rl_core.algorithms.native.es import NativeES
 from rl_core.algorithms.native.marl_ppo import DEFAULT_HYPERPARAMS as IPPO_DEFAULTS
 from rl_core.algorithms.native.marl_ppo import MultiAgentPPO
+from rl_core.algorithms.native.mbpo import DEFAULT_HYPERPARAMS as MBPO_DEFAULTS
+from rl_core.algorithms.native.mbpo import NativeMBPO
 from rl_core.algorithms.native.networks import policy_name
+from rl_core.algorithms.native.pets import DEFAULT_HYPERPARAMS as PETS_DEFAULTS
+from rl_core.algorithms.native.pets import NativePETS
 from rl_core.algorithms.native.ppo import DEFAULT_HYPERPARAMS as PPO_DEFAULTS
 from rl_core.algorithms.native.ppo import NativePPO
+from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS as QMIX_DEFAULTS
+from rl_core.algorithms.native.qmix import MultiAgentQMIX
 from rl_core.algorithms.native.rainbow_dqn import DEFAULT_HYPERPARAMS as RAINBOW_DQN_DEFAULTS
 from rl_core.algorithms.native.rainbow_dqn import NativeRainbowDQN
 from rl_core.algorithms.native.sac import DEFAULT_HYPERPARAMS as SAC_DEFAULTS
 from rl_core.algorithms.native.sac import NativeSAC
 from rl_core.algorithms.native.td3 import DEFAULT_HYPERPARAMS as TD3_DEFAULTS
 from rl_core.algorithms.native.td3 import NativeTD3
+from rl_core.algorithms.native.world_models_ha import DEFAULT_HYPERPARAMS as WORLD_MODELS_HA_DEFAULTS
+from rl_core.algorithms.native.world_models_ha import NativeWorldModelsHA
 from rl_core.algorithms.runner_utils import run_custom_algorithm
 
 ALGO_CLASSES = {
@@ -40,6 +52,12 @@ ALGO_CLASSES = {
     "td3": NativeTD3,
     "es": NativeES,
     "ippo": MultiAgentPPO,
+    "qmix": MultiAgentQMIX,
+    "dreamer": NativeDreamer,
+    "mbpo": NativeMBPO,
+    "pets": NativePETS,
+    "world_models_ha": NativeWorldModelsHA,
+    "efficientzero": NativeEfficientZero,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -51,6 +69,23 @@ DEFAULT_HYPERPARAMS = {
     "td3": TD3_DEFAULTS,
     "es": ES_DEFAULTS,
     "ippo": IPPO_DEFAULTS,
+    "qmix": QMIX_DEFAULTS,
+    "dreamer": DREAMER_DEFAULTS,
+    "mbpo": MBPO_DEFAULTS,
+    "pets": PETS_DEFAULTS,
+    "world_models_ha": WORLD_MODELS_HA_DEFAULTS,
+    "efficientzero": EFFICIENTZERO_DEFAULTS,
+}
+# Which world model type (rl_core.world_models.spec.WORLD_MODEL_TYPES) each
+# of the four algorithms above actually uses — `runner_utils.py` needs this
+# to validate/label a resolved `world_model_id`, and the frontend's
+# `algorithm.world_model_id` dropdown (Designer) needs the same mapping to
+# only ever offer a matching-type saved World Model for a given algorithm.
+WORLD_MODEL_TYPE_FOR_ALGO = {
+    "dreamer": "rssm",
+    "mbpo": "ensemble",
+    "pets": "ensemble",
+    "world_models_ha": "vae_mdnrnn",
 }
 
 

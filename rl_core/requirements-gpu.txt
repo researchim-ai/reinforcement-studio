@@ -46,6 +46,33 @@ highway-env>=1.10
 # are the same. Only actually *uses* the `mujoco` extra already pulled in
 # above by `gymnasium[...,mujoco,...]` — nothing extra to compile.
 gymnasium-robotics>=1.4
+# PettingZoo (rl_core/envs/pettingzoo_envs.py) — the "marl" category's 5
+# built-in PettingZoo benchmarks (3 MPE envs via mpe2, SISL's Pursuit, and
+# Butterfly's Knights Archers Zombies). `pettingzoo` itself is already
+# pulled in transitively by gymnasium-robotics above; pinned explicitly
+# here (with the `[butterfly]` extra, for KAZ's pygame-ce rendering/step
+# loop) since these envs now depend on it directly, not just through
+# another package's internals.
+# `mpe2` is PettingZoo's own actively-maintained fork of its old built-in
+# `pettingzoo.mpe` module (deprecated/removed upstream) — pure-Python,
+# no swig/compiler, same "prebuilt wheel" story as everything else above.
+# Pursuit (`pettingzoo.sisl`) needs no extra dependency beyond `pettingzoo`
+# itself (unlike `multiwalker`/`waterworld` in the same `sisl` family,
+# which need Box2D/pymunk — not installed, and not one of the envs used).
+pettingzoo[butterfly]>=1.24
+mpe2>=1.1
+# RWARE + LBForaging (rl_core/envs/tuple_marl_envs.py) — the "marl"
+# category's 4 "big" Tuple-space benchmarks (2 RWARE warehouse-robot
+# sizes + 2 Level-Based Foraging sizes) alongside the PettingZoo ones
+# above. Both are pure-Python, no compiler/game client needed; both only
+# fail to render a GIF preview headlessly (no display -> caught and
+# skipped, see `TupleMarlVectorEnv.render` — training itself is unaffected).
+rware>=2.0
+lbforaging>=2.0
+# SMAClite (rl_core/envs/tuple_marl_envs.py's `smac_*` scenarios) is
+# deliberately NOT pinned here — see the matching comment in
+# requirements.txt (its own `Rtree==1.0.0` pin has no cp311+ wheel).
+# Install on demand: `EXTRA_HINT['smaclite']` in `src/pages/Environments.tsx`.
 # NetHack Learning Environment / MiniHack (rl_core/envs/nethack_envs.py) —
 # NOT installed by default, unlike every other extra above: `nle` only
 # ships prebuilt wheels for manylinux (Linux x86_64/aarch64), so on macOS/

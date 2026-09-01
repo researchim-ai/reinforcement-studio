@@ -2,8 +2,29 @@ import { Fragment, type ReactNode } from 'react'
 import {
   CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis,
 } from 'recharts'
-import { ArrowRight, type LucideIcon, Info, Lightbulb, TriangleAlert, CircleCheck } from 'lucide-react'
+import { ArrowRight, type LucideIcon, ExternalLink, Info, Lightbulb, TriangleAlert, CircleCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
+
+/** Inline citation link — "(Author et al., Year)" that actually opens the
+ * paper. Used right next to the in-text mention of a paper throughout the
+ * course instead of leaving citations as dead text. Prefer a direct arXiv
+ * abstract page when one reliably exists for a paper; for pre-arXiv-era
+ * classics (Tiger, Hallway, RockSample, ...) a Google Scholar search on the
+ * exact title is used instead — always resolves to the right paper without
+ * risking a stale/wrong direct link to a paywalled PDF. */
+export function PaperLink({ children, url }: { children: ReactNode; url: string }) {
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center gap-0.5 whitespace-nowrap text-primary/90 underline decoration-primary/30 underline-offset-2 hover:text-primary hover:decoration-primary"
+    >
+      {children}
+      <ExternalLink className="h-2.5 w-2.5 shrink-0" />
+    </a>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Generic building blocks reused across every lesson — kept intentionally
@@ -288,6 +309,47 @@ export function MemoryTimelineDiagram() {
       <p className="text-[10px] text-muted-foreground">
         Скрытое состояние hₜ несёт информацию из всех прошлых шагов — обрывается только на границе эпизода.
       </p>
+    </div>
+  )
+}
+
+/** The single picture that makes "world model" concrete: one real step
+ * (expensive — an actual `env.step()`) branches into a short chain of
+ * *imagined* steps (cheap — pure forward passes through the learned
+ * dynamics model, dashed to mark "not real"). This is the shared payoff
+ * every one of Dreamer/MBPO/PETS/World Models exploits in its own way —
+ * imagination-based actor-critic training, model-augmented replay, or
+ * direct planning — so this diagram is reused across all four lessons
+ * rather than redrawn per-algorithm. */
+export function ImaginationDiagram() {
+  const imagined = ['ẑ₂ / ŝ₂', 'ẑ₃ / ŝ₃', 'ẑ₄ / ŝ₄', '…']
+  return (
+    <div className="space-y-2.5 py-2">
+      <div className="flex items-center gap-0 overflow-x-auto">
+        <div className="flex h-14 w-28 shrink-0 flex-col items-center justify-center gap-0.5 rounded-lg border-2 border-primary/50 bg-primary/10 text-center">
+          <span className="text-[10px] font-medium">s₀ (реальность)</span>
+        </div>
+        <div className="flex shrink-0 flex-col items-center px-1.5">
+          <span className="whitespace-nowrap text-[8px] text-muted-foreground">1× env.step()</span>
+          <ArrowRight className="h-3.5 w-3.5 text-primary/60" />
+        </div>
+        <div className="flex h-14 w-28 shrink-0 flex-col items-center justify-center gap-0.5 rounded-lg border-2 border-primary/50 bg-primary/10 text-center">
+          <span className="text-[10px] font-medium">s₁ (реальность)</span>
+        </div>
+      </div>
+      <div className="ml-[7.5rem] flex items-center gap-0 overflow-x-auto border-l-2 border-dashed border-amber-500/40 pl-3">
+        {imagined.map((label, i) => (
+          <Fragment key={label}>
+            <div className="flex h-11 w-16 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-amber-500/50 bg-amber-500/5 text-center">
+              <span className="text-[10px] text-amber-500">{label}</span>
+            </div>
+            {i < imagined.length - 1 && <ArrowRight className="h-3 w-3 shrink-0 text-amber-500/40" />}
+          </Fragment>
+        ))}
+        <span className="ml-2 whitespace-nowrap text-[9px] text-muted-foreground">
+          «воображение» — только forward-проходы через модель, ни одного настоящего env.step()
+        </span>
+      </div>
     </div>
   )
 }

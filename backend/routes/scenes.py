@@ -34,6 +34,8 @@ _TEMPLATES = {
     "default": scene_store.default_spec,
     "predator_prey": scene_store.default_predator_prey_spec,
     "team_battle": scene_store.default_team_battle_spec,
+    "pack_hunt": scene_store.default_pack_hunt_spec,
+    "team_battle_large": scene_store.default_team_battle_large_spec,
 }
 
 
@@ -50,8 +52,10 @@ async def list_templates():
     return {
         "templates": [
             {"id": "default", "name": "Пустая сцена", "description": "Одна команда, коллекционирование монет"},
-            {"id": "predator_prey", "name": "Хищник и жертва", "description": "2 команды, 2 роли — предатор гоняется за жертвами (MARL, ippo)"},
-            {"id": "team_battle", "name": "Команда на команду", "description": "2 команды соревнуются за монеты, общая награда внутри команды (MARL, ippo)"},
+            {"id": "predator_prey", "name": "Хищник и жертва", "description": "2 команды, 2 роли — предатор гоняется за жертвами (MARL, ippo/qmix)"},
+            {"id": "team_battle", "name": "Команда на команду", "description": "2 команды (2×2) соревнуются за монеты, общая награда внутри команды (MARL, ippo/qmix)"},
+            {"id": "pack_hunt", "name": "Стая против жертв", "description": "4 хищника кооперативно охотятся на 2 быстрых жертв, общая награда стаи (MARL, ippo/qmix)"},
+            {"id": "team_battle_large", "name": "Командная битва 3×3", "description": "Увеличенная арена, 3×3 агента, общая награда внутри команды (MARL, ippo/qmix)"},
         ],
     }
 

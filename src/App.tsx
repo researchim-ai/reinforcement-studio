@@ -39,6 +39,7 @@ const Sweeps = lazyWithReload(() => import('@/pages/Sweeps').then((m) => ({ defa
 const SceneBuilder = lazyWithReload(() => import('@/pages/SceneBuilder').then((m) => ({ default: m.SceneBuilder })))
 const PluginsPage = lazyWithReload(() => import('@/pages/Plugins').then((m) => ({ default: m.PluginsPage })))
 const NetworkBuilderPage = lazyWithReload(() => import('@/pages/NetworkBuilder').then((m) => ({ default: m.NetworkBuilderPage })))
+const WorldModelBuilder = lazyWithReload(() => import('@/pages/WorldModelBuilder').then((m) => ({ default: m.WorldModelBuilder })))
 const Academy = lazyWithReload(() => import('@/pages/Academy').then((m) => ({ default: m.Academy })))
 const SettingsPage = lazyWithReload(() => import('@/pages/Settings').then((m) => ({ default: m.SettingsPage })))
 
@@ -63,6 +64,7 @@ export default function App() {
           <Route path="/sweeps" element={<Suspense fallback={<PageFallback />}><Sweeps /></Suspense>} />
           <Route path="/plugins" element={<Suspense fallback={<PageFallback />}><PluginsPage /></Suspense>} />
           <Route path="/network-builder" element={<Suspense fallback={<PageFallback />}><NetworkBuilderPage /></Suspense>} />
+          <Route path="/world-models" element={<Suspense fallback={<PageFallback />}><WorldModelBuilder /></Suspense>} />
           <Route path="/scene-builder" element={<Suspense fallback={<PageFallback />}><SceneBuilder /></Suspense>} />
           <Route path="/academy" element={<Suspense fallback={<PageFallback />}><Academy /></Suspense>} />
           <Route path="/settings" element={<Suspense fallback={<PageFallback />}><SettingsPage /></Suspense>} />

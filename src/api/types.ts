@@ -201,6 +201,13 @@ export interface AlgorithmSpec {
   hyperparams: HyperparamSpec[]
   is_custom?: boolean
   supported_action_kinds?: ActionKind[]
+  // Set only on the four World Model algorithms (dreamer/mbpo/pets/
+  // world_models_ha, see backend/routes/environments.py's ALGORITHM_CATALOG)
+  // — which World Model type (WorldModelType below) this algorithm expects,
+  // so the Designer's Algorithm node can offer only matching saved World
+  // Models in its `world_model_id` dropdown, mirroring `NetworkFamily`'s
+  // role for `network_spec_id`.
+  world_model_type?: WorldModelType | null
 }
 
 export type PluginKind = 'gym-algorithms' | 'alphazero-algorithms' | 'reward-functions'
@@ -255,6 +262,16 @@ export interface ExperimentConfig {
     // sizes, never saved to disk under a name. Mutually exclusive with
     // `network_spec_id` in practice (the Designer only ever sets one).
     network_spec?: NetworkSpec | null
+    // Same "saved catalog entry vs. inline" pair as `network_spec_id`/
+    // `network_spec` above, but for a World Model (rl_core/world_models/) —
+    // only meaningful for the four algorithms with `world_model_type` set
+    // (see AlgorithmSpec above). `world_model_id` picks up a saved World
+    // Model's trained checkpoint too, if any; an inline `world_model_spec`
+    // (the Designer's quick type+config picker, never saved to disk) never
+    // has one. Resolved server-side by `rl_core/world_models/store.py::
+    // resolve_world_model_spec`.
+    world_model_id?: string | null
+    world_model_spec?: { type: WorldModelType; config: WorldModelConfig } | null
   }
   training: {
     total_timesteps?: number
@@ -377,6 +394,106 @@ export interface SpaceInfo {
   n?: number
 }
 
+// ------------------------------------------------- World Models
+
+// The three implemented families (rl_core/world_models/spec.py::
+// WORLD_MODEL_TYPES) — Dreamer-style RSSM, MBPO/PETS-style probabilistic
+// ensemble dynamics, and the classic Ha & Schmidhuber VAE+MDN-RNN. Every
+// one of the four World Model algorithms below expects exactly one of
+// these (see `AlgorithmSpec.world_model_type`).
+export type WorldModelType = 'rssm' | 'ensemble' | 'vae_mdnrnn'
+
+// A type's config is a flat bag of architecture-size numbers (deterministic
+// state size, ensemble members, latent size, ...) — never a layer graph
+// like `NetworkSpec`, since none of the three families expose an
+// arbitrary trunk/head structure to hand-design.
+export type WorldModelConfig = Record<string, number>
+
+export interface WorldModelConfigField {
+  key: string
+  label: string
+  min: number
+  max: number
+}
+
+// Static per-type metadata (`GET /world-models/types`) the World Model
+// Builder's config form renders from directly, same rationale as
+// `NetworkFamilyInfo`/`HyperparamSpec`.
+export interface WorldModelTypeInfo {
+  id: WorldModelType
+  default_config: WorldModelConfig
+  fields: WorldModelConfigField[]
+}
+
+export interface WorldModelDoc {
+  name: string
+  description: string
+  type: WorldModelType
+  config: WorldModelConfig
+  environment_id?: string | null
+}
+
+export interface WorldModelMeta {
+  id: string
+  slug: string
+  name: string
+  description: string
+  type: WorldModelType
+  config: WorldModelConfig
+  environment_id?: string | null
+  // Whether `attach_checkpoint` has ever copied trained weights in — an
+  // untrained spec still resolves fine (any algorithm/standalone run just
+  // builds a fresh model of this type/config instead), it just starts from
+  // scratch instead of picking up previous training.
+  trained: boolean
+  trained_at?: string | null
+  source_run_id?: string | null
+  broken?: boolean
+  error?: string
+}
+
+// `world_model.json`, written next to `config.json` at the start of any run
+// that resolved a World Model (standalone `kind: "world_model"` runs, or
+// any of the four algorithms with `world_model_id`/`world_model_spec` set)
+// — mirrors `NetworkSnapshot`'s role for Network Builder specs.
+export interface WorldModelSnapshot {
+  type: WorldModelType | null
+  config: WorldModelConfig | null
+  world_model_id?: string | null
+  resolved_at?: string
+}
+
+// The exact `StartRunRequest` shape (backend/routes/training.py) a
+// standalone World Model "Train" run sends — same endpoint
+// (`POST /training/start`) and run-tracking pipeline as any other run
+// (see `rl_core/world_models/trainer.py`'s module docstring), just with
+// `kind: "world_model"` and `algorithm.id` being a `WorldModelType` rather
+// than a real algorithm id.
+export interface WorldModelStartRequest {
+  kind: 'world_model'
+  name?: string
+  environment: { id: string; wrappers: WrapperNode[] }
+  algorithm: {
+    id: WorldModelType
+    hyperparams: WorldModelConfig
+    world_model_id?: string | null
+  }
+  training: {
+    total_timesteps?: number
+    seed?: number
+    use_gpu?: boolean
+    batch_size?: number
+    seq_len?: number
+    collect_steps_per_iter?: number
+    train_steps_per_iter?: number
+    learning_rate?: number
+    // Parallel env lanes for data collection (see
+    // `rl_core/world_models/trainer.py`'s module docstring) — same
+    // `training.num_envs` lever every other algorithm's run already has.
+    num_envs?: number
+  }
+}
+
 export interface NetworkInfo {
   channels: number
   num_blocks: number
@@ -417,7 +534,10 @@ export interface InspectResult {
 
 export interface MetricsSnapshot {
   run_id: string
-  kind: EnvKind
+  // Widened beyond `EnvKind` — a standalone World Model run (see
+  // `rl_core/world_models/trainer.py`) writes `kind: "world_model"`,
+  // never "gym"/"alphazero".
+  kind: EnvKind | 'world_model'
   status: 'running' | 'completed' | 'stopped' | 'failed'
   algo: string
   env_id: string
@@ -448,6 +568,33 @@ export interface MetricsSnapshot {
   es_mean_fitness?: number | null
   es_best_fitness?: number | null
   es_sigma?: number | null
+  // World Model losses (rl_core/world_models/losses.py) — which subset is
+  // present depends on which of the three types this run trains:
+  // RSSM (standalone `kind:"world_model"` id="rssm", or `dreamer`) reports
+  // recon_loss/kl_loss/reward_loss/continue_loss; Ensemble (id="ensemble",
+  // or `mbpo`/`pets`) reports dynamics_loss/reward_loss; VAE+MDN-RNN
+  // (id="vae_mdnrnn", or `world_models_ha`) reports vae_recon_loss/
+  // vae_kl_loss/mdn_loss/reward_loss/continue_loss. `dreamer`/`mbpo` also
+  // report actor_loss/critic_loss (their imagination/model-augmented
+  // actor-critic) alongside the world model's own losses above.
+  recon_loss?: number | null
+  kl_loss?: number | null
+  reward_loss?: number | null
+  continue_loss?: number | null
+  dynamics_loss?: number | null
+  vae_recon_loss?: number | null
+  vae_kl_loss?: number | null
+  mdn_loss?: number | null
+  // Dreamer's own imagined-rollout return estimate — not a loss, but
+  // charted alongside its actor/critic losses as a quick "is imagination
+  // actually predicting anything useful" signal.
+  imagined_return_mean?: number | null
+  // MBPO's imagined-transition buffer size, and every standalone World
+  // Model / `world_models_ha`'s mean reward over its most recent
+  // random-policy collection batch — informational, not chart-worthy on
+  // their own, but harmless to carry through.
+  model_buffer_size?: number | null
+  collect_mean_reward?: number | null
   // Best-effort metrics pulled from SB3's own logger for custom plugins
   // that subclass a stable-baselines3 algorithm (see metrics_callback.py).
   entropy_loss?: number | null
@@ -506,7 +653,7 @@ export interface MetricsSnapshot {
 export interface RunSummary {
   run_id: string
   name: string
-  kind: EnvKind
+  kind: EnvKind | 'world_model'
   environment_id: string
   algorithm_id: string
   status: string

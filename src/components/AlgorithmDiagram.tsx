@@ -1,6 +1,7 @@
 import { Fragment, type ReactNode } from 'react'
 import {
-  ArrowRight, Brain, Database, Dices, Repeat, RefreshCw, Shuffle, Swords, Target, TrendingUp, Eye, Layers, History, Sparkles,
+  ArrowRight, Brain, Crosshair, Database, Dices, Moon, Repeat, RefreshCw, Shuffle, Swords,
+  Target, TrendingUp, Eye, Layers, History, Sparkles, Users,
 } from 'lucide-react'
 import { cn, formatNumber } from '@/lib/utils'
 
@@ -36,7 +37,9 @@ interface Step {
   detail?: string
 }
 
-type Family = 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero' | 'generic'
+type Family =
+  | 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero'
+  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'ippo' | 'qmix' | 'generic'
 
 /** Best-effort family detection from the algorithm id — used to pick which
  * canned "how it learns" loop to render. Custom plugins (`custom:*`) fall
@@ -54,6 +57,13 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (id.includes('a2c')) return 'a2c'
   if (id.includes('ppo')) return 'ppo'
   if (id === 'es' || id.includes('evolution') || id.includes('cma-es') || id.includes('cmaes')) return 'es'
+  if (id.includes('dreamer')) return 'dreamer'
+  if (id.includes('mbpo')) return 'mbpo'
+  if (id.includes('pets')) return 'pets'
+  if (id.includes('world_models_ha') || id.includes('world-models-ha')) return 'world_models_ha'
+  if (id.includes('efficientzero') || id.includes('efficient-zero') || id.includes('muzero')) return 'efficientzero'
+  if (id === 'ippo' || id.includes('ippo')) return 'ippo'
+  if (id === 'qmix' || id.includes('qmix')) return 'qmix'
   return 'generic'
 }
 
@@ -190,6 +200,84 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
           { icon: Brain, title: 'Adam-шаг по оценке градиента', detail: hp(hyperparams, 'learning_rate', 'lr=') },
         ],
         loopCaption: 'Gradient-free: без backprop через среду — параметры сети обновляются по fitness целых эпизодов',
+      }
+    case 'dreamer':
+      return {
+        steps: [
+          { icon: Eye, title: 'Реальный шаг', detail: hp(hyperparams, 'collect_steps_per_iter', 'каждые=') },
+          { icon: RefreshCw, title: 'Дообучение RSSM', detail: hp(hyperparams, 'seq_len', 'seq_len=') },
+          { icon: Moon, title: 'Воображение (prior)', detail: hp(hyperparams, 'imagination_horizon', 'horizon=') },
+          { icon: Brain, title: 'Actor-critic на воображении', detail: hp(hyperparams, 'batch_size', 'batch=') },
+        ],
+        loopCaption: 'Model-based: реальный опыт только дообучает RSSM — actor-critic целиком обучается внутри воображаемых траекторий',
+      }
+    case 'mbpo':
+      return {
+        steps: [
+          { icon: Eye, title: 'Реальный шаг (SAC)', detail: hp(hyperparams, 'train_freq', 'каждые=') },
+          { icon: RefreshCw, title: 'Обучение ансамбля', detail: hp(hyperparams, 'model_train_freq', 'каждые=') },
+          { icon: Moon, title: 'Короткие модельные rollouts', detail: hp(hyperparams, 'rollout_length', 'длина=') },
+          { icon: Brain, title: 'SAC-обновление', detail: hp(hyperparams, 'real_ratio', 'real_ratio=') },
+        ],
+        loopCaption: 'Model-based: SAC учится на смеси настоящих и коротких воображаемых переходов, отращенных от реальных состояний',
+      }
+    case 'pets':
+      return {
+        steps: [
+          { icon: Eye, title: 'Случайный шаг / шаг плана' },
+          { icon: RefreshCw, title: 'Обучение ансамбля', detail: hp(hyperparams, 'model_train_freq', 'каждые=') },
+          { icon: Crosshair, title: 'CEM-планирование', detail: joinDetail(hp(hyperparams, 'cem_horizon', 'horizon='), hp(hyperparams, 'cem_candidates', 'N=')) },
+          { icon: Target, title: 'Первое действие плана' },
+        ],
+        loopCaption: 'Без обучаемой политики — каждое действие ищется заново CEM-поиском по текущему ансамблю, план целиком выбрасывается после первого шага',
+      }
+    case 'world_models_ha':
+      return {
+        steps: [
+          { icon: Dices, title: 'Случайный сбор (фаза 1)', detail: hp(hyperparams, 'world_model_phase_steps', 'шагов=') },
+          { icon: RefreshCw, title: 'VAE + MDN-RNN', detail: hp(hyperparams, 'seq_len', 'seq_len=') },
+          { icon: Shuffle, title: 'ES-популяция (фаза 2)', detail: joinDetail(hp(hyperparams, 'population_size', 'N='), hp(hyperparams, 'sigma', 'σ=')) },
+          { icon: Brain, title: 'Контроллер [z,h]→action' },
+        ],
+        loopCaption: 'Две фазы: сначала обучается world model на случайном опыте, затем она замораживается и крошечный линейный контроллер эволюционируется сверху',
+      }
+    case 'efficientzero':
+      return {
+        steps: [
+          { icon: Eye, title: 'Представление s = h(obs)' },
+          {
+            icon: Crosshair,
+            title: 'Gumbel/sampling-поиск (дерево)',
+            detail: joinDetail(hp(hyperparams, 'num_simulations', 'sim='), hp(hyperparams, 'num_top_actions', 'top=')),
+          },
+          { icon: Target, title: 'Действие + policy/value target' },
+          {
+            icon: Brain,
+            title: 'Unroll: reward + value + consistency',
+            detail: hp(hyperparams, 'unroll_steps', 'unroll='),
+          },
+        ],
+        loopCaption: 'Model-based planning: на каждом шаге заново ищется улучшенная политика через representation/dynamics/prediction сети, поиск даёт и действие, и обучающий target',
+      }
+    case 'ippo':
+      return {
+        steps: [
+          { icon: Users, title: 'N команд, N политик' },
+          { icon: Shuffle, title: 'Общий rollout сцены', detail: hp(hyperparams, 'n_steps', 'n_steps=') },
+          { icon: TrendingUp, title: 'Advantage (GAE) на команду', detail: hp(hyperparams, 'gamma', 'γ=') },
+          { icon: Brain, title: 'PPO-обновление на команду', detail: hp(hyperparams, 'batch_size', 'batch=') },
+        ],
+        loopCaption: 'Independent learning: каждая команда — полностью отдельный PPO, команды взаимодействуют только через общую динамику среды',
+      }
+    case 'qmix':
+      return {
+        steps: [
+          { icon: Users, title: 'N команд, общий Q на команду', detail: hp(hyperparams, 'exploration_final_eps', 'ε_min=') },
+          { icon: Database, title: 'Буфер командных переходов', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          { icon: Layers, title: 'Mixing-сеть → Q_tot', detail: hp(hyperparams, 'mixing_embed_dim', 'embed=') },
+          { icon: Target, title: 'TD-обновление на команду', detail: hp(hyperparams, 'target_update_interval', 'target каждые=') },
+        ],
+        loopCaption: 'Value decomposition: агенты команды делят одну Q-сеть, их Q-значения монотонно смешиваются в Q_tot — команды учатся независимо друг от друга',
       }
     case 'alphazero':
       return {

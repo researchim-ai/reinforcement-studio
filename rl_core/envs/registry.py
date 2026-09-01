@@ -53,8 +53,8 @@ register_finrl_envs()
 
 ActionKind = Literal["discrete", "continuous"]
 
-_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es"]
-_CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es"]
+_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es", "dreamer", "world_models_ha", "efficientzero"]
+_CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es", "dreamer", "mbpo", "pets", "world_models_ha", "efficientzero"]
 
 @dataclass
 class EnvSpec:
@@ -867,6 +867,7 @@ def list_environments() -> list[dict]:
     """Returns gym + board game specs, each tagged with live availability."""
     from rl_core.envs.previews import preview_api_path
     from rl_core import scene_store
+    from rl_core.envs import pettingzoo_envs, tuple_marl_envs
 
     out: list[dict] = []
     for spec in GYM_ENVIRONMENTS:
@@ -883,12 +884,23 @@ def list_environments() -> list[dict]:
             continue
         action_kind = meta.get("action_kind", "discrete")
         team_count = meta.get("team_count", 1)
+        agent_count = meta.get("agent_count", 1)
         base_algos = _CONTINUOUS if action_kind == "continuous" else _DISCRETE
         # `ippo` (Independent PPO, rl_core/algorithms/native/marl_ppo.py)
         # only makes sense once a scene actually has 2+ teams — for a
         # single-team scene it would just be a slower, needlessly-split
-        # version of the existing single-policy `ppo`.
-        compatible = [*base_algos, "ippo"] if team_count >= 2 else base_algos
+        # version of the existing single-policy `ppo`. `qmix`
+        # (rl_core/algorithms/native/qmix.py) is gated more loosely — 2+
+        # *agents* total, not teams — because a single cooperative team is
+        # QMIX/VDN's own classic setting (see its module docstring): the
+        # mixer still buys real credit-assignment there, unlike `ippo`.
+        # Both need discrete movement (value decomposition over a joint
+        # *discrete* action space).
+        compatible = list(base_algos)
+        if team_count >= 2:
+            compatible.append("ippo")
+        if agent_count >= 2 and action_kind != "continuous":
+            compatible.append("qmix")
         out.append({
             "id": meta["id"],
             "name": meta.get("name") or meta["slug"],
@@ -906,6 +918,80 @@ def list_environments() -> list[dict]:
             "preview_thumb_url": None,
             "scene_agent_count": meta.get("agent_count"),
             "scene_team_count": team_count,
+            "scene_slug": meta.get("slug"),
+        })
+    for meta in pettingzoo_envs.list_meta():
+        team_count = meta.get("team_count", 1)
+        agent_count = meta.get("agent_count", 1)
+        action_kind = meta.get("action_kind", "discrete")
+        # Same `ippo` (2+ teams) / `qmix` (2+ agents, any team split) gating
+        # as scenes above — plus `dqn`/`ppo`/`a2c`/`es` from `_DISCRETE`,
+        # since every one of these envs is discrete-action (see
+        # `rl_core/envs/pettingzoo_envs.py`'s module docstring).
+        compatible = list(_DISCRETE)
+        if team_count >= 2:
+            compatible.append("ippo")
+        if agent_count >= 2:
+            compatible.append("qmix")
+        out.append({
+            "id": meta["id"],
+            "name": meta["name"],
+            "category": "marl",
+            "description": meta["description"],
+            "action_kind": action_kind,
+            "compatible_algorithms": compatible,
+            "extra_requirement": "pettingzoo" if not meta["available"] else None,
+            "default_hyperparams": None,
+            "recommended_total_timesteps": meta.get("recommended_total_timesteps", 100_000),
+            "recommended_num_envs": None,
+            "kind": "gym",
+            "available": meta["available"],
+            "preview_url": None,
+            "preview_thumb_url": None,
+            "scene_agent_count": meta.get("agent_count"),
+            "scene_team_count": team_count,
+            "scene_slug": meta.get("slug"),
+        })
+    for meta in tuple_marl_envs.list_meta():
+        agent_count = meta.get("agent_count", 1)
+        # Both RWARE and LBForaging are single-team by design (see
+        # `rl_core/envs/tuple_marl_envs.py`'s module docstring) — `ippo`
+        # never applies (needs 2+ teams), `qmix` applies once there are
+        # 2+ agents (its own classic single-team case).
+        if meta.get("mask_aware"):
+            # `smac_*` — situational (masked) action space, only `qmix`
+            # actually reads `get_avail_actions()` (see that module's
+            # docstring) — everything else in `_DISCRETE` would still run
+            # (the adapter clamps illegal actions rather than crashing)
+            # but would be misleadingly bad, not a fair comparison.
+            # Unconditional (not gated on `agent_count`, unlike below) —
+            # every registered `smac_*` scenario is multi-agent by
+            # construction, and `agent_count` reads as 0 when `smaclite`
+            # isn't installed (see `list_meta`), which must not hide
+            # `qmix` from the "what would work if you installed this"
+            # listing the Environments gallery shows for every extra.
+            compatible = ["qmix"]
+        else:
+            compatible = list(_DISCRETE)
+            if agent_count >= 2:
+                compatible.append("qmix")
+        out.append({
+            "id": meta["id"],
+            "name": meta["name"],
+            "category": "marl",
+            "description": meta["description"],
+            "action_kind": meta.get("action_kind", "discrete"),
+            "compatible_algorithms": compatible,
+            "extra_requirement": meta.get("extra_requirement", "rware/lbforaging") if not meta["available"] else None,
+            "default_hyperparams": None,
+            "recommended_total_timesteps": meta.get("recommended_total_timesteps", 150_000),
+            "recommended_num_envs": None,
+            "kind": "gym",
+            "available": meta["available"],
+            "preview_url": None,
+            "preview_thumb_url": None,
+            "scene_agent_count": agent_count,
+            "scene_team_count": meta.get("team_count", 1),
             "scene_slug": meta.get("slug"),
         })
     for spec in BOARD_GAMES:

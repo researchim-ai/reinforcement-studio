@@ -133,6 +133,25 @@ export function useNetworks() {
   return useQuery({ queryKey: ['networks'], queryFn: api.listNetworks })
 }
 
+export function useWorldModelTypes() {
+  return useQuery({ queryKey: ['world-model-types'], queryFn: api.listWorldModelTypes })
+}
+
+export function useWorldModels() {
+  return useQuery({ queryKey: ['world-models'], queryFn: api.listWorldModels })
+}
+
+/** The exact World Model spec (`world_model.json`) a run actually
+ * resolved/used — counterpart to `useRunNetwork` for the four World Model
+ * algorithms and standalone `kind: "world_model"` runs. */
+export function useRunWorldModel(runId: string | undefined) {
+  return useQuery({
+    queryKey: ['run-world-model', runId],
+    queryFn: () => api.getRunWorldModel(runId as string),
+    enabled: !!runId,
+  })
+}
+
 export function useScenes() {
   return useQuery({ queryKey: ['scenes'], queryFn: api.listScenes })
 }

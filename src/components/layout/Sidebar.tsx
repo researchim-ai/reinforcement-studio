@@ -15,6 +15,7 @@ import {
   GraduationCap,
   FlaskConical,
   Cuboid,
+  Brain,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { useDockerStore } from '@/stores/dockerStore'
@@ -32,6 +33,7 @@ const navItems = [
   { path: '/sweeps', icon: FlaskConical, labelKey: 'nav.sweeps' },
   { path: '/plugins', icon: Puzzle, labelKey: 'nav.plugins' },
   { path: '/network-builder', icon: Network, labelKey: 'nav.networkBuilder' },
+  { path: '/world-models', icon: Brain, labelKey: 'nav.worldModels' },
   { path: '/scene-builder', icon: Cuboid, labelKey: 'nav.sceneBuilder' },
   { path: '/academy', icon: GraduationCap, labelKey: 'nav.academy' },
   { path: '/settings', icon: Settings, labelKey: 'nav.settings' },
