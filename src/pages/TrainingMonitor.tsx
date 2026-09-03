@@ -11,17 +11,19 @@ import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { useRuns, useRunNetwork, useRunWorldModel } from '@/api/hooks'
+import { useAlgorithms, useRuns, useRunNetwork, useRunWorldModel } from '@/api/hooks'
 import { api, createMetricsWebSocket } from '@/api/client'
 import { AlgorithmDiagram, type AlgorithmDiagramNetwork } from '@/components/AlgorithmDiagram'
 import { SaveArchitectureDialog } from '@/components/networkbuilder/SaveArchitectureDialog'
 import { CompareRunsPanel } from '@/components/monitor/CompareRunsPanel'
 import { RunFolderLink } from '@/components/monitor/RunFolderLink'
 import { EvaluateDialog } from '@/components/models/EvaluateDialog'
-import type { MetricsSnapshot, SpaceInfo } from '@/api/types'
+import { Tooltip as HpTooltip } from '@/components/ui/tooltip'
+import type { HyperparamSpec, MetricsSnapshot, SpaceInfo } from '@/api/types'
 import { cn, formatDuration } from '@/lib/utils'
 import { spaceSize } from '@/lib/spaceInfo'
 import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
+import { useSettingsStore } from '@/stores/settingsStore'
 
 const STATUS_VARIANT: Record<string, 'success' | 'secondary' | 'destructive' | 'outline'> = {
   running: 'success',
@@ -187,6 +189,17 @@ export function TrainingMonitor() {
   const { data: runNetwork } = useRunNetwork(selectedRunId)
   const canSaveArchitecture = !!runNetwork?.family && !!runNetwork?.spec
   const { data: runWorldModel } = useRunWorldModel(selectedRunId)
+  const { data: algosData } = useAlgorithms()
+  const language = useSettingsStore((s) => s.language)
+  // key -> HyperparamSpec for the currently selected run's algorithm, so
+  // the "Гиперпараметры алгоритма" card can show a proper label + a
+  // hover-tooltip description instead of the raw hyperparam key.
+  const hyperparamSpecs = useMemo(() => {
+    const algo = algosData?.algorithms.find((a) => a.id === selectedRun?.algorithm_id)
+    const map = new Map<string, HyperparamSpec>()
+    for (const hp of algo?.hyperparams ?? []) map.set(hp.key, hp)
+    return map
+  }, [algosData, selectedRun?.algorithm_id])
 
   useEffect(() => {
     if (!selectedRunId) return
@@ -682,7 +695,11 @@ export function TrainingMonitor() {
                     <CardTitle className="text-sm">Гиперпараметры алгоритма</CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <KeyValueGrid entries={Object.entries(latest.hyperparams)} />
+                    <HyperparamGrid
+                      entries={Object.entries(latest.hyperparams)}
+                      specs={hyperparamSpecs}
+                      language={language}
+                    />
                   </CardContent>
                 </Card>
               )}
@@ -935,6 +952,46 @@ function KeyValueGrid({ entries }: { entries: [string, unknown][] }) {
           <span className="font-mono font-medium">{formatValue(value)}</span>
         </div>
       ))}
+    </div>
+  )
+}
+
+/** Like `KeyValueGrid`, but specifically for a run's algorithm hyperparams:
+ * shows the human-readable `label` from the algorithm's schema (falling
+ * back to the raw key for custom-plugin hyperparams, which don't have one)
+ * and, whenever a `desc` is available, wraps the label in a hover tooltip
+ * explaining what the hyperparameter actually does, in whichever of the
+ * two supported UI languages is currently selected. */
+function HyperparamGrid({
+  entries,
+  specs,
+  language,
+}: {
+  entries: [string, unknown][]
+  specs: Map<string, HyperparamSpec>
+  language: 'ru' | 'en'
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-3">
+      {entries.map(([key, value]) => {
+        const spec = specs.get(key)
+        const label = spec?.label ?? key
+        const desc = spec?.desc?.[language]
+        return (
+          <div key={key} className="flex flex-col">
+            {desc ? (
+              <HpTooltip content={desc}>
+                <span className="cursor-help text-muted-foreground underline decoration-dotted decoration-muted-foreground/50 underline-offset-2">
+                  {label}
+                </span>
+              </HpTooltip>
+            ) : (
+              <span className="text-muted-foreground">{label}</span>
+            )}
+            <span className="font-mono font-medium">{formatValue(value)}</span>
+          </div>
+        )
+      })}
     </div>
   )
 }

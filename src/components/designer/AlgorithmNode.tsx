@@ -6,10 +6,12 @@ import { Select } from '@/components/ui/select'
 import { NumericInput } from '@/components/ui/numeric-input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { Tooltip } from '@/components/ui/tooltip'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
 import { QuickNetworkEditor } from '@/components/designer/QuickNetworkEditor'
 import { FAMILY_LABELS, defaultHiddenSizesForFamily, networkFamilyFor, requiredFamilyFor } from '@/lib/networkBuilder'
 import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
+import { useSettingsStore } from '@/stores/settingsStore'
 import type { AlgorithmSpec, NetworkMeta, WorldModelMeta } from '@/api/types'
 
 export interface AlgorithmNodeData {
@@ -63,6 +65,7 @@ function conditionsMatch(
 }
 
 export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & { data: AlgorithmNodeData }) {
+  const language = useSettingsStore((s) => s.language)
   const selected = data.algorithms.find((a) => a.id === data.selectedId)
   const requiredFamily = selected ? networkFamilyFor(selected.id, selected.kind) : null
   // Narrower than `requiredFamily` — excludes `alphazero` (which already has
@@ -110,7 +113,15 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
               {visibleHyperparams!.map((hp) => (
                 <div key={hp.key} className="space-y-1">
                   <div className="flex items-baseline justify-between gap-2">
-                    <Label className="text-[11px] text-muted-foreground">{hp.label}</Label>
+                    {hp.desc ? (
+                      <Tooltip content={hp.desc[language]} side="right">
+                        <Label className="cursor-help text-[11px] text-muted-foreground underline decoration-dotted decoration-muted-foreground/50 underline-offset-2">
+                          {hp.label}
+                        </Label>
+                      </Tooltip>
+                    ) : (
+                      <Label className="text-[11px] text-muted-foreground">{hp.label}</Label>
+                    )}
                   </div>
                   {hp.options ? (
                     <Select

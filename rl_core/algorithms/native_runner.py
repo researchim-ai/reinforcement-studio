@@ -38,6 +38,8 @@ from rl_core.algorithms.native.sac import DEFAULT_HYPERPARAMS as SAC_DEFAULTS
 from rl_core.algorithms.native.sac import NativeSAC
 from rl_core.algorithms.native.td3 import DEFAULT_HYPERPARAMS as TD3_DEFAULTS
 from rl_core.algorithms.native.td3 import NativeTD3
+from rl_core.algorithms.native.unizero import DEFAULT_HYPERPARAMS as UNIZERO_DEFAULTS
+from rl_core.algorithms.native.unizero import NativeUniZero
 from rl_core.algorithms.native.world_models_ha import DEFAULT_HYPERPARAMS as WORLD_MODELS_HA_DEFAULTS
 from rl_core.algorithms.native.world_models_ha import NativeWorldModelsHA
 from rl_core.algorithms.runner_utils import run_custom_algorithm
@@ -58,6 +60,7 @@ ALGO_CLASSES = {
     "pets": NativePETS,
     "world_models_ha": NativeWorldModelsHA,
     "efficientzero": NativeEfficientZero,
+    "unizero": NativeUniZero,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -75,6 +78,7 @@ DEFAULT_HYPERPARAMS = {
     "pets": PETS_DEFAULTS,
     "world_models_ha": WORLD_MODELS_HA_DEFAULTS,
     "efficientzero": EFFICIENTZERO_DEFAULTS,
+    "unizero": UNIZERO_DEFAULTS,
 }
 # Which world model type (rl_core.world_models.spec.WORLD_MODEL_TYPES) each
 # of the four algorithms above actually uses — `runner_utils.py` needs this

@@ -1,6 +1,6 @@
 import { Fragment, type ReactNode } from 'react'
 import {
-  CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis,
+  Bar, BarChart, CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis,
 } from 'recharts'
 import { ArrowRight, type LucideIcon, ExternalLink, Info, Lightbulb, TriangleAlert, CircleCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -385,6 +385,224 @@ export function PomdpCompareDiagram({
           ))}
         </ul>
       </div>
+    </div>
+  )
+}
+
+const SUBSCRIPT_DIGITS = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉']
+
+// ---------------------------------------------------------------------------
+// MuZero-family (EfficientZero/UniZero) diagrams.
+// ---------------------------------------------------------------------------
+
+/** The MuZero/EfficientZero training-unroll picture: only `s₀` is ever
+ * built from a *real* observation (via `h()`) — every later `sₖ` in the
+ * unroll comes purely from `dynamics g(s, a)`, chained forward through
+ * known real actions, never re-grounded in a real `obsₖ`. The real
+ * `obs₁, obs₂, ...` of this same window still exist (dashed) but only feed
+ * the *consistency loss target*, never the dynamics' input — the single
+ * fact `TokenAttentionDiagram` below (UniZero) is drawn to contrast with:
+ * UniZero's Transformer instead re-reads every real token directly. */
+export function LatentChainDiagram() {
+  const n = 4
+  const cols = Array.from({ length: 2 * n - 1 }, (_, i) => (i % 2 === 0 ? '4.25rem' : '2.75rem')).join(' ')
+  return (
+    <div className="overflow-x-auto py-2">
+      <div className="grid items-center gap-y-1.5" style={{ gridTemplateColumns: cols, width: 'max-content' }}>
+        {Array.from({ length: n }, (_, i) => (
+          <div
+            key={`s-${i}`}
+            className={cn(
+              'flex h-12 flex-col items-center justify-center rounded-lg border-2 text-center',
+              i === 0 ? 'border-primary/60 bg-primary/10' : 'border-border/70 bg-background/60',
+            )}
+            style={{ gridRow: 1, gridColumn: 2 * i + 1 }}
+          >
+            <span className="text-[11px] font-semibold">s{SUBSCRIPT_DIGITS[i]}</span>
+            <span className="text-[8px] text-muted-foreground">policy/value</span>
+          </div>
+        ))}
+        {Array.from({ length: n - 1 }, (_, i) => (
+          <div key={`arr-${i}`} className="flex flex-col items-center" style={{ gridRow: 1, gridColumn: 2 * i + 2 }}>
+            <span className="whitespace-nowrap text-[7px] text-muted-foreground">g(s,a{SUBSCRIPT_DIGITS[i]})</span>
+            <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/60" />
+          </div>
+        ))}
+        {Array.from({ length: n }, (_, i) => (
+          <div key={`o-${i}`} className="flex flex-col items-center gap-0.5" style={{ gridRow: 2, gridColumn: 2 * i + 1 }}>
+            {i === 0 ? (
+              <>
+                <ArrowRight className="h-3 w-3 rotate-90 text-primary/70" />
+                <span className="whitespace-nowrap text-[8px] text-primary/80">obs₀ → h()</span>
+              </>
+            ) : (
+              <>
+                <div className="h-2.5 w-px border-l border-dashed border-amber-500/50" />
+                <span className="whitespace-nowrap text-[7.5px] text-amber-500/80">obs{SUBSCRIPT_DIGITS[i]} — только цель consistency</span>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+      <p className="mt-2.5 text-[10px] text-muted-foreground">
+        Только s₀ строится из настоящего наблюдения (h(obs₀)) — s₁, s₂, s₃ получаются чисто из dynamics g(s,a) по
+        известным реальным действиям, а настоящие obs₁, obs₂, obs₃ этого же окна участвуют только как <i>цель</i>
+        consistency loss, никогда как вход динамики. Вся история до sₖ доступна dynamics-сети только через то, что
+        успело «уложиться» в один вектор sₖ₋₁.
+      </p>
+    </div>
+  )
+}
+
+/** The single picture UniZero's whole pitch rests on: every past
+ * observation/action stays its own token, and the Transformer's causal
+ * attention lets the *last* token look directly at every earlier one in
+ * the window — nothing is squeezed into one carried-over vector the way
+ * `LatentChainDiagram` (previous lesson) draws it. Also marks exactly
+ * which token position each head reads its hidden state off of. */
+export function TokenAttentionDiagram() {
+  const tokens: { label: string; kind: 'obs' | 'act' | 'cur' }[] = [
+    { label: 'obs₀', kind: 'obs' },
+    { label: 'act₀', kind: 'act' },
+    { label: 'obs₁', kind: 'obs' },
+    { label: 'act₁', kind: 'act' },
+    { label: 'obsₜ', kind: 'cur' },
+  ]
+  const xs = [16, 78, 140, 202, 264]
+  const w = 44
+  const h = 28
+  const y = 96
+  const centers = xs.map((x) => x + w / 2)
+  const lastCx = centers[centers.length - 1]
+  const arcHeights = [54, 44, 32, 20]
+  const fill: Record<string, string> = { obs: 'fill-background', act: 'fill-amber-500/10', cur: 'fill-primary/20' }
+  const stroke: Record<string, string> = {
+    obs: 'oklch(0.45 0 0)', act: 'oklch(0.75 0.15 70)', cur: 'oklch(0.7 0.15 260)',
+  }
+
+  return (
+    <svg viewBox="0 0 336 172" className="h-44 w-full max-w-xl">
+      <text x={168} y={13} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        причинное (causal) внимание: последний токен «видит» каждый прошлый obs/act-токен окна памяти напрямую
+      </text>
+
+      {centers.slice(0, -1).map((cx, i) => (
+        <path
+          key={`arc-${i}`}
+          d={`M ${lastCx} ${y - 2} Q ${(lastCx + cx) / 2} ${y - 2 - arcHeights[i]} ${cx} ${y - 2}`}
+          fill="none"
+          stroke="oklch(0.7 0.15 260)"
+          strokeOpacity={0.5}
+          strokeWidth={1.3}
+        />
+      ))}
+
+      {tokens.map((t, i) => (
+        <g key={t.label}>
+          <rect
+            x={xs[i]} y={y} width={w} height={h} rx={5}
+            className={fill[t.kind]} stroke={stroke[t.kind]} strokeWidth={t.kind === 'cur' ? 2 : 1.3}
+          />
+          <text x={centers[i]} y={y + h / 2 + 3} textAnchor="middle" className="fill-foreground text-[9px] font-medium">
+            {t.label}
+          </text>
+        </g>
+      ))}
+
+      <line x1={centers[3]} y1={y + h + 3} x2={centers[3]} y2={y + h + 9} stroke="oklch(0.75 0.15 70)" strokeWidth={1} />
+      <text x={centers[3]} y={y + h + 20} textAnchor="middle" className="fill-amber-500 text-[8px]">reward здесь</text>
+      <line x1={centers[4]} y1={y + h + 3} x2={centers[4]} y2={y + h + 21} stroke="oklch(0.7 0.15 260)" strokeWidth={1} />
+      <text x={centers[4]} y={y + h + 32} textAnchor="middle" className="fill-primary text-[8px]">policy/value здесь</text>
+    </svg>
+  )
+}
+
+/** The Gumbel-search "funnel": round 1 samples m candidates via
+ * Gumbel-Top-k (logits + Gumbel noise, no Dirichlet noise needed), then
+ * Sequential Halving repeatedly throws away the worse half by
+ * `completed Q` until one candidate — the real `env_action` — survives.
+ * Static/illustrative numbers, same spirit as `MCTSTreeDiagram`
+ * (AlphaZero lesson) but for the halving tournament instead of PUCT. */
+export function GumbelHalvingDiagram() {
+  const round1 = [
+    { x: 8, label: 'a₁', score: '0.62', alive: true },
+    { x: 88, label: 'a₂', score: '0.88', alive: true },
+    { x: 168, label: 'a₃', score: '0.35', alive: false },
+    { x: 248, label: 'a₄', score: '0.51', alive: false },
+  ]
+  const round2 = [{ x: 8, label: 'a₁', n: 6 }, { x: 88, label: 'a₂', n: 10 }]
+  const winnerX = 88
+
+  return (
+    <svg viewBox="0 0 336 208" className="h-52 w-full max-w-xl">
+      <text x={168} y={12} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        раунд 1: Gumbel-Top-k из prior — m кандидатов проходят в дерево
+      </text>
+      {round1.map((c) => (
+        <g key={c.label} opacity={c.alive ? 1 : 0.35}>
+          <rect
+            x={c.x} y={22} width={56} height={30} rx={5}
+            className={c.alive ? 'fill-primary/10' : 'fill-background'}
+            stroke={c.alive ? 'oklch(0.7 0.15 260)' : 'oklch(0.45 0 0)'} strokeWidth={1.3}
+          />
+          <text x={c.x + 28} y={36} textAnchor="middle" className="fill-foreground text-[9px] font-medium">{c.label}</text>
+          <text x={c.x + 28} y={47} textAnchor="middle" className="fill-muted-foreground text-[7.5px]">g+prior={c.score}</text>
+          {!c.alive && <line x1={c.x + 6} y1={26} x2={c.x + 50} y2={48} stroke="oklch(0.55 0.2 25)" strokeWidth={1.5} />}
+        </g>
+      ))}
+
+      <text x={168} y={72} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        раунд 2 (Sequential Halving): половина отброшена по completed Q
+      </text>
+      {round2.map((c) => (
+        <g key={c.label}>
+          <line x1={c.x + 28} y1={52} x2={c.x + 28} y2={84} stroke="oklch(0.4 0 0)" strokeWidth={1.2} />
+          <rect x={c.x} y={84} width={56} height={30} rx={5} className="fill-primary/10" stroke="oklch(0.7 0.15 260)" strokeWidth={1.3} />
+          <text x={c.x + 28} y={98} textAnchor="middle" className="fill-foreground text-[9px] font-medium">{c.label}</text>
+          <text x={c.x + 28} y={109} textAnchor="middle" className="fill-muted-foreground text-[7.5px]">N={c.n}</text>
+        </g>
+      ))}
+
+      <text x={168} y={138} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        финал: победитель — max visit-count среди выживших
+      </text>
+      <line x1={winnerX + 28} y1={114} x2={winnerX + 28} y2={150} stroke="oklch(0.4 0 0)" strokeWidth={1.2} />
+      <rect x={winnerX - 20} y={150} width={96} height={38} rx={6} className="fill-emerald-500/15" stroke="oklch(0.75 0.18 150)" strokeWidth={2} />
+      <text x={winnerX + 28} y={166} textAnchor="middle" className="fill-foreground text-[9px] font-semibold">env_action = a₂</text>
+      <text x={winnerX + 28} y={178} textAnchor="middle" className="fill-muted-foreground text-[8px]">N=32 (num_simulations)</text>
+    </svg>
+  )
+}
+
+/** Two-hot categorical target — MuZero Appendix F's answer to "one big
+ * reward spike shouldn't blow up a scalar-MSE loss": the true value is
+ * never rounded to its nearest bin, its probability mass is split between
+ * the two bins straddling it (here `target ≈ 2.35` between bins `2` and
+ * `3`), and the network learns a full softmax over every bin instead of
+ * regressing one scalar. */
+export function TwoHotBinsChart() {
+  const target = 2.35
+  const lower = Math.floor(target)
+  const frac = target - lower
+  const bins = Array.from({ length: 11 }, (_, i) => i - 5)
+  const data = bins.map((b) => ({
+    bin: b,
+    weight: b === lower ? Number((1 - frac).toFixed(2)) : b === lower + 1 ? Number(frac.toFixed(2)) : 0,
+  }))
+  return (
+    <div className="h-40 w-full">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{ top: 4, right: 12, left: -18, bottom: 14 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} />
+          <XAxis
+            dataKey="bin" stroke={CHART_AXIS} fontSize={10} tickLine={false}
+            label={{ value: `корзина h(x), target = h(${target})`, position: 'insideBottom', offset: -6, fontSize: 10, fill: CHART_AXIS }}
+          />
+          <YAxis stroke={CHART_AXIS} fontSize={10} domain={[0, 1]} tickLine={false} />
+          <RTooltip contentStyle={CHART_TOOLTIP} formatter={(v: number) => v.toFixed(2)} />
+          <Bar dataKey="weight" name="two-hot вес корзины" fill={CHART_LINE_1} radius={[3, 3, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
     </div>
   )
 }

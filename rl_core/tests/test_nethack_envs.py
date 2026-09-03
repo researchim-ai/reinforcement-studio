@@ -10,10 +10,11 @@ import tempfile
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import pytest
 
 from rl_core.envs import registry
-from rl_core.envs.nethack_envs import _MINIHACK_BASE_IDS, _NETHACK_BASE_IDS
+from rl_core.envs.nethack_envs import _MINIHACK_BASE_IDS, _NETHACK_BASE_IDS, _RENDER_TILE_PX, _RENDER_VIEWPORT_COLS
 
 
 def _has(module: str) -> bool:
@@ -89,6 +90,31 @@ def test_every_registered_minihack_id_is_constructible(img_id):
     env = gym.make(img_id)
     env.reset(seed=0)
     env.step(env.action_space.sample())
+    env.close()
+
+
+@pytest.mark.skipif(not _has("nle"), reason="nle not installed")
+def test_pixel_render_is_cropped_to_a_viewport_not_the_full_dungeon():
+    # Regression test: NLE's own `render_mode="pixel"` always draws the
+    # *entire* 21x79-tile dungeon screen regardless of how much of the
+    # level is actually explored — un-cropped, the live-preview GIF is
+    # mostly dead black space around a small room, which looks like "the
+    # map isn't rendering at all" (see `_crop_pixel_frame_to_viewport`'s
+    # docstring). This asserts the crop is both present (narrower than the
+    # full dungeon) and consistently sized (a fixed viewport, not "however
+    # big the currently-explored area happens to be" — GIF frames must all
+    # share one size).
+    env = gym.make("NetHackScore-Img-v0", render_mode="rgb_array")
+    env.reset(seed=0)
+    frame = env.render()
+    assert frame is not None
+    arr = np.asarray(frame)
+    assert arr.shape[1] == _RENDER_VIEWPORT_COLS * _RENDER_TILE_PX
+    assert arr.shape[1] < 79 * _RENDER_TILE_PX  # narrower than the full uncropped dungeon width
+    for _ in range(5):
+        env.step(env.action_space.sample())
+        frame2 = env.render()
+        assert np.asarray(frame2).shape == arr.shape  # every frame stays the same fixed size
     env.close()
 
 

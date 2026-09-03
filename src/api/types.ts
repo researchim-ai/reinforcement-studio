@@ -191,6 +191,11 @@ export interface HyperparamSpec {
   // picker UI where a raw numeric code wouldn't mean anything to a user.
   options?: HyperparamOption[]
   visibleWhen?: HyperparamCondition[]
+  // Hover-tooltip text explaining what the hyperparameter does, in both
+  // supported UI languages (see backend/routes/environments.py's
+  // `_HP_DESCRIPTIONS`/`_HP_DESCRIPTIONS_BY_ALGO`). Absent for hyperparams
+  // of custom plugin algorithms, which don't go through that catalog.
+  desc?: { ru: string; en: string }
 }
 
 export interface AlgorithmSpec {

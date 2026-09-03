@@ -39,7 +39,7 @@ interface Step {
 
 type Family =
   | 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero'
-  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'ippo' | 'qmix' | 'generic'
+  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'unizero' | 'ippo' | 'qmix' | 'generic'
 
 /** Best-effort family detection from the algorithm id — used to pick which
  * canned "how it learns" loop to render. Custom plugins (`custom:*`) fall
@@ -62,6 +62,7 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (id.includes('pets')) return 'pets'
   if (id.includes('world_models_ha') || id.includes('world-models-ha')) return 'world_models_ha'
   if (id.includes('efficientzero') || id.includes('efficient-zero') || id.includes('muzero')) return 'efficientzero'
+  if (id.includes('unizero')) return 'unizero'
   if (id === 'ippo' || id.includes('ippo')) return 'ippo'
   if (id === 'qmix' || id.includes('qmix')) return 'qmix'
   return 'generic'
@@ -258,6 +259,28 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
           },
         ],
         loopCaption: 'Model-based planning: на каждом шаге заново ищется улучшенная политика через representation/dynamics/prediction сети, поиск даёт и действие, и обучающий target',
+      }
+    case 'unizero':
+      return {
+        steps: [
+          { icon: History, title: 'Токены: [obs, act, obs, act, ...]', detail: hp(hyperparams, 'context_length', 'context=') },
+          {
+            icon: Layers,
+            title: 'Causal Transformer',
+            detail: joinDetail(hp(hyperparams, 'num_layers', 'layers='), hp(hyperparams, 'embed_dim', 'dim=')),
+          },
+          {
+            icon: Crosshair,
+            title: 'Gumbel-поиск по представлению',
+            detail: hp(hyperparams, 'num_simulations', 'sim='),
+          },
+          {
+            icon: Brain,
+            title: 'Reward/value/policy + consistency',
+            detail: hp(hyperparams, 'unroll_steps', 'unroll='),
+          },
+        ],
+        loopCaption: 'Как EfficientZero, но вместо рекуррентной (LSTM/MLP) динамики — единый causal Transformer над явной последовательностью токенов [obs₀, act₀, obs₁, act₁, ...]: каждое прошлое наблюдение остаётся напрямую доступным через attention, а не сжимается в один вектор состояния',
       }
     case 'ippo':
       return {

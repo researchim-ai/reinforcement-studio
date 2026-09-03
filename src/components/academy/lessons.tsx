@@ -7,8 +7,9 @@ import {
 } from 'lucide-react'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
 import {
-  AgentEnvLoopDiagram, Callout, DiscountChart, EpsilonDecayChart, Formula, FlowRow,
-  ImaginationDiagram, MCTSTreeDiagram, MemoryTimelineDiagram, PaperLink, PomdpCompareDiagram, PPOClipChart, Section,
+  AgentEnvLoopDiagram, Callout, DiscountChart, EpsilonDecayChart, Formula, FlowRow, GumbelHalvingDiagram,
+  ImaginationDiagram, LatentChainDiagram, MCTSTreeDiagram, MemoryTimelineDiagram, PaperLink, PomdpCompareDiagram,
+  PPOClipChart, Section, TokenAttentionDiagram, TwoHotBinsChart,
 } from './visuals'
 
 export interface Lesson {
@@ -1329,6 +1330,18 @@ const efficientzero: Lesson = {
         </p>
       </Section>
 
+      <Section title="Training unroll: как разворачивается предсказание вперёд">
+        <p>
+          Обучение берёт из буфера окно из <code>unroll_steps + 1</code> реальных шагов подряд: реальное
+          <code> obs₀</code> и <code>unroll_steps</code> реальных действий <code>a₀, a₁, ...</code>, которые
+          агент и правда выполнил. Представление <code>s₀ = h(obs₀)</code> строится один раз из настоящего
+          наблюдения — а дальше каждый следующий <code>sₖ = g(sₖ₋₁, aₖ₋₁)</code> получается <i>чисто</i> из
+          dynamics-сети по известному реальному действию, без единого повторного обращения к настоящему
+          наблюдению. Policy/value читаются с каждого <code>sₖ</code>, reward — с каждого перехода.
+        </p>
+        <LatentChainDiagram />
+      </Section>
+
       <Section title="Consistency loss: как латент не разваливается без реконструкции">
         <p>
           Без reconstruction loss нечем помешать representation-сети коллапсировать s в
@@ -1358,6 +1371,37 @@ consistency_loss = − cosine_similarity(p_true, p_pred)`}
         </p>
       </Section>
 
+      <Section title="Категориальные value/reward-головы: почему не просто один скаляр + MSE">
+        <p>
+          И value-голова, и «value prefix» (reward-голова dynamics-сети) предсказывают не одно
+          число, а <i>распределение</i> по фиксированному набору из <code>2 · value_support_size +
+          1</code> «корзин» — ровно приём MuZero (Appendix F, «scaling and squashing»). Причина не
+          декоративная: у скалярной MSE-головы loss растёт <i>квадратично</i> от масштаба цели —
+          одна редкая большая награда (бонус, добыча, скачок score) в минибатче делает loss (и
+          градиент) этого шага обучения огромным относительно всех остальных, обычных шагов.
+          Категориальная голова вместо этого сначала сжимает весь диапазон через{' '}
+          <code>signed_hyperbolic</code> (логарифмически по модулю), а затем учится cross-entropy
+          по «two-hot» цели (вес размазан между двумя соседними корзинами) — loss любого одного
+          шага ограничен сверху <code>log(число корзин)</code> независимо от того, насколько
+          большой была именно эта цель.
+        </p>
+        <Formula caption="MuZero Appendix F: h — сжимающее преобразование, h⁻¹ — обратное; корзины равномерны в h-масштабе">
+{`h(x)   = sign(x) · (sqrt(|x| + 1) − 1) + ε·x
+h⁻¹(y) = sign(y) · (((sqrt(1 + 4ε(|y| + 1 + ε)) − 1) / 2ε)² − 1)
+
+target = two_hot(h(x))                     # cross-entropy, не MSE(x̂, x)
+x̂      = h⁻¹(Σ_bin  softmax(logits)_bin · bin_value)`}
+        </Formula>
+        <TwoHotBinsChart />
+        <Callout tone="warning" title="Это не только про качество обучения — это про стабильность">
+          Именно отсутствие этого приёма стояло за всплесками value_loss/reward_loss на всплесках
+          награды в средах с «спайковой» наградой (например, NetHack: несколько шагов почти без
+          награды, затем один большой скачок) — plain-скалярная MSE-голова превращает такой скачок
+          в разрушительно большой градиент на этом шаге обучения. Категориальная голова устраняет
+          это в первую очередь, а не просто «более точно оценивает большие значения».
+        </Callout>
+      </Section>
+
       <Section title="Gumbel search: настоящее дерево, только с бюджетированным отбором кандидатов вместо классического PUCT-MCTS">
         <p>
           Классический PUCT-MCTS (AlphaZero, оригинальный MuZero) тратит сотни симуляций на ход —
@@ -1375,6 +1419,7 @@ consistency_loss = − cosine_similarity(p_true, p_pred)`}
           полученное значение обратно вверх по всему пройденному пути — ровно тот же механизм
           backup'а, что у PUCT-MCTS, просто без огромного бюджета симуляций на ход.
         </p>
+        <GumbelHalvingDiagram />
         <Formula caption="v_mix/completed Q (Danihelka et al., 2022, Appendix D) — то, что даёт даже НЕ раскрытым узлам разумную оценку Q вместо того, чтобы их просто игнорировать">
 {`# корень: Gumbel-Top-k из m кандидатов, round-robin по visit-count
 # внутри дерева: argmax(improved_policy − visit_fraction), без Sequential Halving
@@ -1410,12 +1455,27 @@ action = Sequential-Halving-победитель среди корневых к�
 
       <Callout tone="info" title="Упрощения этой реализации относительно статьи">
         Дерево поиска и его формулы (Gumbel-Top-k, Sequential Halving, v_mix/completed Q, backup
-        значений) реализованы без сокращений — это то же самое дерево, что в статье. Упрощено
-        только вокруг него: value-цель для обучения — стандартный n-step TD-bootstrap текущей
-        value-сетью, а не полный re-rollout последней политики (Search-Based Value Estimation
-        статьи, нужный только для коррекции устаревших сохранённых value-target'ов — TD-bootstrap
-        решает ту же проблему проще); и никакого Dirichlet-шума в корневых приорах — сам
+        значений) реализованы без сокращений — это то же самое дерево, что в статье, сверено
+        построчно с их же C++/Cython-путём поиска (`gumbel_cnode.cpp`), которым они реально
+        обучают модели (их Python-путь `py_mcts.py` — отладочный, с собственным квирком: top-m
+        там фактически не работает). Prioritized replay и reanalyze (см. ниже) — тоже перенесены,
+        а не упрощены. Что осталось проще, чем у них: никакого отдельного async self-play/
+        reanalyze/train на Ray — reanalyze у нас синхронный, встроенный в основной цикл (дороже по
+        wall-clock, но без второго процесса); и никакого Dirichlet-шума в корневых приорах — сам
         Gumbel-Top-k уже даёт свежую случайность в том, какие действия попадут на рассмотрение.
+      </Callout>
+
+      <Callout tone="good" title="Prioritized Experience Replay + Reanalyze — перенесены из оригинала">
+        Раньше буфер сэмплировал переходы равномерно, а value-цель была одним фиксированным
+        n-step TD-таргетом. Теперь — как в `ez/agents/base.py` оригинала: (1) сэмплирование
+        пропорционально |предсказание value − таргет|<sup>priority_alpha</sup> (Schaul et al.,
+        2016) с importance-sampling коррекцией (priority_beta) лосса, чтобы это не смещало
+        градиент; (2) reanalyze — каждые reanalyze_freq реальных шагов заново прогоняем
+        search() текущей (уже более обученной) сетью по случайным сохранённым переходам и
+        перезаписываем их policy_target/search_value — у оригинала это отдельные фоновые
+        процессы, у нас — периодический проход внутри общего цикла; (3) value-таргет —
+        max(TD-bootstrap, search_value) — их режим value_target='max': переход, который ещё не
+        реанализировали, прозрачно откатывается на обычный TD-таргет.
       </Callout>
 
       <Callout tone="info" title="training.num_envs > 1 — это по-настоящему батчевый поиск">
@@ -1423,6 +1483,158 @@ action = Sequential-Halving-победитель среди корневых к�
         независимых копий», здесь search() принимает сразу весь батч наблюдений и строит все N
         деревьев в лок-степе: каждая из num_simulations симуляций считает раскрытие узла для всех
         N лейнов ОДНИМ batched forward pass'ом через dynamics/prediction-сети, а не N отдельными.
+      </Callout>
+
+      <Callout tone="tip" title="consistency_loss_coef=5.0 по умолчанию — как в официальном atari.yaml">
+        Официальный репозиторий EfficientZeroV2 весит consistency loss в 5 раз сильнее value loss
+        (5.0 против 0.5 — для DMC/continuous 2.0) — это безопасно именно потому, что BatchNorm +
+        асимметрия projector/predictor + stop-gradient на «истинной» ветке структурно не дают
+        представлению схлопнуться независимо от веса лосса (в этом и смысл SimSiam/BYOL-трюка) —
+        больший вес просто быстрее и точнее подгоняет представление, а не рискует коллапсом.
+      </Callout>
+
+      <Callout tone="good" title="train_freq/train_steps_per_iter не зависят от num_envs">
+        num_timesteps растёт на num_envs за итерацию (все лейны шагают в лок-степе), поэтому наивная
+        проверка «пересекли ли границу train_freq?» срабатывает не более раза за итерацию — даже
+        если такой скачок пересёк сразу несколько границ. Без поправки на это рост num_envs тихо
+        делил бы частоту обучения относительно собранного опыта на num_envs (в 24 → 48 лейнов —
+        вдвое реже градиентных шагов на реальный шаг среды). Обучение считает, сколько границ
+        train_freq реально пересечено за скачок, и делает train_steps_per_iter обновлений за
+        каждую — соотношение «градиентных шагов на единицу опыта» остаётся постоянным при любом
+        num_envs.
+      </Callout>
+    </>
+  ),
+}
+
+// ---------------------------------------------------------------------------
+// 7f2. UniZero — Transformer вместо рекуррентной динамики
+// ---------------------------------------------------------------------------
+
+const unizero: Lesson = {
+  id: 'unizero',
+  title: 'UniZero (MuZero + Transformer)',
+  tagline: 'Тот же рецепт «планировать через выученную модель мира на каждом шаге», что у EfficientZero — но модель мира не рекуррентная, а causal Transformer над явной последовательностью токенов',
+  icon: History,
+  group: 'World Models',
+  badges: ['Model-based', 'Transformer world model', 'MCTS/Gumbel search', 'Дискретные и continuous'],
+  content: (
+    <>
+      <AlgorithmDiagram
+        algorithmId="unizero"
+        kind="gym"
+        hyperparams={{ embed_dim: 128, num_layers: 2, context_length: 6, num_simulations: 32, unroll_steps: 5 }}
+        show={{ network: false }}
+      />
+
+      <p className="text-[13px] text-muted-foreground">
+        UniZero (<PaperLink url="https://arxiv.org/abs/2406.10667">Pu, Zhao, Niu et al., ICLR 2025</PaperLink>,
+        проект <PaperLink url="https://github.com/opendilab/LightZero">LightZero</PaperLink>) решает ту же
+        задачу, что и предыдущий урок — планировать маленьким деревом через выученную модель мира на
+        каждом реальном шаге — но меняет саму модель мира. У EfficientZero (и у самого MuZero) вся
+        история сжимается в один вектор латентного состояния s, который LSTM/MLP-динамика шаг за шагом
+        обновляет. UniZero вместо этого держит явную последовательность токенов — каждое прошлое
+        наблюдение и действие остаётся своим собственным токеном, к которому Transformer может напрямую
+        обратиться через attention на любом более позднем шаге, а не «наполовину забытым» внутри одного
+        сжатого вектора.
+      </p>
+
+      <Section title="Токены вместо одного вектора состояния">
+        <FlowRow
+          items={[
+            { icon: Eye, title: 'obsₜ → токен', detail: 'тот же encoder, что и везде в приложении' },
+            { icon: Target, title: 'actionₜ → токен', detail: 'one-hot/raw вектор → embedding' },
+            { icon: Layers, title: 'Causal Transformer', detail: 'внимание на все прошлые токены окна памяти' },
+          ]}
+        />
+        <TokenAttentionDiagram />
+        <p>
+          Входная последовательность — <code>[obs₀, act₀, obs₁, act₁, ..., obsₜ]</code>: наблюдение и
+          действие каждого прошлого шага (в пределах окна <code>context_length</code>) — отдельный токен.
+          Головы читают конкретные позиции этой последовательности после Transformer'а: reward — с
+          hidden state в позиции токена <i>действия</i> (модель предсказывает награду именно за это
+          действие), policy/value — с позиции токена <i>наблюдения</i> (та же логика, что у EfficientZero:
+          что делать/сколько это стоит, оценивается до выбора действия). И value, и reward — те же
+          категориальные головы (signed-hyperbolic + two-hot, MuZero Appendix F), что и в EfficientZero —
+          см. предыдущий урок за подробным разбором, почему это не «просто одна голова вместо другой».
+        </p>
+      </Section>
+
+      <Section title="Полное использование траектории при обучении — не только первого наблюдения">
+        <p>
+          У EfficientZero обучающий unroll реально «видит» настоящее наблюдение только один раз (в самом
+          начале), а дальше unroll идёт через собственные предсказания dynamics-сети — настоящие
+          <code>next_obs</code> в этом unroll'е используются только как <i>цель</i> для consistency loss, а
+          не как вход. У UniZero наоборот: вся последовательность из <code>unroll_steps + 1</code> настоящих
+          наблюдений подаётся в Transformer <i>сразу</i>, за один forward pass, и каждое из них сразу даёт
+          свой собственный reward/value/policy loss — не только первое. Ровно это в статье называется
+          «полное использование траектории» и объясняется как одна из причин, почему UniZero сходится
+          быстрее рекуррентной модели мира даже без каких-либо задач на длинную память.
+        </p>
+      </Section>
+
+      <Section title="Consistency loss здесь играет другую роль — учит именно 'воображение'">
+        <p>
+          Раз обучение видит настоящие наблюдения на каждом шаге, для чего вообще нужен consistency loss?
+          Ответ — для <i>поиска</i>: во время Gumbel-поиска (и во время предсказания на много шагов
+          вперёд) настоящих будущих наблюдений ещё нет, и Transformer должен «представить», что увидел бы
+          следующий obs-токен, чтобы продолжить последовательность и раскрыть узел дерева глубже. Голова
+          <code>latent_head</code> учится предсказывать этот воображаемый следующий токен из hidden state
+          позиции действия — а обучается она той же SimSiam-схемой (projector/predictor + BatchNorm +
+          stop-gradient на «настоящей» ветке), что и consistency loss EfficientZero, просто целью здесь
+          служит сырой (до-Transformer'ный) embedding настоящего следующего наблюдения — тот же тензор,
+          что и так вычисляется как часть общего forward pass'а обучения, просто с <code>.detach()</code>.
+        </p>
+      </Section>
+
+      <Section title="Поиск — тот же Gumbel search, что у EfficientZero, просто с другим 'шагом динамики'">
+        <p>
+          Дерево поиска (Gumbel-Top-k в корне, Sequential Halving, v_mix/completed Q, backup значений —
+          см. предыдущий урок за формулами) здесь буквально то же самое, включая и то, как решается
+          continuous-случай (сэмплирование K кандидатов из текущей гауссовой политики + расширенной
+          версии). Меняется только то, что происходит при раскрытии одного узла: вместо одного вызова
+          LSTM-динамики — два forward pass'а Transformer'а (действие → reward, воображаемое следующее
+          наблюдение → policy/value), а «состояние» узла дерева — это не вектор фиксированного размера, а
+          собственный кусок последовательности токенов этого узла (растёт на 2 токена на каждую ступень
+          вглубь дерева).
+        </p>
+      </Section>
+
+      <Callout tone="good" title="RoPE вместо обучаемых позиций — и поэтому персистентный KV-cache без потерь">
+        Позиция токена здесь кодируется не обучаемым вектором (как в оригинале), а поворотом (RoPE, Su
+        et al., 2021) query/key-векторов на угол, пропорциональный позиции, прямо перед скалярным
+        произведением в attention — поэтому каждый вес внимания зависит только от <i>разницы</i> позиций
+        двух токенов, а не от их абсолютных значений. Отсюда сразу два следствия. Первое: окно обучения,
+        всегда нумерующее свои токены с нуля, и self-play, где у токена настоящая, всё растущая абсолютная
+        позиция с начала эпизода, вычисляют математически одно и то же — никакой конвенции синхронизировать
+        не нужно (в отличие от обучаемой таблицы embedding'ов, где значение для позиции 500 и позиции 0 —
+        два ничем не связанных вектора). Второе: вытеснение самых старых записей из KV-cache становится
+        обычным срезом тензора без каких-либо приближённых поправок позиций — в отличие от приёма оригинала
+        (сдвиг + пересчёт позиционной «дельты»), нужного там именно потому, что его обучаемые embedding'и не
+        инвариантны к сдвигу. Поэтому каждый лейн в <code>learn()</code> держит один KV-cache, который живёт
+        весь эпизод, растёт на 2 токена за реальный шаг и подрезается обратно до <code>2×context_length</code>
+        при переполнении — а не перестраивается с нуля каждый шаг, как было в промежуточной версии этого
+        файла. Корень реального шага теперь стоит настоящий <code>O(1)</code>, а не <code>O(context_length)</code>.
+      </Callout>
+
+      <Callout tone="warning" title="Честная оговорка: вытеснение теряет позиционную неоднозначность, но не всё">
+        RoPE снимает проблему позиций при вытеснении полностью — но не делает вытеснение стерильным во
+        всех смыслах при <code>num_layers &gt; 1</code>. Собственное скрытое состояние выжившего токена
+        (а значит, и его key/value на всех слоях выше первого) было посчитано <i>пока</i> вытеснённые токены
+        ещё были доступны для внимания — поэтому немного их влияния остаётся зашитым в остаточном потоке
+        (residual stream) даже после вытеснения. Это неизбежное свойство любого многослойного KV-cache со
+        скользящим окном (в том числе в оригинальном UniZero) и не зависит от способа кодирования позиций —
+        осознанный компромисс, а не незамеченная ошибка: единственная альтернатива — никогда не вытеснять,
+        то есть платить <code>O(длина эпизода)</code> за каждый реальный шаг вместо <code>O(1)</code>.
+      </Callout>
+
+      <Callout tone="good" title="Prioritized Experience Replay + Reanalyze — перенесены как есть">
+        Буфер, приоритизированное сэмплирование (Schaul et al., 2016) и периодический reanalyze (свежий
+        search() текущей сетью поверх сохранённых переходов, value-таргет = max(TD-bootstrap,
+        search_value)) — тот же самый механизм, что в EfficientZero, просто с дополнительным полем
+        контекста (последние <code>context_length</code> реальных пар (observation, action) перед каждым
+        сэмплированным переходом) — эпизоды и так хранятся целиком, так что это просто срез массива, а не
+        отдельное хранилище.
       </Callout>
     </>
   ),
@@ -2368,6 +2580,6 @@ const cheatsheet: Lesson = {
 
 export const LESSONS: Lesson[] = [
   fundamentals, dqn, rainbow, a2c, ppo, sac, ddpg, td3, continuousTechniques, alphazero,
-  worldModelsOverview, dreamer, mbpoPets, worldModelsHa, efficientzero, marlOverview, ippo, qmix,
+  worldModelsOverview, dreamer, mbpoPets, worldModelsHa, efficientzero, unizero, marlOverview, ippo, qmix,
   memory, pomdp, exploration, es, wrappers, cheatsheet,
 ]

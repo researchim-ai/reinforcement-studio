@@ -5,9 +5,14 @@ interface TooltipProps {
   content: string
   children: React.ReactNode
   side?: 'top' | 'right' | 'bottom' | 'left'
+  // Short (e.g. a single value) tooltips read better on one line; longer
+  // free-text descriptions (hyperparameter explanations, ...) need to wrap
+  // instead of stretching the tooltip off-screen. Defaults to wrapping,
+  // since that's safe for both short and long content.
+  wrap?: boolean
 }
 
-function Tooltip({ content, children, side = 'top' }: TooltipProps) {
+function Tooltip({ content, children, side = 'top', wrap = true }: TooltipProps) {
   const [show, setShow] = React.useState(false)
 
   const positionClasses = {
@@ -27,7 +32,8 @@ function Tooltip({ content, children, side = 'top' }: TooltipProps) {
       {show && (
         <div
           className={cn(
-            'absolute z-50 rounded-md bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-md border border-border animate-fade-in whitespace-nowrap',
+            'absolute z-50 rounded-md bg-popover px-3 py-1.5 text-xs leading-snug text-popover-foreground shadow-md border border-border animate-fade-in',
+            wrap ? 'max-w-64 whitespace-normal' : 'whitespace-nowrap',
             positionClasses[side],
           )}
         >

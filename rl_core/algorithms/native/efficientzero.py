@@ -31,6 +31,23 @@ Four MuZero-family ingredients carried over from EfficientZero (V1 and V2):
   unroll's start at each step rather than each step's reward in
   isolation - reduces compounding one-step reward-prediction error over
   a short unroll, exactly like the paper.
+- Categorical value/reward ("scaling and squashing", MuZero Appendix F):
+  both the value head and the value-prefix head predict a *distribution*
+  over a fixed support (`2 * value_support_size + 1` bins) in a
+  `signed_hyperbolic`-transformed scale, trained with cross-entropy
+  against a two-hot target, instead of a single scalar regressed with
+  MSE. This is not decorative - a plain scalar+MSE head's loss is
+  quadratic in the *raw* reward/value scale, so any env with an
+  occasional large or heavy-tailed reward (a boss kill, a big score jump,
+  a rare bonus) makes that one minibatch's loss - and its gradient -
+  explode relative to every ordinary step, exactly the "value_loss
+  spikes" this app's own EfficientZero V2 runs show without it. The
+  hyperbolic transform compresses that same raw range logarithmically
+  *before* the fixed-width bins see it, so every bin (and therefore the
+  cross-entropy loss/gradient) stays boundedly-scaled regardless of how
+  large one particular target happens to be - the categorical head can
+  represent a huge value accurately without blowing up training the way
+  a scalar head chasing the same value with squared error would.
 - Gumbel search (Danihelka et al., 2021 - the search EfficientZero V2
   itself reuses for its discrete case): sample a small set of candidate
   root actions via the Gumbel-Top-k trick, then narrow that set with
@@ -82,20 +99,41 @@ every model-based algorithm here is fundamentally bottlenecked on until
 the model is decent - now gets `num_envs` real transitions per wall-clock
 env.step() instead of one.
 
+Two more pieces ported from the official repo's own training recipe
+(`ez/agents/base.py`/`ez/config/exp/atari.yaml`) rather than staying with
+a "single fixed target, uniform replay" simplification:
+- **Prioritized replay** (Schaul et al., 2016, `priority.use_priority:
+  True` in every one of the reference's own configs): `_EfficientZeroBuffer`
+  samples transitions proportional to `|value_prediction - value_target|
+  ** priority_alpha` from the last time each was trained on (the
+  reference's own `fresh_priority`) instead of uniformly, with the
+  standard importance-sampling correction (`priority_beta`) applied to
+  the loss so this doesn't bias the gradient - just refocuses *when* each
+  transition's gradient contribution lands.
+- **Reanalyze + `value_target: 'max'`**: the reference's own headline
+  answer to target staleness - a transition's stored policy/value target
+  was produced by whatever network existed *when it was collected*,
+  which could be arbitrarily many gradient steps out of date by the time
+  it's actually sampled for training. The reference runs whole separate
+  background worker processes continuously re-`search()`-ing sampled
+  trajectories with the network's current weights to refresh their
+  stored targets; `_reanalyze` ports the same idea as a periodic in-loop
+  pass instead (`reanalyze_freq`/`reanalyze_batch_size`, triggered from
+  `learn()` the same num_envs-independent way `train_freq` is). A
+  transition's value target is then `max(td_bootstrap_target,
+  search_value)` - the reference's own `value_target: 'max'` mode -
+  falling back transparently to the plain TD target for anything not yet
+  reanalyzed.
+
 Remaining simplifications vs. the paper (kept explicit here rather than
 silent, matching this app's convention elsewhere - see e.g. `qmix.py`'s
 own "Stability note"):
-- "Search-Based Value Estimation" (SVE) - the paper additionally re-rolls
-  out imagined trajectories with the *latest* policy/model to re-estimate
-  *training-time* value targets and correct for off-policy staleness on
-  top of what the tree search above already gives. Here the training
-  value target is instead a plain `td_steps`-step return (real rewards,
-  truncated at episode end) bootstrapped by the *current* value net -
-  cheaper to compute for every training sample, and value-network
-  bootstrapping is itself already the standard TD fix for the same
-  staleness problem, just without SVE's extra re-rollout step. The search
-  tree itself (used to pick real actions and produce the policy target)
-  is unabridged.
+- No separate async self-play/reanalyze/train worker processes (Ray) -
+  reanalyze above happens synchronously in-loop instead of on its own
+  always-running process, so it directly costs wall-clock time rather
+  than being "free" background work; tune `reanalyze_freq`/
+  `reanalyze_batch_size` down if that overhead matters more than target
+  freshness for a given env.
 - Latent normalization is a plain `tanh` bound on `s`, not the paper's
   learned min-max rescaling - same spirit (keep the model's own latent
   space from exploding, so squared-error/cosine losses on it stay
@@ -144,16 +182,39 @@ DEFAULT_HYPERPARAMS = {
     "c_visit": 50.0,
     "c_scale": 0.1,
     "value_minmax_delta": 0.01,
+    "value_support_size": 300,
     "gamma": 0.99,
     "value_loss_coef": 0.5,
     "policy_loss_coef": 1.0,
     "reward_loss_coef": 1.0,
-    "consistency_loss_coef": 1.0,
+    # 5.0, not 1.0 - matches the official EfficientZeroV2 repo's own
+    # discrete/image-based (Atari) default config (ez/config/exp/atari.yaml:
+    # consistency_coeff=5.0 vs value_loss_coeff=0.5, a 10x ratio; continuous
+    # DMC configs use 2.0). Safe to weight this heavily specifically because
+    # the projector/predictor's BatchNorm1d + stop-gradient (see _Projector/
+    # _Predictor below) structurally prevents representation collapse
+    # regardless of loss weight - that's the entire point of the SimSiam/
+    # BYOL asymmetry, so a higher weight just makes the representation
+    # converge faster/tighter rather than risking collapse.
+    "consistency_loss_coef": 5.0,
     "continuous_prior_scale": 2.5,
     "policy_target_temperature": 1.0,
     "train_freq": 1,
     "train_steps_per_iter": 1,
     "learning_starts": 500,
+    # Prioritized replay (Schaul et al., 2016) + reanalyze (target
+    # staleness correction) - see `_EfficientZeroBuffer`/`_reanalyze`
+    # docstrings. Values match the official EfficientZeroV2 repo's own
+    # `ez/config/exp/atari.yaml` (`priority_prob_alpha`/`priority_prob_beta`
+    # both 1.0, `min_prior` ~1e-6); `reanalyze_freq`/`reanalyze_batch_size`
+    # are this port's own knobs for how often/how much to refresh (the
+    # reference instead runs a whole separate always-on async worker
+    # process for this - see module docstring).
+    "priority_alpha": 1.0,
+    "priority_beta": 1.0,
+    "min_priority": 1e-6,
+    "reanalyze_freq": 200,
+    "reanalyze_batch_size": 64,
     "max_grad_norm": 5.0,
 }
 
@@ -185,15 +246,16 @@ class _Dynamics(nn.Module):
     is a *cumulative* sum from wherever that reset happened, not a
     standalone per-step reward."""
 
-    def __init__(self, latent_dim: int, action_dim: int, hidden_dim: int) -> None:
+    def __init__(self, latent_dim: int, action_dim: int, hidden_dim: int, support_size: int) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.support_size = support_size
         self.state_encoder = nn.Linear(latent_dim, hidden_dim)
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
         self.trunk = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ELU())
         self.next_latent_head = nn.Linear(hidden_dim, latent_dim)
         self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
-        self.value_prefix_head = nn.Linear(hidden_dim, 1)
+        self.value_prefix_head = nn.Linear(hidden_dim, 2 * support_size + 1)
 
     def initial_lstm_state(self, batch_size: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
         h = torch.zeros(batch_size, self.hidden_dim, device=device)
@@ -203,12 +265,16 @@ class _Dynamics(nn.Module):
     def forward(
         self, s: torch.Tensor, action: torch.Tensor, lstm_state: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Returns `value_prefix_logits` (categorical, see module docstring's
+        "Categorical value/reward" bullet) - use `_logits_to_scalar` for the
+        raw cumulative-reward estimate, or feed the logits straight into a
+        cross-entropy loss against `_scalar_to_two_hot(cum_reward, ...)`."""
         x = torch.cat([self.state_encoder(s), self.action_encoder(action)], dim=-1)
         h = self.trunk(x)
         next_s = torch.tanh(self.next_latent_head(h))
         lstm_h, lstm_c = self.lstm(h, lstm_state)
-        value_prefix = self.value_prefix_head(lstm_h).squeeze(-1)
-        return next_s, value_prefix, (lstm_h, lstm_c)
+        value_prefix_logits = self.value_prefix_head(lstm_h)
+        return next_s, value_prefix_logits, (lstm_h, lstm_c)
 
 
 class _Prediction(nn.Module):
@@ -217,11 +283,12 @@ class _Prediction(nn.Module):
     actions get a diagonal Gaussian, exactly like `dreamer.py`'s `_Actor`
     (same tanh-squash-and-rescale-to-bounds convention)."""
 
-    def __init__(self, latent_dim: int, action_space: gym.Space, hidden_dim: int) -> None:
+    def __init__(self, latent_dim: int, action_space: gym.Space, hidden_dim: int, support_size: int) -> None:
         super().__init__()
         self.discrete = isinstance(action_space, gym.spaces.Discrete)
+        self.support_size = support_size
         self.trunk = nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.ELU())
-        self.value_head = nn.Linear(hidden_dim, 1)
+        self.value_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         if self.discrete:
             self.action_dim = int(action_space.n)
             self.policy_head = nn.Linear(hidden_dim, self.action_dim)
@@ -234,8 +301,15 @@ class _Prediction(nn.Module):
             self.register_buffer("action_scale", torch.as_tensor((high - low) / 2.0, dtype=torch.float32))
             self.register_buffer("action_bias", torch.as_tensor((high + low) / 2.0, dtype=torch.float32))
 
+    def value_logits(self, s: torch.Tensor) -> torch.Tensor:
+        """Categorical value-head logits - see module docstring's
+        "Categorical value/reward" bullet. Used as-is for the training
+        cross-entropy loss; `value()` below converts to a raw scalar for
+        every other caller (search bookkeeping, TD bootstrap target)."""
+        return self.value_head(self.trunk(s))
+
     def value(self, s: torch.Tensor) -> torch.Tensor:
-        return self.value_head(self.trunk(s)).squeeze(-1)
+        return _logits_to_scalar(self.value_logits(s), self.support_size)
 
     def policy_logits(self, s: torch.Tensor) -> torch.Tensor:
         return self.policy_head(self.trunk(s))
@@ -288,6 +362,48 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     x = x - x.max()
     e = np.exp(x)
     return e / e.sum()
+
+
+# ----------------------------------------------------------------------
+# Categorical value/reward support - MuZero Appendix F "scaling and
+# squashing" (`h`/`h^-1`), same closed-form transform DeepMind's own
+# `rlax.signed_hyperbolic`/`signed_parabolic` use - see module docstring's
+# "Categorical value/reward" bullet for *why* this exists (bounding the
+# loss/gradient of the value & value-prefix heads regardless of how large
+# one particular reward/value target happens to be).
+# ----------------------------------------------------------------------
+def _signed_hyperbolic(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    return torch.sign(x) * (torch.sqrt(torch.abs(x) + 1.0) - 1.0) + eps * x
+
+
+def _signed_parabolic(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    z = torch.sqrt(1.0 + 4.0 * eps * (torch.abs(x) + 1.0 + eps)) - 1.0
+    return torch.sign(x) * ((z / (2.0 * eps)) ** 2 - 1.0)
+
+
+def _scalar_to_two_hot(x: torch.Tensor, support_size: int) -> torch.Tensor:
+    """Raw scalar(s) `x` (any shape) -> two-hot distribution over
+    `2 * support_size + 1` bins (new trailing dim), in the
+    `_signed_hyperbolic`-transformed scale - the cross-entropy target for
+    both the value and value-prefix heads."""
+    num_bins = 2 * support_size + 1
+    z = _signed_hyperbolic(x).clamp(-support_size, support_size)
+    floor = z.floor()
+    frac = (z - floor).unsqueeze(-1)
+    floor_idx = (floor + support_size).long().clamp(0, num_bins - 1)
+    ceil_idx = (floor_idx + 1).clamp(0, num_bins - 1)
+    two_hot = torch.zeros(*x.shape, num_bins, device=x.device, dtype=x.dtype)
+    two_hot.scatter_(-1, floor_idx.unsqueeze(-1), 1.0 - frac)
+    two_hot.scatter_add_(-1, ceil_idx.unsqueeze(-1), frac)
+    return two_hot
+
+
+def _logits_to_scalar(logits: torch.Tensor, support_size: int) -> torch.Tensor:
+    """Predicted per-bin logits -> raw scalar (expectation over bins in the
+    transformed scale, then `_signed_parabolic` back to raw)."""
+    probs = F.softmax(logits, dim=-1)
+    support = torch.arange(-support_size, support_size + 1, device=logits.device, dtype=probs.dtype)
+    return _signed_parabolic((probs * support).sum(-1))
 
 
 class _MinMaxStats:
@@ -515,21 +631,50 @@ class _EfficientZeroBuffer:
     training signal for the policy head (the cross-entropy/regression
     target in `_train_step`, not the raw played action).
 
+    Two more per-transition arrays exist purely to port the official
+    EfficientZeroV2 repo's own training recipe (`ez/agents/base.py`,
+    `priority.use_priority: True`, `train.value_target: 'mixed'`) instead
+    of the simpler "single TD target, uniform replay" scheme this file
+    used before:
+    - `priority[t]`: `|value_prediction - value_target|` from the last
+      time this transition was trained on (reference's own `fresh_priority`
+      - see `_train_step`), used for *prioritized* sampling below instead
+      of uniform - new/never-trained transitions start at the buffer's
+      running max priority so they get picked up promptly (standard PER
+      convention, avoids fresh data starving under a stale-but-still-high
+      initial priority estimate).
+    - `search_value[t]`: root value from the *most recent* `search()` call
+      over this transition's `obs[t]` - refreshed periodically by
+      `NativeEfficientZero._reanalyze` using the network's *current*
+      weights, not just whatever the (possibly much less trained) network
+      produced at collection time. `_train_step` takes
+      `max(td_bootstrap_target, search_value)` as the value target - the
+      reference's `value_target: 'max'` mode - so a transition that's
+      never been reanalyzed (`search_value` stays at its `-inf`-ish
+      sentinel) transparently falls back to the plain TD target.
+
     `num_lanes > 1` (`training.num_envs > 1`, see module docstring) lets
     `add(..., lane=i)` accumulate `num_lanes` independent in-progress
     episodes concurrently without their interleaved transitions splicing
     into one another - same convention as `SequenceReplayBuffer`
     (`rl_core/world_models/replay.py`)."""
 
+    _NO_SEARCH_VALUE = -1e9
+
     def __init__(
         self, capacity_episodes: int, obs_shape: tuple[int, ...], action_dim: int, policy_target_dim: int,
-        num_lanes: int = 1,
+        num_lanes: int = 1, priority_alpha: float = 1.0, priority_beta: float = 1.0, min_priority: float = 1e-6,
     ) -> None:
         self.capacity = max(1, capacity_episodes)
         self.obs_shape = obs_shape
         self.action_dim = action_dim
         self.policy_target_dim = policy_target_dim
+        self.priority_alpha = max(0.0, priority_alpha)
+        self.priority_beta = max(0.0, priority_beta)
+        self.min_priority = max(1e-8, min_priority)
         self.episodes: list[dict[str, np.ndarray]] = []
+        self._episode_alpha_sum: list[float] = []
+        self._max_priority = 1.0
         self._cur: list[dict[str, list[Any]]] = [self._new_episode() for _ in range(max(1, num_lanes))]
 
     @staticmethod
@@ -553,15 +698,24 @@ class _EfficientZeroBuffer:
         cur = self._cur[lane]
         if not cur["obs"]:
             return
-        self.episodes.append({
+        ep_len = len(cur["obs"])
+        episode = {
             "obs": np.stack(cur["obs"]),
             "action": np.stack(cur["action"]),
             "reward": np.asarray(cur["reward"], dtype=np.float32),
             "next_obs": np.stack(cur["next_obs"]),
             "policy_target": np.stack(cur["policy_target"]),
-        })
+            # New data starts at the running max priority (PER convention)
+            # so it gets sampled/trained-on promptly rather than starved by
+            # whatever priority scale earlier, already-trained data has.
+            "priority": np.full(ep_len, self._max_priority, dtype=np.float64),
+            "search_value": np.full(ep_len, self._NO_SEARCH_VALUE, dtype=np.float32),
+        }
+        self.episodes.append(episode)
+        self._episode_alpha_sum.append(float(np.sum(episode["priority"] ** self.priority_alpha)))
         if len(self.episodes) > self.capacity:
             self.episodes.pop(0)
+            self._episode_alpha_sum.pop(0)
         self._cur[lane] = self._new_episode()
 
     def __len__(self) -> int:
@@ -572,11 +726,24 @@ class _EfficientZeroBuffer:
         return len(self.episodes)
 
     def sample(self, batch_size: int, unroll_steps: int, td_steps: int, gamma: float) -> dict[str, np.ndarray]:
-        """Random (episode, start index) per batch element, `unroll_steps`
-        contiguous real transitions from there (padded/masked past episode
-        end), plus a `td_steps`-step (truncated at episode end) real-reward
-        sum + bootstrap observation/discount/mask for the value target -
-        see module docstring's "Search-Based Value Estimation" note."""
+        """Prioritized (episode, start index) per batch element - two-level
+        proportional sampling (pick an episode weighted by its total
+        `priority ** alpha`, then a start index within it weighted by its
+        *own* `priority ** alpha`) rather than a single flat sum-tree over
+        every transition in the buffer, which would cost `O(total
+        transitions)` to rebuild on every priority update. This is the
+        standard hierarchical approximation to flat proportional-priority
+        sampling and is exact for the common case of near-uniform priority
+        *within* an episode. `unroll_steps` contiguous real transitions
+        from the sampled start (padded/masked past episode end), plus a
+        `td_steps`-step (truncated at episode end) real-reward sum +
+        bootstrap observation/discount/mask, and the stored `search_value`
+        (see class docstring's `value_target: 'max'` note) for the value
+        target; `episode_idx`/`timestep`/`is_weight` let `_train_step`
+        write fresh priorities back after computing the loss (reference's
+        own `fresh_priority`) and correct the loss for the sampling bias
+        prioritization introduces (importance-sampling weights, Schaul et
+        al., 2016)."""
         obs0 = np.zeros((batch_size, *self.obs_shape), dtype=np.float32)
         action = np.zeros((batch_size, unroll_steps, self.action_dim), dtype=np.float32)
         reward = np.zeros((batch_size, unroll_steps), dtype=np.float32)
@@ -587,11 +754,38 @@ class _EfficientZeroBuffer:
         td_obs = np.zeros((batch_size, unroll_steps, *self.obs_shape), dtype=np.float32)
         td_discount = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_bootstrap_mask = np.zeros((batch_size, unroll_steps), dtype=np.float32)
+        search_value = np.full((batch_size, unroll_steps), self._NO_SEARCH_VALUE, dtype=np.float32)
+        episode_idx = np.zeros(batch_size, dtype=np.int64)
+        timestep = np.zeros(batch_size, dtype=np.int64)
+        sample_prob = np.zeros(batch_size, dtype=np.float64)
+
+        n_episodes = len(self.episodes)
+        alpha_sums = np.asarray(self._episode_alpha_sum, dtype=np.float64)
+        total_alpha_sum = float(alpha_sums.sum())
+        if total_alpha_sum > 0:
+            ep_probs = alpha_sums / total_alpha_sum
+        else:
+            ep_probs = np.full(n_episodes, 1.0 / n_episodes)
+        ep_choices = np.random.choice(n_episodes, size=batch_size, p=ep_probs)
+        n_total_transitions = max(1, len(self))
 
         for b in range(batch_size):
-            ep = self.episodes[np.random.randint(len(self.episodes))]
+            ep_i = int(ep_choices[b])
+            ep = self.episodes[ep_i]
             t_len = len(ep["reward"])
-            start = int(np.random.randint(t_len))
+            local_weight = ep["priority"] ** self.priority_alpha
+            local_sum = float(local_weight.sum())
+            if local_sum > 0:
+                local_probs = local_weight / local_sum
+                start = int(np.random.choice(t_len, p=local_probs))
+                local_prob = float(local_probs[start])
+            else:
+                start = int(np.random.randint(t_len))
+                local_prob = 1.0 / t_len
+            episode_idx[b] = ep_i
+            timestep[b] = start
+            sample_prob[b] = max(ep_probs[ep_i] * local_prob, 1e-12)
+
             obs0[b] = ep["obs"][start]
             for k in range(unroll_steps):
                 idx = start + k
@@ -602,6 +796,7 @@ class _EfficientZeroBuffer:
                 reward[b, k] = ep["reward"][idx]
                 next_obs[b, k] = ep["next_obs"][idx]
                 policy_target[b, k] = ep["policy_target"][idx]
+                search_value[b, k] = ep["search_value"][idx]
 
                 n = min(td_steps, t_len - idx)
                 td_sum, discount = 0.0, 1.0
@@ -614,11 +809,86 @@ class _EfficientZeroBuffer:
                 td_obs[b, k] = ep["next_obs"][landing_idx]
                 td_bootstrap_mask[b, k] = 0.0 if landing_idx == t_len - 1 else 1.0
 
+        # Importance-sampling correction (Schaul et al., 2016, eq. 5):
+        # w_i = (1 / (N * P(i))) ** beta, normalized by the batch's own max
+        # so the largest weight in any given batch is always 1 (keeps the
+        # overall loss scale stable regardless of how skewed priorities
+        # currently are).
+        is_weight = (1.0 / (n_total_transitions * sample_prob)) ** self.priority_beta
+        is_weight = is_weight / max(float(is_weight.max()), 1e-12)
+
         return {
             "obs0": obs0, "action": action, "reward": reward, "next_obs": next_obs,
             "policy_target": policy_target, "mask": mask, "td_reward": td_reward,
             "td_obs": td_obs, "td_discount": td_discount, "td_bootstrap_mask": td_bootstrap_mask,
+            "search_value": search_value, "episode_idx": episode_idx, "timestep": timestep,
+            "is_weight": is_weight.astype(np.float32),
         }
+
+    def update_priorities(self, episode_idx: np.ndarray, timestep: np.ndarray, values: np.ndarray) -> None:
+        """Write fresh `|value_prediction - value_target|` priorities back
+        for exactly the transitions a `sample()` call just returned (safe
+        to call with plain `self.episodes` indices: nothing in `learn()`
+        ever calls `add()`/evicts an episode between a `sample()` and its
+        matching `_train_step`'s priority write-back, both run fully
+        synchronously inside one `_train_step()` call)."""
+        values = np.maximum(np.asarray(values, dtype=np.float64), self.min_priority)
+        touched = set()
+        for ep_i, t, v in zip(episode_idx.tolist(), timestep.tolist(), values.tolist()):
+            if not (0 <= ep_i < len(self.episodes)):
+                continue
+            self.episodes[ep_i]["priority"][t] = v
+            touched.add(ep_i)
+        self._max_priority = max(self._max_priority, float(values.max()) if len(values) else self._max_priority)
+        for ep_i in touched:
+            ep = self.episodes[ep_i]
+            self._episode_alpha_sum[ep_i] = float(np.sum(ep["priority"] ** self.priority_alpha))
+
+    def sample_for_reanalyze(self, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """`n` uniformly-random *distinct-ish* `(episode_idx, timestep)`
+        pairs (plain uniform, unlike `sample()`'s priority weighting -
+        reanalyze's job is to broadly refresh stale targets across the
+        whole buffer, not concentrate on whatever's already
+        high-priority) plus their `obs[timestep]`, for
+        `NativeEfficientZero._reanalyze` to re-`search()` with the
+        network's current weights."""
+        n_episodes = len(self.episodes)
+        n = min(n, sum(len(ep["reward"]) for ep in self.episodes))
+        if n <= 0:
+            empty_obs = np.zeros((0, *self.obs_shape), dtype=np.float32)
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), empty_obs
+        lengths = np.asarray([len(ep["reward"]) for ep in self.episodes], dtype=np.float64)
+        ep_choices = np.random.choice(n_episodes, size=n, p=lengths / lengths.sum())
+        episode_idx = np.zeros(n, dtype=np.int64)
+        timestep = np.zeros(n, dtype=np.int64)
+        obs_out = np.zeros((n, *self.obs_shape), dtype=np.float32)
+        for i, ep_i in enumerate(ep_choices.tolist()):
+            ep = self.episodes[ep_i]
+            t = int(np.random.randint(len(ep["reward"])))
+            episode_idx[i] = ep_i
+            timestep[i] = t
+            obs_out[i] = ep["obs"][t]
+        return episode_idx, timestep, obs_out
+
+    def update_reanalyzed_targets(
+        self, episode_idx: np.ndarray, timestep: np.ndarray, policy_targets: np.ndarray, search_values: np.ndarray,
+    ) -> None:
+        """Overwrite the stored (possibly very stale - collected who knows
+        how many gradient steps ago) `policy_target`/`search_value` for
+        exactly the transitions `sample_for_reanalyze` just returned, with
+        fresh ones from a `search()` call using the network's *current*
+        weights - the actual point of "reanalyze": target staleness
+        correction, ported from the reference's own background reanalyze
+        workers (`ez/worker/`) as a periodic in-loop pass instead of a
+        separate async process (see `NativeEfficientZero._reanalyze`)."""
+        for i, (ep_i, t) in enumerate(zip(episode_idx.tolist(), timestep.tolist())):
+            if not (0 <= ep_i < len(self.episodes)):
+                continue
+            ep = self.episodes[ep_i]
+            if t >= len(ep["reward"]):
+                continue
+            ep["policy_target"][t] = policy_targets[i]
+            ep["search_value"][t] = search_values[i]
 
 
 class NativeEfficientZero(CustomAlgorithm):
@@ -637,9 +907,10 @@ class NativeEfficientZero(CustomAlgorithm):
         proj_dim = int(hyperparams.get("proj_dim", 64))
         self.action_dim = obs_flat_dim(self._action_space)
 
+        self.support_size = max(1, int(hyperparams.get("value_support_size", 300)))
         self.representation = _Representation(self._obs_space, latent_dim, hidden_dim).to(device)
-        self.dynamics = _Dynamics(latent_dim, self.action_dim, hidden_dim).to(device)
-        self.prediction = _Prediction(latent_dim, self._action_space, hidden_dim).to(device)
+        self.dynamics = _Dynamics(latent_dim, self.action_dim, hidden_dim, self.support_size).to(device)
+        self.prediction = _Prediction(latent_dim, self._action_space, hidden_dim, self.support_size).to(device)
         self.projector = _Projector(latent_dim, proj_dim).to(device)
         self.predictor = _Predictor(proj_dim).to(device)
         self._params = (
@@ -670,12 +941,24 @@ class NativeEfficientZero(CustomAlgorithm):
         self.learning_starts = int(hyperparams.get("learning_starts", 500))
         self.max_grad_norm = float(hyperparams.get("max_grad_norm", 5.0))
 
+        # Prioritized replay + reanalyze hyperparams - port of the official
+        # EfficientZeroV2 repo's own default training recipe (`priority.*`/
+        # `train.reanalyze_ratio`/`train.value_target: 'mixed'` in
+        # `ez/config/exp/atari.yaml`), see `_EfficientZeroBuffer`'s and
+        # `_reanalyze`'s docstrings for what each actually does.
+        self.priority_alpha = max(0.0, float(hyperparams.get("priority_alpha", 1.0)))
+        self.priority_beta = max(0.0, float(hyperparams.get("priority_beta", 1.0)))
+        self.min_priority = max(1e-8, float(hyperparams.get("min_priority", 1e-6)))
+        self.reanalyze_freq = max(1, int(hyperparams.get("reanalyze_freq", 200)))
+        self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 64)))
+
         sample_obs_arr = obs_to_array(self._obs_space.sample(), self._obs_space)
         policy_target_dim = self.n_actions if self.discrete else self.action_dim
         self.buffer = _EfficientZeroBuffer(
             capacity_episodes=int(hyperparams.get("buffer_size", 2_000)),
             obs_shape=sample_obs_arr.shape, action_dim=self.action_dim, policy_target_dim=policy_target_dim,
             num_lanes=num_envs_of(env),
+            priority_alpha=self.priority_alpha, priority_beta=self.priority_beta, min_priority=self.min_priority,
         )
         self._last_metrics: dict[str, float] = {}
 
@@ -778,7 +1061,8 @@ class NativeEfficientZero(CustomAlgorithm):
             else:
                 action_t = torch.as_tensor(np.stack(chosen_actions), dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                next_s, value_prefix, next_lstm_state = self.dynamics(parent_states_t, action_t, lstm_state)
+                next_s, value_prefix_logits, next_lstm_state = self.dynamics(parent_states_t, action_t, lstm_state)
+                value_prefix_scalar = _logits_to_scalar(value_prefix_logits, self.support_size)
                 next_value = self.prediction.value(next_s)
                 if self.discrete:
                     next_logits = self.prediction.policy_logits(next_s)
@@ -792,7 +1076,7 @@ class NativeEfficientZero(CustomAlgorithm):
                 lh, lc = next_lstm_state[0][lane : lane + 1], next_lstm_state[1][lane : lane + 1]
                 if reset_mask[lane]:
                     lh, lc = torch.zeros_like(lh), torch.zeros_like(lc)
-                vp = float(value_prefix[lane].item())
+                vp = float(value_prefix_scalar[lane].item())
                 if self.discrete:
                     priors = next_logits[lane].detach().cpu().numpy().astype(np.float64)
                     leaf.expand(priors, next_s[lane], vp, (lh, lc), bool(reset_mask[lane]))
@@ -830,6 +1114,35 @@ class NativeEfficientZero(CustomAlgorithm):
         return results
 
     # ------------------------------------------------------------------
+    # Reanalyze - port of the reference's own always-on background
+    # reanalyze workers (`ez/worker/`), see `_EfficientZeroBuffer`'s class
+    # docstring for what gets refreshed and why.
+    # ------------------------------------------------------------------
+    def _reanalyze(self) -> dict[str, float] | None:
+        """Sample `reanalyze_batch_size` stored transitions (uniformly
+        across the whole buffer, see `sample_for_reanalyze`) and refresh
+        their `policy_target`/`search_value` with a fresh `search()` call
+        using the network's *current* weights - one batched search, same
+        cost as picking `reanalyze_batch_size` real actions at once. The
+        reference runs this continuously in a separate process so it never
+        competes with training/collection for time; ported here as a
+        periodic in-loop pass instead (see `learn()`'s trigger, mirrors
+        `train_freq`'s own num_envs-independent boundary counting) - the
+        price of not needing a second process, at the cost of adding
+        `reanalyze_batch_size`-worth of search compute every
+        `reanalyze_freq` real steps."""
+        if self.reanalyze_batch_size <= 0 or self.buffer.num_episodes == 0:
+            return None
+        episode_idx, timestep, obs_batch = self.buffer.sample_for_reanalyze(self.reanalyze_batch_size)
+        if obs_batch.shape[0] == 0:
+            return None
+        results = self.search(obs_batch, deterministic=np.zeros(obs_batch.shape[0], dtype=bool))
+        policy_targets = np.stack([r["policy_target"] for r in results])
+        search_values = np.asarray([r["value_target"] for r in results], dtype=np.float32)
+        self.buffer.update_reanalyzed_targets(episode_idx, timestep, policy_targets, search_values)
+        return {"reanalyze_mean_search_value": float(search_values.mean())}
+
+    # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
     def _train_step(self) -> dict[str, float]:
@@ -844,6 +1157,8 @@ class NativeEfficientZero(CustomAlgorithm):
         td_obs = torch.as_tensor(batch["td_obs"], dtype=torch.float32, device=self.device)
         td_discount = torch.as_tensor(batch["td_discount"], dtype=torch.float32, device=self.device)
         td_bootstrap_mask = torch.as_tensor(batch["td_bootstrap_mask"], dtype=torch.float32, device=self.device)
+        search_value = torch.as_tensor(batch["search_value"], dtype=torch.float32, device=self.device)
+        is_weight = torch.as_tensor(batch["is_weight"], dtype=torch.float32, device=self.device)
         cum_reward = torch.cumsum(reward, dim=1)
 
         batch_n = obs0.shape[0]
@@ -853,6 +1168,8 @@ class NativeEfficientZero(CustomAlgorithm):
         value_loss = torch.zeros((), device=self.device)
         policy_loss = torch.zeros((), device=self.device)
         consistency_loss = torch.zeros((), device=self.device)
+        first_step_value_pred: torch.Tensor | None = None
+        first_step_value_target: torch.Tensor | None = None
 
         # Representation only ever runs on the *real* initial observation
         # (`obs0`) above - every subsequent `s` in this loop is the
@@ -863,18 +1180,46 @@ class NativeEfficientZero(CustomAlgorithm):
         # back in to keep the rollout "on track".
         for k in range(self.unroll_steps):
             m = mask[:, k]
+            # IS-weight multiplies in but the mean is still over the
+            # (masked) *batch count*, not the weight sum - dividing by the
+            # weight sum instead would exactly cancel out the bias
+            # correction IS-weighting exists to apply (Schaul et al.,
+            # 2016), same "(weights * loss).mean()" convention the
+            # reference `update_weights` itself uses.
+            wm = m * is_weight
             denom = m.sum().clamp_min(1.0)
-            next_s, value_prefix, lstm_state = self.dynamics(s, action[:, k], lstm_state)
+            next_s, value_prefix_logits, lstm_state = self.dynamics(s, action[:, k], lstm_state)
 
-            r_loss = F.mse_loss(value_prefix, cum_reward[:, k], reduction="none")
-            reward_loss = reward_loss + (r_loss * m).sum() / denom
+            # Cross-entropy against a two-hot target, not scalar MSE - see
+            # module docstring's "Categorical value/reward" bullet: bounds
+            # the loss/gradient regardless of how large `cum_reward`/
+            # `value_target` happens to be in this particular minibatch.
+            reward_two_hot = _scalar_to_two_hot(cum_reward[:, k], self.support_size)
+            r_loss = -(reward_two_hot * F.log_softmax(value_prefix_logits, dim=-1)).sum(-1)
+            reward_loss = reward_loss + (r_loss * wm).sum() / denom
 
-            value_pred = self.prediction.value(s)
+            value_pred_logits = self.prediction.value_logits(s)
             with torch.no_grad():
                 bootstrap_value = self.prediction.value(self.representation(td_obs[:, k])) * td_bootstrap_mask[:, k]
-                value_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
-            v_loss = F.mse_loss(value_pred, value_target, reduction="none")
-            value_loss = value_loss + (v_loss * m).sum() / denom
+                td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
+                # `value_target: 'max'` (reference's own mode, see
+                # `_EfficientZeroBuffer`'s class docstring): transitions
+                # `_reanalyze` has refreshed carry a real `search_value`
+                # (the network's *current*-weights root value estimate,
+                # generally more accurate/less stale than a plain n-step TD
+                # bootstrap off however-old the value net was when this
+                # transition was first collected) - take whichever target
+                # is larger. Never-reanalyzed transitions keep their
+                # `_NO_SEARCH_VALUE` sentinel, so this is a no-op fallback
+                # to the plain TD target for them.
+                value_target = torch.maximum(td_target, search_value[:, k])
+            value_two_hot = _scalar_to_two_hot(value_target, self.support_size)
+            v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
+            value_loss = value_loss + (v_loss * wm).sum() / denom
+            if k == 0:
+                with torch.no_grad():
+                    first_step_value_pred = _logits_to_scalar(value_pred_logits, self.support_size).detach()
+                    first_step_value_target = value_target.detach()
 
             if self.discrete:
                 logp = F.log_softmax(self.prediction.policy_logits(s), dim=-1)
@@ -882,14 +1227,14 @@ class NativeEfficientZero(CustomAlgorithm):
             else:
                 mean, _std = self.prediction.policy_gaussian(s)
                 p_loss = F.mse_loss(mean, policy_target[:, k], reduction="none").sum(-1)
-            policy_loss = policy_loss + (p_loss * m).sum() / denom
+            policy_loss = policy_loss + (p_loss * wm).sum() / denom
 
             with torch.no_grad():
                 true_next_s = self.representation(next_obs[:, k])
             p_true = F.normalize(self.projector(true_next_s), dim=-1).detach()
             p_pred = F.normalize(self.predictor(self.projector(next_s)), dim=-1)
             c_loss = -(p_true * p_pred).sum(-1)
-            consistency_loss = consistency_loss + (c_loss * m).sum() / denom
+            consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
             s = next_s
 
@@ -905,11 +1250,23 @@ class NativeEfficientZero(CustomAlgorithm):
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self._params, self.max_grad_norm)
         self.optimizer.step()
+
+        # Fresh per-transition priorities from this step's own first-unroll-
+        # position |prediction - target| (reference's `fresh_priority`) -
+        # feeds back into `_EfficientZeroBuffer`'s prioritized sampling for
+        # whichever *specific* (episode, timestep) pairs this batch just
+        # trained on.
+        assert first_step_value_pred is not None and first_step_value_target is not None
+        fresh_priority = (first_step_value_pred - first_step_value_target).abs().cpu().numpy()
+        self.buffer.update_priorities(batch["episode_idx"], batch["timestep"], fresh_priority)
+
         return {
             "reward_loss": float(reward_loss.item()),
             "value_loss": float(value_loss.item()),
             "policy_loss": float(policy_loss.item()),
             "consistency_loss": float(consistency_loss.item()),
+            "mean_priority": float(fresh_priority.mean()) if fresh_priority.size else 0.0,
+            "mean_is_weight": float(is_weight.mean().item()),
             "total_loss": float(total_loss.item()),
         }
 
@@ -965,13 +1322,32 @@ class NativeEfficientZero(CustomAlgorithm):
             prev_num_timesteps = num_timesteps
             num_timesteps += n_envs
 
-            if (
-                num_timesteps >= self.learning_starts
-                and num_timesteps // self.train_freq != prev_num_timesteps // self.train_freq
-                and self.buffer.num_episodes >= 1
-            ):
-                for _ in range(self.train_steps_per_iter):
+            if self.buffer.num_episodes >= 1 and num_timesteps >= self.learning_starts:
+                # `num_timesteps` jumps by `n_envs` each iteration (all lanes
+                # step in lockstep), so a naive "did we cross a train_freq
+                # boundary?" check fires at most once per iteration no matter
+                # how many boundaries were actually crossed in that jump.
+                # With num_envs > train_freq this silently divides the
+                # gradient-steps-per-env-step ratio by n_envs, i.e. raising
+                # num_envs makes training *less* sample-efficient purely as
+                # a side effect of vectorization, not by design. Count the
+                # boundaries actually crossed and run `train_steps_per_iter`
+                # updates for each one, so the update-to-data ratio stays
+                # constant regardless of num_envs.
+                effective_prev = max(prev_num_timesteps, self.learning_starts)
+                boundaries_crossed = (
+                    num_timesteps // self.train_freq - effective_prev // self.train_freq
+                )
+                for _ in range(self.train_steps_per_iter * boundaries_crossed):
                     self._last_metrics = self._train_step()
+
+                reanalyze_boundaries = (
+                    num_timesteps // self.reanalyze_freq - effective_prev // self.reanalyze_freq
+                )
+                if reanalyze_boundaries > 0:
+                    reanalyze_metrics = self._reanalyze()
+                    if reanalyze_metrics:
+                        self._last_metrics = {**self._last_metrics, **reanalyze_metrics}
 
             any_done = False
             for lane in range(n_envs):

@@ -54,10 +54,53 @@ _MINIHACK_BASE_IDS: list[tuple[str, str, str]] = [
 ]
 
 
+_RENDER_TILE_PX = 16  # `nle.nethack.TILE_X`/`TILE_Y` - not imported just to keep this module import-light
+_RENDER_VIEWPORT_COLS = 26  # tiles - see `_crop_pixel_frame_to_viewport`'s docstring
+
+
+def _crop_pixel_frame_to_viewport(frame: np.ndarray, base_env: gym.Env) -> np.ndarray:
+    """NLE's own `render_mode="pixel"` always draws the *entire* dungeon
+    screen - `nethack.TILE_RENDER_SHAPE`, `(336, 1264, 3)` = 21x79 tiles -
+    regardless of how much of the level the player has actually explored.
+    That's correct (an unexplored dungeon tile genuinely *is* black, same
+    as a human playing would see), but it means an un-cropped frame is
+    routinely 80%+ dead black space around whatever small room the player
+    happens to be standing in right now - which is exactly what makes the
+    live-preview GIF look "all black" at a glance (worse still once
+    `_build_gif_bytes` thumbnails the whole wide-and-mostly-empty frame
+    down to `_GIF_MAX_SIDE`). Cropping to a fixed-width window centered on
+    the player's current column (from `blstats`, the same field NLE's own
+    task reward functions - e.g. `NetHackStaircasePet._is_episode_end`, see
+    `nle/env/tasks.py` - already read player position from) fixes that
+    without needing to know anything about the *current* room's actual
+    shape. Height is left uncropped (21 rows is already a reasonable size,
+    and vertically centering too would need the same near-edge clamping
+    for comparatively little benefit - NetHack's dungeon is far wider than
+    it is tall, so the width is where nearly all the dead space comes
+    from)."""
+    try:
+        base = base_env.unwrapped
+        blstats = base.last_observation[base._blstats_index]
+        player_col = int(blstats[0])  # nethack.NLE_BL_X
+    except Exception:
+        return frame
+    total_cols = frame.shape[1] // _RENDER_TILE_PX
+    width = min(_RENDER_VIEWPORT_COLS, total_cols)
+    start_col = max(0, min(player_col - width // 2, total_cols - width))
+    px = start_col * _RENDER_TILE_PX
+    return frame[:, px : px + width * _RENDER_TILE_PX]
+
+
 class _CharObs(gym.ObservationWrapper):
     """Dict obs -> single-channel uint8 image built from one `obs[key]`
     grid. `key` is already byte-valued (0-255 ASCII/curses codes), so no
-    rescaling is needed before NatureCNN/SmallCNN's own `/255.0` step."""
+    rescaling is needed before NatureCNN/SmallCNN's own `/255.0` step.
+
+    Also crops the live-preview `render(mode="pixel")` frame down to a
+    viewport around the player (`_crop_pixel_frame_to_viewport` above) -
+    piggybacking on this wrapper rather than adding a dedicated one since
+    it's already the single choke point both the NetHack and MiniHack
+    entry points route through below."""
 
     def __init__(self, env: gym.Env, key: str) -> None:
         super().__init__(env)
@@ -67,6 +110,12 @@ class _CharObs(gym.ObservationWrapper):
 
     def observation(self, observation: dict) -> np.ndarray:
         return observation[self._key][:, :, None].astype(np.uint8)
+
+    def render(self) -> Any:
+        frame = self.env.render()
+        if self.render_mode == "pixel" and isinstance(frame, np.ndarray):
+            return _crop_pixel_frame_to_viewport(frame, self.env)
+        return frame
 
 
 def _rgb_array_to_pixel(kwargs: dict[str, Any]) -> dict[str, Any]:

@@ -5,7 +5,9 @@ import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
+import { Tooltip } from '@/components/ui/tooltip'
 import { api } from '@/api/client'
+import { useSettingsStore } from '@/stores/settingsStore'
 import type { AlgorithmSpec, EnvKind, WrapperNode } from '@/api/types'
 
 function parseNumberList(text: string): number[] {
@@ -34,6 +36,7 @@ export function SweepDialog({
   training: Record<string, unknown>
   onCreated: (sweepId: string) => void
 }) {
+  const language = useSettingsStore((s) => s.language)
   const [name, setName] = useState('Sweep')
   const [enabledKeys, setEnabledKeys] = useState<Set<string>>(new Set())
   const [values, setValues] = useState<Record<string, string>>({})
@@ -119,7 +122,15 @@ export function SweepDialog({
                 onChange={() => toggleKey(hp.key)}
                 className="accent-primary"
               />
-              <Label className="w-32 shrink-0 truncate text-[11px] text-muted-foreground">{hp.label}</Label>
+              {hp.desc ? (
+                <Tooltip content={hp.desc[language]} side="top">
+                  <Label className="w-32 shrink-0 cursor-help truncate text-[11px] text-muted-foreground underline decoration-dotted decoration-muted-foreground/50 underline-offset-2">
+                    {hp.label}
+                  </Label>
+                </Tooltip>
+              ) : (
+                <Label className="w-32 shrink-0 truncate text-[11px] text-muted-foreground">{hp.label}</Label>
+              )}
               <Input
                 disabled={!enabledKeys.has(hp.key)}
                 value={values[hp.key] ?? String(baseHyperparams[hp.key] ?? hp.default)}
