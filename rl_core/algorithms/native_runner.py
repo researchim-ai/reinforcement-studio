@@ -34,6 +34,8 @@ from rl_core.algorithms.native.qmix import DEFAULT_HYPERPARAMS as QMIX_DEFAULTS
 from rl_core.algorithms.native.qmix import MultiAgentQMIX
 from rl_core.algorithms.native.rainbow_dqn import DEFAULT_HYPERPARAMS as RAINBOW_DQN_DEFAULTS
 from rl_core.algorithms.native.rainbow_dqn import NativeRainbowDQN
+from rl_core.algorithms.native.researchimzero import DEFAULT_HYPERPARAMS as RESEARCHIMZERO_DEFAULTS
+from rl_core.algorithms.native.researchimzero import NativeResearchImZero
 from rl_core.algorithms.native.sac import DEFAULT_HYPERPARAMS as SAC_DEFAULTS
 from rl_core.algorithms.native.sac import NativeSAC
 from rl_core.algorithms.native.td3 import DEFAULT_HYPERPARAMS as TD3_DEFAULTS
@@ -61,6 +63,7 @@ ALGO_CLASSES = {
     "world_models_ha": NativeWorldModelsHA,
     "efficientzero": NativeEfficientZero,
     "unizero": NativeUniZero,
+    "researchimzero": NativeResearchImZero,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -79,6 +82,7 @@ DEFAULT_HYPERPARAMS = {
     "world_models_ha": WORLD_MODELS_HA_DEFAULTS,
     "efficientzero": EFFICIENTZERO_DEFAULTS,
     "unizero": UNIZERO_DEFAULTS,
+    "researchimzero": RESEARCHIMZERO_DEFAULTS,
 }
 # Which world model type (rl_core.world_models.spec.WORLD_MODEL_TYPES) each
 # of the four algorithms above actually uses — `runner_utils.py` needs this

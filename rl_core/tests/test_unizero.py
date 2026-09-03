@@ -1,9 +1,10 @@
 """Coverage for `rl_core/algorithms/native/unizero.py` (UniZero — Transformer
-world model + Gumbel search, see that module's own docstring). Same "tiny
+world model + PUCT search, see that module's own docstring). Same "tiny
 hyperparams, just check shapes/no-crash, not learned quality" convention as
 `test_efficientzero.py`."""
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 
@@ -16,10 +17,15 @@ from rl_core.algorithms.native.unizero import (
     DEFAULT_HYPERPARAMS,
     NativeUniZero,
     _CausalTransformer,
+    _LayerKV,
+    _MinMaxStats,
+    _SearchNode,
     _TransformerCache,
     _UniZeroBuffer,
+    _add_dirichlet_noise,
     _build_attend_mask,
     _logits_to_scalar,
+    _puct_select_child,
     _scalar_to_two_hot,
     _signed_hyperbolic,
     _signed_parabolic,
@@ -33,7 +39,7 @@ _CONTINUOUS_ENV_ID = "Pendulum-v1"
 _TINY_DISCRETE = {
     "embed_dim": 16, "num_layers": 1, "num_heads": 2, "context_length": 2,
     "buffer_size": 200, "batch_size": 4, "unroll_steps": 3, "td_steps": 3,
-    "num_sampled_actions": 4, "num_simulations": 6, "num_top_actions": 4,
+    "num_sampled_actions": 4, "num_simulations": 6,
     "learning_starts": 10, "train_freq": 1, "value_support_size": 20,
 }
 _TINY_CONTINUOUS = {**_TINY_DISCRETE}
@@ -77,6 +83,73 @@ def _run_smoke(env_id: str, hyperparams: dict, total_timesteps: int, num_envs: i
         loaded.predict(obs, deterministic=True, episode_start=True)
     predict_env.close()
     env.close()
+
+
+class TestPUCTSearch:
+    """`_puct_select_child`/`_add_dirichlet_noise` (module docstring's
+    "Search" section) - the classic AlphaZero/MuZero PUCT primitives that
+    replaced this file's earlier Gumbel/Sequential-Halving search.
+    `search()`'s own end-to-end shape/policy-target-sums-to-1 coverage
+    lives in `TestNativeUniZeroDiscrete`/`TestNativeUniZeroContinuous`
+    below already - this class is for the primitives in isolation."""
+
+    def test_dirichlet_noise_preserves_simplex(self) -> None:
+        priors = np.array([0.7, 0.2, 0.1], dtype=np.float64)
+        noisy = _add_dirichlet_noise(priors, alpha=0.3, frac=0.25)
+        assert noisy.shape == priors.shape
+        assert np.all(noisy >= 0.0)
+        assert np.isclose(noisy.sum(), 1.0, atol=1e-8)
+
+    def test_dirichlet_noise_frac_zero_is_a_no_op(self) -> None:
+        priors = np.array([0.7, 0.2, 0.1], dtype=np.float64)
+        noisy = _add_dirichlet_noise(priors, alpha=0.3, frac=0.0)
+        assert np.allclose(noisy, priors)
+
+    def test_puct_prefers_higher_prior_when_all_children_unvisited(self) -> None:
+        """No child has any visits yet (`value_score` is `0.0` for all of
+        them - `_puct_select_child`'s own docstring) - the only thing
+        that can make one child's score beat another's is its own
+        `prior`, so the highest-prior child must always win the very
+        first descent from any freshly-expanded node."""
+        root = _SearchNode(prior=1.0)
+        root.expand(np.array([0.1, 0.6, 0.3]), cache=None, reward_value=0.0)
+        root.visit_count = 1
+        minmax = _MinMaxStats(delta=0.01)
+        idx = _puct_select_child(root, minmax, discount=0.99, pb_c_base=19652.0, pb_c_init=1.25)
+        assert idx == 1
+
+    def test_puct_visiting_a_child_reduces_its_own_future_selection_score(self) -> None:
+        """Sanity-check the `1 / (1 + child.visit_count)` term actually
+        does something: artificially visiting the best-prior child many
+        times (without improving its own value estimate at all) must
+        eventually make PUCT prefer a lower-prior, unvisited sibling -
+        otherwise the tree would collapse to a single-path lookahead,
+        defeating the entire point of a *search* tree."""
+        root = _SearchNode(prior=1.0)
+        root.expand(np.array([0.05, 0.9, 0.05]), cache=None, reward_value=0.0)
+        root.visit_count = 1
+        minmax = _MinMaxStats(delta=0.01)
+        best_child = root.children[1]
+        for _ in range(200):
+            best_child.visit_count += 1
+            best_child.value_sum += 0.0  # visited, but never actually good
+            root.visit_count += 1
+        idx = _puct_select_child(root, minmax, discount=0.99, pb_c_base=19652.0, pb_c_init=1.25)
+        assert idx != 1
+
+    def test_puct_score_is_deterministic_given_same_inputs(self) -> None:
+        """No RNG anywhere in `_puct_select_child` itself (unlike the
+        Gumbel search this replaced, which needed a fresh `gumbel` draw
+        per simulation) - root Dirichlet noise is the *only* randomness
+        anywhere in this search, and it's injected once, into priors,
+        before any PUCT selection happens at all."""
+        root = _SearchNode(prior=1.0)
+        root.expand(np.array([0.3, 0.4, 0.3]), cache=None, reward_value=0.0)
+        root.visit_count = 1
+        minmax = _MinMaxStats(delta=0.01)
+        idx_a = _puct_select_child(root, minmax, discount=0.99, pb_c_base=19652.0, pb_c_init=1.25)
+        idx_b = _puct_select_child(root, minmax, discount=0.99, pb_c_base=19652.0, pb_c_init=1.25)
+        assert idx_a == idx_b
 
 
 class TestCategoricalValueSupport:
@@ -361,6 +434,95 @@ class TestIncrementalKVCache:
         assert torch.allclose(hidden_evicted, hidden_cold, atol=0.1)  # ...but it stays small
 
 
+class TestRotaryEmbToggle:
+    """`rotary_emb=0` - the learned-absolute-embedding fallback (module
+    docstring's "Positional encoding toggle" section), off by default.
+    Complements `TestRoPE`/`TestIncrementalKVCache` (which only ever
+    exercise the RoPE-on default) with the same style of coverage for the
+    off branch: a fresh (never-evicted) cache must still match a
+    full-sequence forward exactly, and `evict_front`'s `pos_origin`
+    bookkeeping (the "re-based position-delta" approximation) must do
+    exactly what its own docstring says."""
+
+    def _random_transformer(self, embed_dim: int = 8, num_layers: int = 2, num_heads: int = 2) -> _CausalTransformer:
+        torch.manual_seed(0)
+        transformer = _CausalTransformer(
+            embed_dim=embed_dim, num_layers=num_layers, num_heads=num_heads, dropout=0.0, rotary_emb=False,
+        )
+        transformer.eval()
+        return transformer
+
+    def test_pos_embed_table_exists_only_when_rope_is_off(self) -> None:
+        with_rope = _CausalTransformer(embed_dim=8, num_layers=1, num_heads=2, dropout=0.0, rotary_emb=True)
+        without_rope = _CausalTransformer(embed_dim=8, num_layers=1, num_heads=2, dropout=0.0, rotary_emb=False)
+        assert with_rope.pos_embed is None
+        assert without_rope.pos_embed is not None
+
+    def test_incremental_replay_matches_full_sequence_forward_with_no_eviction(self) -> None:
+        """A fresh cache that's never had `evict_front` called on it has
+        `pos_origin == 0` throughout, so its `embed_positions` (module-
+        level `_cache_positions`) exactly equal the plain `0..L-1` a
+        full-sequence `forward` call would use by default - the additive-
+        embedding analogue of `TestIncrementalKVCache`'s own RoPE parity
+        test."""
+        from rl_core.algorithms.native.unizero import _cache_positions
+
+        embed_dim, seq_len, batch = 8, 6, 3
+        transformer = self._random_transformer(embed_dim=embed_dim)
+        torch.manual_seed(1)
+        tokens = torch.randn(batch, seq_len, embed_dim)
+        pad_mask = torch.ones(batch, seq_len, dtype=torch.bool)
+
+        with torch.no_grad():
+            full_hidden = transformer(tokens, pad_mask)  # (B, L, E)
+
+            caches: list[_TransformerCache | None] = [None] * batch
+            replayed = torch.zeros(batch, seq_len, embed_dim)
+            for t in range(seq_len):
+                positions, embed_positions = _cache_positions(caches, device="cpu")
+                hidden, caches = transformer.forward_incremental_batch(
+                    tokens[:, t], positions, caches, embed_positions,
+                )
+                replayed[:, t] = hidden
+
+        assert torch.allclose(replayed, full_hidden, atol=1e-5)
+
+    def test_evict_front_bumps_pos_origin_by_exactly_the_evicted_count(self) -> None:
+        cache = _TransformerCache(num_layers=1)
+        cache.layers[0] = _LayerKV(torch.randn(1, 2, 8, 4), torch.randn(1, 2, 8, 4))
+        cache.length = 8
+        cache.next_pos = 8
+        assert cache.pos_origin == 0
+
+        cache.evict_front(5)  # drop 3
+        assert cache.length == 5
+        assert cache.next_pos == 8  # untouched - module docstring's own invariant
+        assert cache.pos_origin == 3
+
+        cache.evict_front(5)  # keep_last >= length - a no-op, including for pos_origin
+        assert cache.pos_origin == 3
+
+        cache.length, cache.next_pos = 5, 10  # pretend 2 more tokens got appended since
+        cache.evict_front(2)  # drop 3 more
+        assert cache.pos_origin == 6
+
+    def test_cache_positions_helper_rebase(self) -> None:
+        from rl_core.algorithms.native.unizero import _cache_positions
+
+        cache = _TransformerCache(num_layers=1)
+        cache.next_pos, cache.pos_origin = 20, 6
+        positions, embed_positions = _cache_positions([None, cache], device="cpu")
+        assert positions.tolist() == [0, 20]  # raw, absolute - unaffected by pos_origin
+        assert embed_positions.tolist() == [0, 14]  # rebased: next_pos - pos_origin
+
+    def test_smoke_discrete_and_continuous(self) -> None:
+        """End-to-end - `rotary_emb=0` must train/collect without
+        crashing for both action spaces, exactly like the RoPE-on default
+        (`TestNativeUniZeroDiscrete/Continuous.test_smoke`)."""
+        _run_smoke(_DISCRETE_ENV_ID, {**_TINY_DISCRETE, "rotary_emb": 0}, total_timesteps=40)
+        _run_smoke(_CONTINUOUS_ENV_ID, {**_TINY_CONTINUOUS, "rotary_emb": 0}, total_timesteps=40)
+
+
 class TestPersistentLaneCache:
     """`NativeUniZero._lane_cache`/`_advance_lane_caches` - `learn()`'s
     per-lane cache that now genuinely persists and grows across real
@@ -403,6 +565,33 @@ class TestPersistentLaneCache:
         assert max(lengths) == 2 * algo.context_length
         env.close()
 
+    def test_advance_lane_caches_never_tracks_gradients(self) -> None:
+        """Regression test for a real leak: `_advance_lane_caches` is what
+        `self._lane_cache`/`self._eval_cache` actually get threaded
+        through across an entire episode's worth of real steps (this
+        class's own module docstring). If its forward passes weren't
+        `torch.no_grad()`, every real step would extend the autograd
+        graph rooted at the *previous* step's (already graph-tracked)
+        cached K/V tensors instead of starting fresh - an ever-growing
+        graph, retained for the whole episode, that silently turns a
+        tiny model into a multi-GiB CUDA OOM well before a long episode
+        (e.g. NetHack) ends. Every layer's cached `k`/`v` must always be
+        leaf-like: `requires_grad is False` and `grad_fn is None`, even
+        after many chained real-step calls."""
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "learning_starts": 0}, seed=0, device="cpu")
+        obs_arr = obs_to_array(env.reset(seed=0)[0], env.observation_space)[None]
+        caches: list[_TransformerCache | None] = [None]
+        for _ in range(10):
+            action_flat = np.zeros((1, env.action_space.n), dtype=np.float32)
+            action_flat[0, 0] = 1.0
+            caches = algo._advance_lane_caches(caches, obs_arr, action_flat)
+            for layer in caches[0].layers:
+                assert layer is not None
+                assert layer.k.requires_grad is False and layer.k.grad_fn is None
+                assert layer.v.requires_grad is False and layer.v.grad_fn is None
+        env.close()
+
     def test_cache_resets_to_none_on_episode_end(self) -> None:
         env = gym.make(_DISCRETE_ENV_ID)
         algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "learning_starts": 0}, seed=0, device="cpu")
@@ -438,9 +627,33 @@ class TestColdStartReplayMatchesTrainingConvention:
     mix within one training run without a train/self-play distribution
     mismatch (module docstring's "Positional encoding" section)."""
 
+    def test_replay_context_to_cache_never_tracks_gradients(self) -> None:
+        """Same regression as `TestPersistentLaneCache
+        .test_advance_lane_caches_never_tracks_gradients`, for
+        `_reanalyze()`'s own cold-start cache-construction path."""
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        one = obs_to_array(env.reset(seed=0)[0], env.observation_space)
+        length = algo.context_length
+        ctx_obs = np.stack([one] * length)[None]
+        ctx_action = np.zeros((1, length, algo.action_dim), dtype=np.float32)
+        ctx_valid = np.ones((1, length), dtype=bool)
+        root_caches = algo._replay_context_to_cache(ctx_obs, ctx_action, ctx_valid)
+        for layer in root_caches[0].layers:
+            assert layer is not None
+            assert layer.k.requires_grad is False and layer.k.grad_fn is None
+            assert layer.v.requires_grad is False and layer.v.grad_fn is None
+        env.close()
+
     def test_cache_root_matches_full_sequence_root(self) -> None:
         env = gym.make(_DISCRETE_ENV_ID)
         algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        # `DEFAULT_HYPERPARAMS["dropout"]` is `0.1` (not `0.0`) by
+        # default now (module docstring's "Networks" comparison to the
+        # reference) - `.eval()` so the two forward-pass strategies this
+        # test compares are deterministic and bit-comparable; dropout
+        # noise itself is exercised by other tests, not this one.
+        algo.transformer.eval()
         obs, _info = env.reset(seed=0)
         one = obs_to_array(obs, env.observation_space)
         length = algo.context_length
@@ -479,6 +692,75 @@ class TestColdStartReplayMatchesTrainingConvention:
             h_obs_full = h2[:, -1]
         assert torch.allclose(h_act_cache[0], h_act_full[0], atol=1e-4)
         assert torch.allclose(h_obs_cache[0], h_obs_full[0], atol=1e-4)
+        env.close()
+
+
+class TestTargetNetwork:
+    """`self.target_tokenizer`/`self.target_transformer`/`self.target_heads`
+    (module docstring's "Target network" section) - an EMA-updated copy
+    of the corresponding online modules, used for the bootstrap value and
+    the latent-consistency loss's target embedding."""
+
+    def test_target_starts_as_exact_copy_of_online(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        for online_p, target_p in zip(algo.tokenizer.parameters(), algo.target_tokenizer.parameters()):
+            assert torch.equal(online_p, target_p)
+        for online_p, target_p in zip(algo.transformer.parameters(), algo.target_transformer.parameters()):
+            assert torch.equal(online_p, target_p)
+        for online_p, target_p in zip(algo.heads.parameters(), algo.target_heads.parameters()):
+            assert torch.equal(online_p, target_p)
+        env.close()
+
+    def test_target_params_never_require_grad(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        for module in (algo.target_tokenizer, algo.target_transformer, algo.target_heads):
+            assert not module.training
+            for p in module.parameters():
+                assert p.requires_grad is False
+        env.close()
+
+    def test_update_target_network_moves_toward_online_by_exactly_theta(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        theta = 0.3
+        algo = NativeUniZero(
+            env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "target_update_theta": theta}, seed=0, device="cpu",
+        )
+        # Perturb the online tokenizer only, so the expected post-update
+        # target value has a single, easy-to-check closed form:
+        # `(1-theta)*old_target + theta*online`, and `old_target ==
+        # old_online` per `test_target_starts_as_exact_copy_of_online`.
+        with torch.no_grad():
+            for p in algo.tokenizer.parameters():
+                p.add_(1.0)
+        old_target = [p.clone() for p in algo.target_tokenizer.parameters()]
+        online_now = [p.clone() for p in algo.tokenizer.parameters()]
+        algo._update_target_network()
+        for old_t, online_p, new_t in zip(old_target, online_now, algo.target_tokenizer.parameters()):
+            expected = (1.0 - theta) * old_t + theta * online_p
+            assert torch.allclose(new_t, expected, atol=1e-6)
+        env.close()
+
+    def test_train_step_actually_moves_target_network(self) -> None:
+        """Regression: `_update_target_network()` must actually be *called*
+        from `_train_step` (easy to silently skip - it's not needed for
+        the forward/backward pass to run without crashing, only for the
+        target network to mean anything over time)."""
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeUniZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        old_target = [p.clone() for p in algo.target_tokenizer.parameters()]
+
+        steps: list[int] = []
+
+        def writer(num_timesteps, episode_reward=None, episode_length=None, metrics=None):
+            steps.append(num_timesteps)
+            return num_timesteps < 40
+
+        algo.learn(total_timesteps=40, callback=TrainingCallback(writer))
+        assert any(
+            not torch.equal(old_t, new_t) for old_t, new_t in zip(old_target, algo.target_tokenizer.parameters())
+        )
         env.close()
 
 
@@ -668,7 +950,14 @@ class TestNativeUniZeroContinuous:
         assert len(results) == 1
         result = results[0]
         action_dim = int(np.prod(env.action_space.shape))
-        assert result["policy_target"].shape == (action_dim,)
+        # Sampled UniZero's own policy target: root's own sampled
+        # candidate actions, flattened, followed by their visit-count
+        # distribution (module docstring's "Search" section) - not a
+        # single blended action any more.
+        num_cand = algo.num_sampled_actions
+        assert result["policy_target"].shape == (num_cand * (action_dim + 1),)
+        weights = result["policy_target"][num_cand * action_dim :]
+        assert np.isclose(weights.sum(), 1.0, atol=1e-4)
         assert result["env_action"].shape == (action_dim,)
         env.close()
 
@@ -677,6 +966,60 @@ class TestNativeUniZeroContinuous:
 
     def test_smoke_parallel_envs(self) -> None:
         _run_smoke(_CONTINUOUS_ENV_ID, _TINY_CONTINUOUS, total_timesteps=40, num_envs=3)
+
+
+class TestSampledContinuousPolicyLoss:
+    """`_train_step`'s continuous policy loss (module docstring's
+    "Search" section) - a genuine importance-weighted NLL against
+    `search()`'s own (sampled candidates, visit-count weights) pair, the
+    reference's own Sampled-MuZero/Sampled-UniZero policy-improvement
+    estimator, not this file's earlier MSE-to-a-blended-action
+    regression."""
+
+    def test_weighted_nll_matches_torch_distributions_normal(self) -> None:
+        """Directly checks `_train_step`'s own inlined Gaussian NLL
+        formula (`-0.5*((x-mu)^2/var + log(2*pi*var))`, summed over action
+        dims) against `torch.distributions.Normal.log_prob` for the exact
+        same `(candidates, mean, std)` - a regression test for a sign/
+        formula slip that a pure shape/no-crash smoke test wouldn't catch."""
+        torch.manual_seed(0)
+        b, num_cand, action_dim = 3, 5, 2
+        mean = torch.randn(b, action_dim)
+        std = torch.rand(b, action_dim) + 0.5
+        candidates = torch.randn(b, num_cand, action_dim)
+
+        var = std.clamp_min(1e-6) ** 2
+        diff = candidates - mean.unsqueeze(1)
+        log_prob = -0.5 * ((diff ** 2) / var.unsqueeze(1) + torch.log(2.0 * math.pi * var.unsqueeze(1))).sum(-1)
+
+        dist = torch.distributions.Normal(mean.unsqueeze(1), std.unsqueeze(1))
+        expected_log_prob = dist.log_prob(candidates).sum(-1)
+        assert torch.allclose(log_prob, expected_log_prob, atol=1e-4)
+
+    def test_train_step_runs_and_produces_finite_policy_loss(self) -> None:
+        """Pendulum's own episodes never terminate early (fixed 200-step
+        `TimeLimit`), so a short `learn()` smoke run never flushes one
+        into the buffer for `_train_step` to actually run against -
+        populate one directly instead, in `search()`'s own (candidates,
+        visit-weights) `policy_target` encoding (module docstring's
+        "Search" section), and call `_train_step` straight away."""
+        env = gym.make(_CONTINUOUS_ENV_ID)
+        hp = {**DEFAULT_HYPERPARAMS, **_TINY_CONTINUOUS, "learning_starts": 0}
+        algo = NativeUniZero(env, hp, seed=0, device="cpu")
+        obs_arr = obs_to_array(env.reset(seed=0)[0], env.observation_space)
+        num_cand = algo.num_sampled_actions
+        for t in range(6):
+            action = env.action_space.sample()
+            action_flat = obs_to_array(action, env.action_space)
+            candidates = np.tile(action_flat, (num_cand, 1)).astype(np.float32)
+            weights = np.full(num_cand, 1.0 / num_cand, dtype=np.float32)
+            policy_target = np.concatenate([candidates.reshape(-1), weights])
+            algo.buffer.add(obs_arr, action_flat, 1.0, obs_arr, policy_target, done=(t == 5))
+
+        metrics = algo._train_step()
+        env.close()
+        assert np.isfinite(metrics["policy_loss"])
+        assert np.isfinite(metrics["policy_entropy"])
 
 
 class TestReanalyzeIntegration:

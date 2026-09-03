@@ -1,267 +1,141 @@
-"""UniZero (Pu, Zhao, Niu, Zhu, Chen, Ni, Song, Liu, ICLR 2025 -
-https://arxiv.org/abs/2406.10667), from the LightZero project
-(https://github.com/opendilab/LightZero). Every other MuZero-family
-algorithm in this app (`efficientzero.py`) learns a *recurrent* latent
-dynamics model - an LSTM/MLP steps one `s_k -> s_{k+1}` at a time, so the
-model's only "memory" of everything before `s_k` is whatever got squeezed
-into that one fixed-size vector. UniZero's actual contribution is
-replacing that recurrence with a **causal Transformer over an explicit,
-interleaved token sequence** `[obs_0, act_0, obs_1, act_1, ..., obs_t]`:
-every past observation and action is its own token, still directly
-attendable by the model at every later step, instead of being entangled
-(and potentially half-forgotten) into one carried-over latent vector.
-That's genuinely useful for anything with long-range dependencies
-(remembering a key picked up many steps ago, a partially-observed maze) -
-and, per the paper, even in fully-observed single-task settings it trains
-*faster* than a recurrent world model because every real observation in a
-training window contributes its own reward/value/policy loss term
-directly, not just the first one before the model has to unroll blind.
+"""ResearchImZero - our own MuZero-family algorithm, seeded from the
+best-measured synergy of `unizero.py` and `efficientzero.py` rather than
+being a port of any one published paper. Empirical motivation (see the
+chat history this file was written from): a from-scratch, exact port of
+the reference UniZero (PUCT + Dirichlet noise, an EMA target network,
+MSE-to-target-tokenizer consistency loss, AdamW, `learning_starts=0`,
+PER/reanalyze off by default - all now living in `unizero.py`, kept
+around unmodified as the "faithful to the paper" reference implementation
+    10|for anyone who wants exact reference behavior) trained *dramatically*
+worse in practice on this app's own hard-exploration image envs (NetHack)
+than an earlier, less "correct" revision of the same file that borrowed
+`efficientzero.py`'s own training recipe wholesale - same architecture,
+same buffer, wildly different search/loss/optimizer/schedule choices.
+This file keeps **UniZero's actual architectural contribution** (a causal
+Transformer over an interleaved `[obs_0, act_0, obs_1, ...]` token
+sequence, RoPE, the persistent incrementally-evicted per-lane KV-cache -
+see `unizero.py`'s own module docstring for why each of these matters,
+    20|all reused here verbatim, unmodified) and swaps back in
+**`efficientzero.py`'s own proven training recipe** everywhere that
+recipe, empirically, is what actually made the earlier good runs learn
+fast: Gumbel search instead of PUCT, SimSiam consistency instead of an
+EMA target network, `max(td_target, search_value)` value targets instead
+of a plain TD target, plain `Adam` instead of `AdamW`, PER + reanalyze +
+`learning_starts=500` on by default instead of off. Nothing here is
+claimed to be "more correct" relative to any paper - the entire point of
+this file existing separately from `unizero.py` is to be the one we keep
+tuning by what actually works, not what matches a reference implementation.
 
-Three ingredients ported from the paper/reference (`LightZero-main/lzero/
-model/unizero_world_models/`, `lzero/policy/unizero.py`):
-- **Tokenizer + interleaved sequence**: each observation is encoded to one
-  token (`_Tokenizer`, reusing the same `ObsEncoder` every world model in
-  this app shares), each action to one token (`_ActionEmbed`), and a
-  bounded window of the most recent `context_length` real (obs, action)
-  pairs plus the current observation form the token sequence a causal
-  Transformer (`_CausalTransformer`) attends over.
-- **Head placement**: reward is read off the hidden state at an *action*
-  token's position (predicts that single action's real reward - no
-  cumulative "value prefix" trick needed here, unlike EfficientZero's
-  LSTM reward head: attention already gives the model the reward head's
-  own view of everything relevant, so there's nothing to gain from
-  additionally training it to sum); policy/value are read off an *obs*
-  token's position (`_Heads`); both value and reward are categorical
-  distributions over a fixed support (MuZero Appendix F's
-  `signed_hyperbolic` scaling - same `_scalar_to_two_hot`/
-  `_logits_to_scalar` machinery `efficientzero.py` uses, ported here
-  rather than re-derived, for the exact same reason: bounding the loss/
-  gradient regardless of how large one particular reward/value happens to
-  be in a given minibatch).
-- **Full-trajectory teacher forcing**: training feeds the Transformer a
-  window of *real* interleaved tokens (context + `unroll_steps + 1` real
-  observations + `unroll_steps` real actions) in **one** forward pass and
-  reads every step's reward/policy/value loss off that single pass -
-  every real observation in the window contributes directly (the paper's
-  own "full trajectory utilization" advantage over recurrent unrolling).
+    30|**Search: Gumbel-Top-k + Sequential Halving** (Danihelka et al., 2022 -
+same algorithm `efficientzero.py` uses, *not* classic PUCT), ported
+verbatim (`_SearchNode`/`_MinMaxStats`/`_transformed_completed_qs`/
+`_select_action`/`_sequential_halving`/`_HalvingSchedule`/
+`_backpropagate` below are `efficientzero.py`'s own copies, byte-for-byte
+except for one adaptation) with exactly one adaptation: a node's "state"
+is its own incremental KV-cache slice (`cache`, extended two tokens per
+tree edge - one action, one predicted-observation, see `_step_imagine`),
+not a fixed-size latent + LSTM cell, and a node's reward is a plain
+per-edge scalar (UniZero's reward head predicts one transition's real
+    40|reward directly, no LSTM "value prefix" cumulative-sum trick to unwind)
+rather than `efficientzero.py`'s own value-prefix delta. Continuous
+actions get the same sampled-candidate treatment
+(`_sample_continuous_candidates`, ported from `efficientzero.py` as-is)
+run through the identical Gumbel machinery discrete actions use - no
+separate continuous search algorithm. The policy target this produces
+is, correspondingly, `efficientzero.py`'s own: the *improved policy*
+(Gumbel's own completed-Q-value + prior blend, Appendix D of Danihelka et
+al.) for discrete actions, and the visit-weighted-average sampled
+candidate for continuous ones - not a plain visit-count distribution
+    50|(`unizero.py`'s reference-faithful choice) or a genuine importance-
+weighted density fit (`unizero.py`'s own Sampled-UniZero continuous
+policy loss) - both swapped back for simplicity/proven-in-practice
+reasons, not because either alternative is wrong.
 
-**Search: classic PUCT + root Dirichlet noise**, matching the reference's
-own default UniZero search (`gumbel_algo=False`, `UniZeroMCTSCtree` -
-`lzero/mcts/tree_search/mcts_ctree.py`) rather than `efficientzero.py`'s
-own *Gumbel*/Sequential-Halving search (kept as-is over there, for
-EfficientZero V2's own default search - a genuinely different algorithm,
-not a stylistic choice between the two files). `_SearchNode`/
-`_MinMaxStats`/`_puct_select_child`/`_add_dirichlet_noise`/
-`_backpropagate` implement the standard AlphaZero/MuZero-family PUCT tree
-(Silver et al., 2018; Schrittwieser et al., 2020) essentially verbatim -
-`argmax_child[ pb_c(N_parent)*prior(child)*sqrt(N_parent)/(1+N_child) +
-Q_normalized(child) ]` descent, `(1-frac)*prior + frac*Dirichlet(alpha)`
-noise mixed into the root's own children's priors once (only when not
-`deterministic` - real self-play collection, not eval), followed by
-`num_simulations` simulations and a plain *visit-count* policy target at
-the end (`search()`'s own docstring). What *does* still differ from
-`efficientzero.py`'s own search is the same thing as before: what a tree
-node's "state" is - EfficientZero's is a fixed-size latent vector (`s`,
-plus an LSTM cell); here it's the node's own slice of the growing raw
-token sequence, and "stepping the dynamics" means appending two more raw
-tokens (one action, one *predicted* next-observation) and asking the
-Transformer for a fresh hidden state - see `_step_imagine` below.
+**No target network.** Both places `unizero.py` needs one -
+(1) the latent-consistency loss's target embedding and (2) the n-step TD
+target's bootstrap value - use the *online* network directly here, under
+`torch.no_grad()`/`.detach()` stop-gradient, exactly like
+`efficientzero.py` itself does (`self.representation(...)` under
+    60|`no_grad`, never a separate copied model). Two different anti-collapse
+mechanisms replace what a slow-moving EMA target would otherwise be
+guarding against:
+- **Consistency loss is SimSiam, not MSE-to-target.** `_Projector`/
+  `_Predictor` (ported verbatim from `efficientzero.py`) add a
+  `BatchNorm1d`-equipped projector head + an asymmetric predictor on the
+  *predicted* branch only, trained via negative cosine similarity against
+  the stop-gradiented *online* tokenizer's own embedding of the real next
+  observation. Chen & He, 2021's own ablation (Table 2c) is why the
+  `BatchNorm1d` specifically isn't decorative - stop-gradient *alone*
+   70|  still collapses in practice; empirically forcing every batch's
+  projected features to spread out (via BN) is what actually prevents the
+  every-observation-embeds-to-the-same-point degenerate solution, not the
+  stop-gradient asymmetry by itself.
+- **Value target additionally blends in a periodically-refreshed search
+  value** (`value_target = max(td_target, search_value)`,
+  `efficientzero.py`'s own `value_target: 'max'` mode, ported as-is) -
+  `_reanalyze()` (also ported as-is, `reanalyze_batch_size=64`/
+  `reanalyze_freq=200` on by default here, unlike `unizero.py`'s `0`)
+  periodically refreshes `search_value` with the network's *current*-
+   80|weights root value estimate for old (episode, timestep) samples, so a
+  transition's value target isn't purely at the mercy of however stale
+  the online net's own bootstrap was back when that transition first
+  landed in the buffer.
 
-**Positional encoding: RoPE, not learned absolute embeddings.** This is
-what makes the KV-cache below both *correct* and *fast* at the same time,
-so it's worth spelling out why up front. Rotary position embeddings
-(Su et al., 2021, https://arxiv.org/abs/2104.09864) rotate each attention
-head's query/key vectors by an angle proportional to that token's
-position *before* the QK dot product, so `<q_p, k_q>` (and therefore every
-attention weight) is a function of `p - q` alone - never of `p` or `q`'s
-own absolute value. Two direct, load-bearing consequences:
-- **Any two token sequences with the same relative spacing produce
-  identical attention, regardless of where either one's positions
-  "start counting from".** A training window that always labels its own
-  first token position `0` and a self-play root that labels the exact
-  same *kind* of token its true, ever-growing absolute step-count-since-
-  episode-start position are therefore *mathematically the same
-  computation* - there is no "convention" to keep in sync between the two
-  call sites at all, unlike a learned additive `nn.Embedding` table (this
-  file's own earlier approach, and the reference's default), where the
-  value looked up for position `500` and position `0` are two unrelated
-  learned vectors and the two call sites *must* agree on which one a
-  given token gets.
-- **Evicting the oldest entries from a KV-cache needs zero *positional*
-  correction.** A cached key's rotation is baked in at the moment it's
-  computed and never touched again; dropping unrelated old cache slots
-  changes nothing about the relative offset between any two *surviving*
-  tokens (or a future query and a surviving key), so trimming the front
-  of a cache is a plain tensor slice (`_TransformerCache.evict_front`) -
-  no analogue of the reference's own approximate "shift + re-based
-  position-delta" fix (needed there specifically because *its* additive
-  embeddings aren't shift-invariant) is needed here. This is a genuinely
-  different, narrower claim than "eviction is a complete no-op", though:
-  with `num_layers > 1`, a surviving token's own cached hidden state
-  (hence its K/V in every layer *above* the first) was computed *while
-  the now-evicted tokens were still present*, so it still carries a
-  little of their influence forward through the residual stream - the
-  same well-known property any multi-layer causal-attention KV-cache
-  eviction scheme has (this file's own or the reference's), independent
-  of positional encoding entirely. That's an intentional, bounded trade
-  (see `_TransformerCache.evict_front`'s own docstring) - the actual
-  alternative would be never evicting at all, i.e. paying `O(episode
-  length)` compute for every real step's root instead of `O(1)` - not a
-  free correctness upgrade being left on the table.
-Concretely: `_CausalSelfAttention` rotates `q`/`k` (never `v`) by each
-token's position right before the dot product, in both the full-sequence
-path (`forward`, used by training's teacher-forcing pass - positions are
-always plain `0..seq_len-1` per lane, per the first bullet above,
-equivalent to whatever absolute position the same tokens would carry
-anywhere else they're used) and the incremental path
-(`forward_incremental_batch`, used by every self-play/search-tree call
-below - positions come from each `_TransformerCache`'s own monotonic
-`next_pos` counter, which - unlike `length`, the cache's *physical* token
-count - never decreases, including across an eviction).
+**Prioritized replay + reanalyze on by default** (`priority_alpha=1.0`,
+`reanalyze_batch_size=64` - `efficientzero.py`'s own defaults, both `0`/
+off in `unizero.py` to match the reference UniZero's own policy-level
+choices) - both concepts are orthogonal to "recurrent vs Transformer
+dynamics", ported wholesale from `efficientzero.py`'s `_EfficientZeroBuffer`
+   90|(this file's own `_ResearchImZeroBuffer` only differs from it by the
+extra `context_obs`/`context_action`/`context_valid` slicing every
+Transformer training window needs - see that class's own docstring).
 
-**Persistent, incrementally-extended per-lane root cache.** Because RoPE
-makes eviction lossless, every real env step (`learn()`'s collection loop,
-`predict()`'s eval-time stepping) now does exactly what the reference
-itself does and what an earlier, pre-RoPE version of this file *tried* to
-do but had to abandon (see prior revisions' own comments, since removed)
-for being unsound with additive embeddings: keep one `_TransformerCache`
-per lane that lives across the *entire episode*, extended by exactly two
-tokens (one action, one observation) per real step and trimmed back down
-to `2 * context_length` tokens (`_TransformerCache.evict_front`, called
-from `NativeUniZero._advance_lane_caches`) whenever it grows past that
-budget - never rebuilt from scratch. Reset to `None` (`first_step_flag`,
-in the reference's own terms) whenever an episode ends. This is the
-*actual* engineering payoff of a KV-cache the reference's own paper/README
-flags as the hardest part to get right: a real step's own root token no
-longer costs `O(context_length)` (replaying the whole retained window from
-scratch every time, this file's own pre-RoPE approach) but a genuine
-`O(1)` - exactly one incremental Transformer call, same as any single
-step of `search()`'s own tree expansion (`_step_imagine`) already was.
-`_reanalyze()`'s arbitrary historical (episode, timestep) samples have no
-live per-lane cache to reuse (they're not "the current real step" for any
-lane), so they still cold-start a cache from scratch by replaying their
-own stored context (`_replay_context_to_cache`) - there's nothing to
-persist across independent reanalyze calls anyway.
+**`learning_starts=500`, not `0`.** `train_freq=1` already means one
+gradient step per real env-step collected (`learn()`'s own
+`boundaries_crossed` comment) - training from the very first few
+transitions, before the buffer has any behavioral diversity, is a real,
+observed failure mode: a from-scratch model + a tiny buffer + this much
+training pressure per new transition collapses the policy's own entropy
+  100|within the first few hundred steps, and - depending on the env's own
+episode-termination condition - a collapsed-but-"safe" policy can then
+stop producing terminal transitions at all, starving the buffer of
+anything fresher and locking the collapse in. `500` (matching
+`efficientzero.py`'s own default, and this file's own earlier - before it
+briefly, mistakenly matched the reference's bare `0` policy-level
+default - choice) gives the buffer a little real behavioral diversity to
+train against before training starts at all.
 
-**Target network.** `self.target_tokenizer`/`self.target_transformer`/
-`self.target_heads` are an EMA/momentum-updated copy of the corresponding
-online modules (`theta=0.05` default, `_update_target_network`, called
-once per `_train_step` right after `self.optimizer.step()`) - reference's
-own `self._target_model`. Two, and only two, things read from it:
-- The latent-consistency ("predict next latent") loss's target embedding
-  - a plain MSE between `heads.latent(h_act_k)` and the *target*
-  tokenizer's embedding of the real next observation (reference's own
-  `predict_latent_loss_type='mse'`, `obs_loss_weight=10` default) - not
-  this file's earlier SimSiam (projector+predictor+cosine, stop-gradient
-  on the *online* tokenizer's own output, no target network at all,
-  weight `2.0`). See `_train_step`'s own comment, next to where this loss
-  is computed, for why training toward a target that's a function of the
-  very weights being updated is a softer version of the same self-
-  reference problem the bootstrap value below has.
-- The n-step TD target's bootstrap value - a fresh forward over the
-  TD-landing observation (still with an *empty* context, a separate,
-  narrower simplification than the reference's own "with its own real
-  context" choice - see `_train_step`'s own comment) through the target
-  network, not the online one. Reference (`lzero/mcts/buffer/
-  game_buffer_unizero.py`'s `sample()`) passes `policy._target_model`
-  into `_compute_target_reward_value`, not the online model, for exactly
-  this reason.
+**Lighter default hyperparameters** (`num_heads=4`, `batch_size=64`,
+ 110|`unroll_steps=5`, `num_simulations=32`, `gamma=0.99`,
+`consistency_loss_coef=2.0`, `value_support_size=300`) - not this file's
+earlier attempt at matching the reference UniZero's own *policy-level*
+defaults (`num_heads=8`, `batch_size=256`, `unroll_steps=10`,
+`num_simulations=50`, `gamma=0.997`, `consistency_loss_coef=10.0`,
+`value_support_size=50`), which are individually defensible but,
+combined, meaningfully increase both per-step compute (fewer real
+env-steps per wall-clock second - directly hurts a hard-exploration env's
+odds of encountering reward at all before something like the collapse
+above locks in) and how large a single early, low-diversity training
+ 120|batch's influence on the network is. `Adam`, not `AdamW` - simpler,
+matches both `efficientzero.py` and this file's own earlier working
+recipe; no evidence weight decay specifically mattered either way here.
 
-`training.num_envs > 1` batches the search across all lanes exactly like
-`efficientzero.py` (one shared `_step_imagine` call handles every lane's
-current simulation step at once); prioritized replay (Schaul et al.,
-2016) and reanalyze (periodic *policy*-target-refresh, ported from the
-reference's own always-on background reanalyze workers) are reused from
-`efficientzero.py`'s `_EfficientZeroBuffer` - both concepts are entirely
-orthogonal to "recurrent vs Transformer dynamics", so there was no reason
-to simplify them away here just because the world model changed. Two
-details differ from `efficientzero.py`'s own copy, deliberately, to match
-the *reference UniZero*'s (not EfficientZero V2's) own choices here
-(`lzero/mcts/buffer/game_buffer_unizero.py`,
-`lzero/policy/unizero.py`/configs): the value target is a plain n-step TD
-target - reanalyze's refreshed MCTS `search_value` only ever overwrites
-the buffer's *policy* target, never blended into the value target via
-`max()` (`efficientzero.py`'s own, correct-for-*that*-algorithm choice;
-see `_train_step`'s value-target comment for why it's wrong here) - and
-`DEFAULT_HYPERPARAMS["reanalyze_batch_size"]` defaults to `0` (off),
-matching the reference UniZero configs' own `reanalyze_ratio = 0` default
-(`efficientzero.py` reanalyzes by default; the reference UniZero mostly
-doesn't).
+Everything else - `_Tokenizer`/`_ActionEmbed`/`_CausalTransformer`/RoPE/
+`_TransformerCache`/incremental KV-cache eviction/`_step_imagine`/
+`_replay_context_to_cache`/`_advance_lane_caches`/`_embed_root_batch`/
+categorical value-reward heads/label smoothing - is `unizero.py`'s own
+machinery, reused as-is; see that file's module docstring for the design
+rationale behind each. `rotary_emb` (default on) toggles the same RoPE-
+ 130|vs-learned-absolute-embedding choice `unizero.py` has, for the same
+reasons.
 
-Networks/optimizer now deliberately mirror the reference rather than
-reusing `efficientzero.py`'s own choices verbatim: discrete actions go
-through a genuine `nn.Embedding` lookup table (`_ActionEmbed`), not
-`Linear(one-hot) + tanh`; `_CausalSelfAttention` has separate `query`/
-`key`/`value` projections, not one fused `qkv` matmul; the optimizer is
-`AdamW` (`weight_decay=1e-4`, `betas=(0.9, 0.95)`), not plain `Adam`;
-value/reward categorical targets get label smoothing
-(`label_smoothing_eps=0.1` default) before the cross-entropy loss;
-prioritized replay is *off* by default (`priority_alpha=0.0`, reference's
-own `use_priority=False`); there's a policy-entropy bonus
-(`policy_entropy_coef=5e-3` default) subtracted from the total loss.
-
-Search itself now also mirrors the reference (see the dedicated "Search"
-paragraph above): classic PUCT + root Dirichlet noise + visit-count
-policy target for discrete actions; for continuous actions specifically,
-the reference's own "Sampled UniZero"/Sampled MuZero variant
-(Hubert et al., 2021, arXiv:2104.06303) runs the exact same PUCT tree over
-a *sampled* candidate-action set instead of the full continuous space -
-this file's own `_sample_continuous_candidates` (sample a fixed number of
-candidates from the current Gaussian policy, half "on-policy" half
-deliberately wider, softmax their log-density as PUCT priors) is this
-file's own port of that same idea, not a re-derivation of it, and now runs
-through the identical `_puct_select_child`/`_backpropagate` machinery
-discrete actions do - there's no separate continuous-only search
-algorithm here any more. The *policy target* this produces for continuous
-actions is, correspondingly, not a single blended action any more either:
-`search()` returns the root's own sampled candidate actions *and* their
-visit-count distribution together (flattened into one array,
-`policy_target_dim = num_sampled_actions * (action_dim + 1)` -
-`NativeUniZero.__init__`'s own comment), and `_train_step`'s continuous
-policy loss is a genuine importance-weighted NLL against that sampled set
-- `-sum_i visit_frac_i * log N(candidate_i; mean, std)` - the reference's
-own Sampled-MuZero policy-improvement estimator, not this file's earlier
-plain MSE toward the *visit-weighted average* of the candidates (a much
-cruder point-estimate regression that throws away the target
-distribution's own shape - unimodal-mean matching vs. genuinely fitting a
-density to a multi-sample empirical distribution).
-
-**Positional encoding toggle (`rotary_emb`, default on).** RoPE is the
-*default* here (see the dedicated section above for why - it's what makes
-this file's own persistent KV-cache design lossless and `O(1)` per real
-step), but it's now an opt-out hyperparam, not a hardcoded choice: setting
-`rotary_emb=0` switches `_CausalTransformer` to a learned absolute
-`nn.Embedding(max_positions, embed_dim)` added to each token's raw
-embedding before the first block - the reference's own actual default
-(RoPE itself is opt-in *there*, on for CartPole, off for Atari), and using
-a different pairing convention besides (complex/adjacent-dim pairing,
-`view_as_complex`, vs. this file's rotate-half either way). Turning it off
-gives up the RoPE branch's free lossless eviction for the reference's own
-kind of fix instead - approximate, not exact: each `_TransformerCache`
-additionally tracks `pos_origin` (bumped by `evict_front` by exactly the
-evicted count), and every embedding-table lookup for a *newly appended*
-token after that point uses `next_pos - pos_origin` rather than raw
-`next_pos`, keeping it inside the small range training's own full-
-sequence pass (`0..window_len-1`) actually saw instead of growing
-unboundedly with episode length. "Approximate" specifically because
-*already-cached* tokens' K/V keep whatever (larger, pre-rebase) position
-they were originally computed with baked in - there is no retroactive
-fix for those short of a full recompute, which is exactly the `O(1)`-per-
-step property turning this off gives up to begin with. Left off by
-default because it's genuinely slower (no free `O(1)` eviction) and,
-per this file's own earlier benchmarking, the *reference's* own choice of
-`rotary_emb=False` isn't obviously better on the envs this app targets -
-it exists purely as an exact-convergence knob for anyone who wants it.
-
-Remaining simplifications vs. the paper/reference:
-- No multitask task-token/shared-model machinery, no LPIPS/pixel
-  reconstruction decoder, no open-loop consistency losses, no separate
-  async collect/train/reanalyze worker processes (Ray) - reanalyze runs
-  synchronously in-loop, same trade-off `efficientzero.py` itself makes.
+Remaining simplifications vs. either parent file: no multitask/LPIPS/
+pixel-decoder/open-loop-consistency/async-Ray-workers machinery (same
+as both parents); reanalyze runs synchronously in-loop, not in a separate
+process (same trade-off both parents make).
 """
 from __future__ import annotations
 
-import copy
 import math
 from pathlib import Path
 from typing import Any
@@ -284,144 +158,86 @@ from rl_core.algorithms.vec_env import (
 from rl_core.world_models.nets import ObsEncoder
 
 DEFAULT_HYPERPARAMS = {
-    # `lzero/policy/unizero.py`'s own policy-level default
-    # (`learning_rate=0.0001`) - not this file's earlier, unrelated
-    # `2e-4` guess.
-    "learning_rate": 1e-4,
-    # AdamW's weight decay - `lzero/policy/unizero.py`'s own default
-    # (`weight_decay=1e-4`); `betas=(0.9, 0.95)` is hardcoded to match
-    # that same file's `AdamW` branch, not exposed as a hyperparam since
-    # the reference itself never varies it per-env.
-    "weight_decay": 1e-4,
+    # `efficientzero.py`'s own default (plain `Adam`, not `AdamW` - see
+    # module docstring's "no target network"/optimizer discussion).
+    "learning_rate": 2e-4,
     "embed_dim": 128,
     "num_layers": 2,
-    # `lzero/policy/unizero.py`'s own `model.world_model_cfg.num_heads=8`
-    # policy-level default (some per-env zoo configs, e.g. CartPole's,
-    # use fewer for a smaller model - `num_heads` stays a tunable
-    # hyperparam here for the same reason).
-    "num_heads": 8,
-    # Reference default for both `attn_pdrop` and `resid_pdrop`
-    # (`lzero/policy/unizero.py`); one shared knob here rather than two,
-    # since this file's own attention block already applies it to both
-    # the attention-output and MLP-output residual dropouts alike.
-    "dropout": 0.1,
+    # Lighter than `unizero.py`'s reference-matching `8` - module
+    # docstring's "Lighter default hyperparameters" section.
+    "num_heads": 4,
+    "dropout": 0.0,
     # Past real (obs, action) *transitions* kept before "now" in every
     # token sequence the Transformer ever sees (root of a real step, a
     # training window, a reanalyze pass) - `2 * context_length` tokens.
     "context_length": 6,
     "buffer_size": 2_000,
-    # `lzero/policy/unizero.py`'s own policy-level default
-    # (`batch_size=256`); Atari's own zoo config knocks this down to `64`
-    # for memory reasons, CartPole's own keeps `256` - kept as a tunable
-    # hyperparam here for the same per-env reason.
-    "batch_size": 256,
+    "batch_size": 64,
     # Doubles as the training teacher-forcing window length *and* the max
     # search-tree depth budget (an imagined rollout can't run longer than
     # a real training unroll would need to correct it) - same dual role
-    # `unroll_steps` plays in `efficientzero.py`. Reference policy-level
-    # default: `num_unroll_steps=10`.
-    "unroll_steps": 10,
+    # `unroll_steps` plays in `efficientzero.py`.
+    "unroll_steps": 5,
     "td_steps": 5,
     "num_sampled_actions": 8,
-    # Reference policy-level default `num_simulations=50` (`collect`/
-    # `eval` sub-splits of `25`/`50` in some zoo configs - kept as one
-    # shared knob here, like every other MuZero-family algorithm in this
-    # app already does).
-    "num_simulations": 50,
-    # Classic PUCT (`_puct_select_child`) - reference's own
-    # `UniZeroMCTSCtree.config` defaults
-    # (`lzero/mcts/tree_search/mcts_ctree.py`). Not this file's earlier
-    # Gumbel-search-specific `num_top_actions`/`c_visit`/`c_scale`/
-    # `policy_target_temperature` (removed - no longer meaningful once
-    # the search itself changed).
-    "pb_c_base": 19652.0,
-    "pb_c_init": 1.25,
-    # Root exploration noise (`_add_dirichlet_noise`) - reference's own
-    # `root_dirichlet_alpha`/`root_noise_weight` defaults. Applied only
-    # when a `search()` call isn't `deterministic` (real collection,
-    # never eval) - "the only difference between collect and eval is the
-    # dirichlet noise" per the reference's own comment,
-    # `lzero/policy/unizero.py::_forward_collect`.
-    "root_dirichlet_alpha": 0.3,
-    "root_noise_weight": 0.25,
+    "num_simulations": 32,
+    # Gumbel-Top-k + Sequential Halving (`_HalvingSchedule`/
+    # `_sequential_halving`) - `efficientzero.py`'s own defaults, not
+    # PUCT's `pb_c_base`/`pb_c_init`/Dirichlet noise (`unizero.py`'s own
+    # choice - Gumbel-Top-k's own per-simulation resampling is its own,
+    # different, built-in exploration source at the root).
+    "num_top_actions": 8,
+    "c_visit": 50.0,
+    "c_scale": 0.1,
+    "policy_target_temperature": 1.0,
     "value_minmax_delta": 0.01,
-    # Reference: `DiscreteSupport(-50., 51., 1.)` = 101 bins (50 either
-    # side of 0) for both value and reward - not this file's earlier,
-    # much wider `300` (601 bins) guess.
-    "value_support_size": 50,
-    # Label smoothing applied to the value/reward two-hot targets before
-    # the categorical cross-entropy loss - reference's own
-    # `label_smoothing_eps=0.1`, applied via `phi_transform`
-    # (`lzero/policy/unizero.py`). `0.0` reproduces a plain two-hot.
-    "label_smoothing_eps": 0.1,
-    # Reference policy-level default `discount_factor=0.997` - not this
-    # file's earlier, more MuZero-Atari-typical `0.99` guess.
-    "gamma": 0.997,
+    # `efficientzero.py`'s own, much wider default - not `unizero.py`'s
+    # narrower `50` (module docstring's "Lighter default hyperparameters"
+    # section: a wider support isn't actually *lighter* compute-wise, but
+    # this specific value is what both this file's own earlier good runs
+    # and `efficientzero.py` itself already use, so it's kept rather than
+    # re-guessed).
+    "value_support_size": 300,
+    # No label smoothing - `efficientzero.py` has no equivalent knob, and
+    # this file's own earlier good runs didn't use it either.
+    "label_smoothing_eps": 0.0,
+    "gamma": 0.99,
     "value_loss_coef": 0.25,
     "policy_loss_coef": 1.0,
     "reward_loss_coef": 1.0,
-    # Reference: `obs_loss_weight=10` - the "predict next latent" loss's
-    # own weight (`_train_step`'s value-target comment's neighbor, the
-    # consistency-loss comment, explains what changed here to match).
-    "consistency_loss_coef": 10.0,
-    # Reference `policy_entropy_weight=5e-3` - an entropy *bonus*
-    # subtracted from the policy loss (encourages, doesn't discourage,
-    # exploration) that this file had no equivalent of before.
+    # SimSiam consistency loss's own weight - `efficientzero.py`'s own
+    # default (`2.0` here specifically matches this file's own earlier
+    # good NetHack runs, between `efficientzero.py`'s policy-level `5.0`
+    # and this file's UniZero-parent's reference-matching `10.0`).
+    "consistency_loss_coef": 2.0,
+    # SimSiam projector/predictor hidden+output dim (`_Projector`/
+    # `_Predictor`) - `efficientzero.py`'s own default.
+    "proj_dim": 64,
+    # Entropy bonus - generic exploration regularizer, kept from
+    # `unizero.py` (`efficientzero.py` has no equivalent knob).
     "policy_entropy_coef": 5e-3,
     "continuous_prior_scale": 2.5,
     "train_freq": 1,
     "train_steps_per_iter": 1,
-    # Reference *policy-level* default is `train_start_after_envsteps=0`,
-    # but every actual zoo config that ships with an image-heavy
-    # observation (`zoo/atari/config/atari_unizero_config.py` and
-    # friends) raises this to `2000` - and for good reason: `train_freq=1`
-    # already means one gradient step per real env-step collected
-    # (`learn()`'s own `boundaries_crossed` comment), so training from
-    # essentially the *first* few transitions, before the buffer has any
-    # behavioral diversity, is a real, observed failure mode here (a
-    # from-scratch model + a tiny, low-diversity buffer + this much
-    # training pressure per new transition collapses the policy's own
-    # entropy within the first few hundred steps, and - depending on the
-    # env's own episode-termination condition - a collapsed-but-"safe"
-    # policy can then stop producing terminal transitions at all,
-    # starving the buffer of anything fresher and locking the collapse
-    # in; see the run investigation this comment accompanies). `2000`
-    # below matches those zoo configs rather than either the bare
-    # policy-level default or this file's own earlier `500` guess.
-    "learning_starts": 2000,
-    # Off by default - the reference's own `use_priority=False`
-    # (`lzero/mcts/buffer/game_buffer.py`'s own default, inherited
-    # as-is by UniZero's own config) - not this file's earlier `1.0`
-    # (PER always-on) guess. `0.0` here means every sample is drawn
-    # uniformly (`_UniZeroBuffer.sample`'s own `local_probs`/`ep_probs`
-    # math degrades to uniform whenever every priority carries the same
-    # weight, which is what raising every priority to the power of
-    # `alpha=0` does) - set to e.g. `1.0` to opt back into PER.
-    "priority_alpha": 0.0,
+    # `efficientzero.py`'s own default, and this file's own earlier
+    # (pre-reference-matching) good-runs' choice - not `0` (module
+    # docstring's own "learning_starts=500, not 0" section explains why
+    # `0` is a real, observed failure mode combined with `train_freq=1`).
+    "learning_starts": 500,
+    "max_grad_norm": 5.0,
+    # Prioritized replay (Schaul et al., 2016) + reanalyze, *on* by
+    # default here - `efficientzero.py`'s own defaults (not `unizero.py`'s
+    # reference-matching `0.0`/`0`, both off there).
+    "priority_alpha": 1.0,
     "priority_beta": 1.0,
     "min_priority": 1e-6,
     "reanalyze_freq": 200,
-    # Off by default - matches the reference LightZero UniZero configs'
-    # own default (`reanalyze_ratio = 0` in e.g.
-    # `zoo/classic_control/cartpole/config/cartpole_unizero_config.py`
-    # and `zoo/atari/config/atari_unizero_stack4_config.py`). Reanalyze
-    # only ever refreshes *policy* targets from a fresh MCTS search over
-    # old (episode, timestep) samples (`_reanalyze()`'s own docstring) -
-    # it's a variance-reduction knob, not something the base algorithm
-    # needs to be "valid" - set to e.g. `64` to opt back in.
-    "reanalyze_batch_size": 0,
-    # EMA/momentum coefficient for the target network's per-step update
-    # (`theta` below - `target_param = (1-theta)*target_param +
-    # theta*online_param`) - reference's own `target_update_theta=0.05`.
-    # See `NativeUniZero._update_target_network`'s own docstring.
-    "target_update_theta": 0.05,
-    "max_grad_norm": 5.0,
-    # `1` (default): RoPE, `_CausalTransformer`'s own default and this
-    # file's own choice (module docstring's "Positional encoding" /
-    # "Positional encoding toggle" sections) - lossless, `O(1)`-per-real-
-    # step KV-cache eviction. `0`: reference's own actual default, a
-    # learned absolute `nn.Embedding` - slower (no free eviction, only an
-    # approximate one), exists purely as an exact-convergence knob.
+    "reanalyze_batch_size": 64,
+    # `1` (default): RoPE - `_CausalTransformer`'s own default, lossless
+    # `O(1)`-per-real-step KV-cache eviction, reused from `unizero.py`
+    # as-is (module docstring's "everything else" section). `0`: learned
+    # absolute `nn.Embedding` instead - slower, exists as an alternative
+    # for anyone who wants to compare.
     "rotary_emb": 1,
 }
 
@@ -452,7 +268,7 @@ class _ActionEmbed(nn.Module):
     row/bias - but an `nn.Embedding` has no bias term added on top of the
     looked-up row and no extra `tanh` squashing it). `action` still
     arrives one-hot (`obs_to_array`'s convention every algorithm in this
-    app shares, and `_UniZeroBuffer`'s own storage format) purely so this
+    app shares, and `_ResearchImZeroBuffer`'s own storage format) purely so this
     class's *caller* doesn't need a separate discrete/continuous branch -
     `forward` itself converts it to an index via `argmax` (safe: actions
     are data, never something a loss backprops *through*). Continuous
@@ -571,10 +387,10 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 #     new token per lane to an existing (possibly `None`/empty) cache and
 #     returns only that new token's hidden state - used for everything
 #     that legitimately reuses previously-computed attention: every real
-#     step's persistent per-lane cache (`NativeUniZero._advance_lane_caches`),
+#     step's persistent per-lane cache (`NativeResearchImZero._advance_lane_caches`),
 #     every reanalyze sample's one-off cold-start context replay
-#     (`NativeUniZero._replay_context_to_cache`), and search-tree
-#     expansion on top of either root (`NativeUniZero._step_imagine`).
+#     (`NativeResearchImZero._replay_context_to_cache`), and search-tree
+#     expansion on top of either root (`NativeResearchImZero._step_imagine`).
 # A token's position for RoPE purposes is a cache's `next_pos` (see
 # `_TransformerCache`) - monotonic, never rewound by eviction, unlike
 # `length` (the cache's current *physical* token count).
@@ -1019,20 +835,64 @@ class _Heads(nn.Module):
         return mean, log_std.exp()
 
 
+class _Projector(nn.Module):
+    """SimSiam-style projector `P1` (module docstring's "no target
+    network" section) - `efficientzero.py`'s own class, ported verbatim.
+    `BatchNorm1d` on the hidden layer is not decorative - Chen & He,
+    2021's own ablation (Table 2c) shows stop-gradient *alone* still
+    collapses in practice (every latent converging to ~the same vector,
+    which trivially "matches" whatever the predictor outputs and costs
+    nothing at all to reach); BN is what empirically keeps that from
+    happening by forcing every batch's projected features to actually
+    spread out (zero mean, unit variance *per feature, across the batch*)
+    instead of letting the optimizer collapse them all together."""
+
+    def __init__(self, embed_dim: int, proj_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class _Predictor(nn.Module):
+    """SimSiam-style predictor `P2` - only applied on the *predicted*
+    (dynamics) branch, never the stop-gradiented real-encoding branch
+    (asymmetry), with the same anti-collapse `BatchNorm1d` as `_Projector`
+    on its hidden layer - see that class's docstring. `efficientzero.py`'s
+    own class, ported verbatim."""
+
+    def __init__(self, proj_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
 # ----------------------------------------------------------------------
-# PUCT search tree - classic AlphaZero/MuZero-family PUCT (Silver et al.,
-# 2018; Schrittwieser et al., 2020), matching the reference UniZero's own
-# default search (`gumbel_algo=False`, `UniZeroMCTSCtree` -
-# `lzero/mcts/tree_search/mcts_ctree.py`) rather than `efficientzero.py`'s
-# own Gumbel/Sequential-Halving search (a different algorithm, kept as-is
-# over there - see module docstring's "Search" section). A node's "state"
-# is its own incremental KV-cache (`cache`, extended by two tokens - one
-# action, one predicted-observation - per tree edge, see `_step_imagine`)
-# instead of a fixed-size latent vector, and a node's reward is a plain
-# per-edge scalar (no LSTM "value prefix" cumulative-sum trick - see
-# module docstring).
+# Gumbel-Top-k + Sequential Halving search tree (Danihelka et al., 2022) -
+# `efficientzero.py`'s own search algorithm, ported verbatim except for
+# one adaptation: a node's "state" is its own incremental KV-cache
+# (`cache`, extended by two tokens - one action, one predicted-observation
+# - per tree edge, see `_step_imagine`) instead of a fixed-size latent +
+# LSTM cell, and a node's reward is a plain per-edge scalar (UniZero's
+# reward head predicts one transition's real reward directly, no LSTM
+# "value prefix" cumulative-sum trick to unwind) rather than
+# `efficientzero.py`'s own value-prefix delta - see module docstring's
+# "Search" section.
 # ----------------------------------------------------------------------
 class _MinMaxStats:
+    """Running min/max of every backed-up value seen so far in one search
+    tree, used to normalize Q-values into `[0, 1]` before they're compared
+    against each other (Danihelka et al., 2022, Appendix A) - without this
+    a tree whose rewards/values happen to live on a different scale than
+    `c_visit`/`c_scale` were tuned for would search essentially randomly."""
+
     def __init__(self, delta: float) -> None:
         self.maximum = -float("inf")
         self.minimum = float("inf")
@@ -1050,7 +910,20 @@ class _MinMaxStats:
 
 
 class _SearchNode:
-    __slots__ = ("prior", "parent", "children", "visit_count", "value_sum", "reward_value", "cache", "candidate_action")
+    """One node of the Gumbel search tree - either a root (one per lane
+    being searched this real step) or an imagined node reached from its
+    parent by taking one of the parent's candidate actions and stepping
+    the dynamics (`_step_imagine`). Every candidate action slot gets its
+    own (initially un-expanded) child node the instant its parent is
+    expanded - "un-expanded child" and "child the tree hasn't
+    visited/expanded yet" are the same thing here, exactly like the
+    reference tree `efficientzero.py`'s own copy of this class docstring
+    describes."""
+
+    __slots__ = (
+        "prior", "parent", "children", "visit_count", "value_sum", "reward_value",
+        "cache", "candidate_action", "selected_children_idx",
+    )
 
     def __init__(self, prior: float, parent: "_SearchNode | None" = None) -> None:
         self.prior = prior
@@ -1061,6 +934,7 @@ class _SearchNode:
         self.reward_value = 0.0
         self.cache: _TransformerCache | None = None  # this node's own KV-cache (see `_step_imagine`)
         self.candidate_action: Any = None  # continuous only: sampled action leading to this node
+        self.selected_children_idx: list[int] = []  # root only: Sequential Halving survivors
 
     def expanded(self) -> bool:
         return len(self.children) > 0
@@ -1082,43 +956,94 @@ class _SearchNode:
             for child, action in zip(self.children, candidate_actions):
                 child.candidate_action = action
 
+    def children_visit_sum(self) -> int:
+        return sum(c.visit_count for c in self.children)
 
-def _add_dirichlet_noise(priors: np.ndarray, alpha: float, frac: float) -> np.ndarray:
-    """Root exploration noise - reference's own `root_dirichlet_alpha`/
-    `root_noise_weight` (`UniZeroMCTSCtree.config`,
-    `lzero/mcts/tree_search/mcts_ctree.py`): `(1-frac)*prior +
-    frac*Dirichlet(alpha)`, applied once, right after the root's own
-    initial `expand()` - *not* during self-play/reanalyze's own tree
-    descent (only ever touches the root's immediate children's priors,
-    which is exactly what makes it *root* exploration noise rather than
-    a general-purpose one)."""
-    noise = np.random.dirichlet([max(1e-3, alpha)] * len(priors))
-    return (1.0 - frac) * priors + frac * noise
+    def q_of_child(self, idx: int, discount: float) -> float:
+        child = self.children[idx]
+        return child.reward() + discount * child.value()
+
+    def v_mix(self, discount: float) -> float:
+        """Appendix D of Danihelka et al., 2022: blend this node's own raw
+        value estimate with however many of its children are already
+        expanded, weighted by how much of the node's total prior
+        probability mass those expanded children cover - gives
+        `completed_qs` something better than "value at the root" to use
+        as a stand-in Q for children the tree hasn't visited at all yet."""
+        priors = np.array([c.prior for c in self.children], dtype=np.float64)
+        pi = _softmax(priors)
+        pi_sum = 0.0
+        pi_q_sum = 0.0
+        for i, child in enumerate(self.children):
+            if child.expanded():
+                pi_sum += pi[i]
+                pi_q_sum += pi[i] * self.q_of_child(i, discount)
+        if pi_sum < 1e-6:
+            return self.value()
+        visit_sum = self.children_visit_sum()
+        return (self.value() + visit_sum * pi_q_sum / pi_sum) / (1.0 + visit_sum)
+
+    def completed_qs(self, discount: float, minmax: _MinMaxStats) -> np.ndarray:
+        v_mix = self.v_mix(discount)
+        out = np.empty(len(self.children), dtype=np.float64)
+        for i, child in enumerate(self.children):
+            raw = self.q_of_child(i, discount) if child.expanded() else v_mix
+            out[i] = minmax.normalize(raw)
+        return out
+
+    def improved_policy(self, transformed_completed_qs: np.ndarray) -> np.ndarray:
+        priors = np.array([c.prior for c in self.children], dtype=np.float64)
+        return _softmax(priors + transformed_completed_qs)
 
 
-def _puct_select_child(node: _SearchNode, minmax: _MinMaxStats, discount: float, pb_c_base: float, pb_c_init: float) -> int:
-    """Classic PUCT (Silver et al.'s AlphaZero, reused verbatim by every
-    MuZero-family paper including the reference UniZero's own default
-    search - `lzero/mcts/tree_search/mcts_ctree.py`'s `UniZeroMCTSCtree`,
-    `gumbel_algo=False`): `argmax_child[ pb_c(N_parent) * prior(child) *
-    sqrt(N_parent) / (1 + N_child) + Q_normalized(child) ]`, where `pb_c`
-    grows (very slowly - `pb_c_base=19652` default) with the parent's own
-    visit count, trading exploration for exploitation as search deepens.
-    An unvisited child (`N_child == 0`) has no `Q` estimate yet - `0.0`
-    (this function's own choice, matching the reference) rather than some
-    "first play urgency" heuristic value; the `pb_c` prior term alone
-    already makes unvisited high-prior children attractive."""
-    parent_visits = node.visit_count
-    pb_c = math.log((parent_visits + pb_c_base + 1) / pb_c_base) + pb_c_init
-    pb_c *= math.sqrt(max(parent_visits, 1))
-    best_idx, best_score = 0, -float("inf")
-    for i, child in enumerate(node.children):
-        prior_score = pb_c * child.prior / (1 + child.visit_count)
-        value_score = minmax.normalize(child.reward() + discount * child.value()) if child.visit_count > 0 else 0.0
-        score = prior_score + value_score
-        if score > best_score:
-            best_score, best_idx = score, i
-    return best_idx
+def _transformed_completed_qs(node: _SearchNode, minmax: _MinMaxStats, discount: float, c_visit: float, c_scale: float) -> np.ndarray:
+    completed = node.completed_qs(discount, minmax)
+    max_visit = max((c.visit_count for c in node.children), default=0)
+    return (c_visit + max_visit) * c_scale * completed
+
+
+def _select_action(node: _SearchNode, minmax: _MinMaxStats, discount: float, c_visit: float, c_scale: float) -> int:
+    """Root: equal-visit round robin over the current Sequential-Halving
+    survivors (`selected_children_idx`) - ties broken towards whichever
+    survivor is earliest in Gumbel-Top-k rank, matching the reference
+    `do_equal_visit`. Non-root: the paper's deterministic selection rule -
+    argmax of (improved policy - visit fraction) over *all* children, no
+    Sequential Halving below the root."""
+    if node.parent is None:
+        best_idx, best_visits = -1, float("inf")
+        for idx in node.selected_children_idx:
+            visits = node.children[idx].visit_count
+            if visits < best_visits:
+                best_visits, best_idx = visits, idx
+        return best_idx
+    transformed = _transformed_completed_qs(node, minmax, discount, c_visit, c_scale)
+    improved = node.improved_policy(transformed)
+    visits = np.array([c.visit_count for c in node.children], dtype=np.float64)
+    denom = 1.0 + node.children_visit_sum()
+    scores = improved - visits / denom
+    return int(np.argmax(scores))
+
+
+def _sequential_halving(
+    root: _SearchNode, gumbel: np.ndarray, minmax: _MinMaxStats, keep: int, discount: float, c_visit: float, c_scale: float,
+) -> None:
+    """Cut the root's currently-surviving candidate set in half (by score =
+    Gumbel noise + prior + transformed completed Q), same formula the
+    reference `sequential_halving` uses past its first phase - the first
+    phase (Gumbel-Top-k over *all* actions) is instead folded into where
+    `selected_children_idx` gets initialized (simulation 0 of `search()`
+    below), which is exactly equivalent given the reference's own
+    equal-visit round robin always exhausts the top `num_top_actions`
+    candidates before any lower-ranked one ever gets a look."""
+    selected = root.selected_children_idx
+    if len(selected) <= 1:
+        return
+    priors = np.array([c.prior for c in root.children], dtype=np.float64)
+    transformed = _transformed_completed_qs(root, minmax, discount, c_visit, c_scale)
+    scores = np.array([gumbel[i] + priors[i] + transformed[i] for i in selected])
+    order = np.argsort(-scores)
+    keep = max(1, min(keep, len(selected)))
+    root.selected_children_idx = [selected[i] for i in order[:keep]]
 
 
 def _backpropagate(path: list[_SearchNode], leaf_value: float, minmax: _MinMaxStats, discount: float) -> None:
@@ -1130,6 +1055,40 @@ def _backpropagate(path: list[_SearchNode], leaf_value: float, minmax: _MinMaxSt
         minmax.update(value)
 
 
+class _HalvingSchedule:
+    """Ports the reference `ready_for_next_gumble_phase`'s visit-budget
+    schedule verbatim: phase 0 gets `floor(n / (log2(m) * m)) * m`
+    simulations (always a multiple of `m = num_top_actions`, so the root's
+    equal-visit round robin exhausts exactly the top-`m` Gumbel-Top-k
+    candidates without ever spilling into a lower-ranked one - see
+    `_sequential_halving`'s docstring), then each subsequent phase gets
+    `floor(n / (log2(m) * current_m)) * current_m` more (or whatever's
+    left, once `current_m <= 2`), halving `current_m` every time, until
+    the budget of `n = num_simulations` simulations runs out."""
+
+    def __init__(self, num_simulations: int, num_top_actions: int) -> None:
+        self.n = max(1, num_simulations)
+        self.m = max(2, num_top_actions)
+        self.current_top = self.m
+        self.next_cutoff = self._span(self.current_top, used=0)
+
+    def _span(self, current_top: int, used: int) -> int:
+        log2m = max(math.log2(self.m), 1e-9)
+        if current_top > 2:
+            span = math.floor(self.n / (log2m * current_top)) * current_top
+        else:
+            span = self.n - used
+        return min(self.n, max(1, int(span)))
+
+    def maybe_advance(self, simulation_idx: int) -> bool:
+        ready = (simulation_idx + 1) >= self.next_cutoff
+        if ready and self.current_top > 1:
+            used = self.next_cutoff
+            self.current_top = max(1, self.current_top // 2)
+            self.next_cutoff = min(self.n, used + self._span(self.current_top, used))
+        return ready
+
+
 # ----------------------------------------------------------------------
 # Replay buffer - PER + reanalyze support ported verbatim from
 # `efficientzero.py`'s `_EfficientZeroBuffer` (see that class's own
@@ -1138,7 +1097,7 @@ def _backpropagate(path: list[_SearchNode], leaf_value: float, minmax: _MinMaxSt
 # Transformer window needs (episodes are stored as contiguous arrays, so
 # this is a pure slice - no extra storage).
 # ----------------------------------------------------------------------
-class _UniZeroBuffer:
+class _ResearchImZeroBuffer:
     _NO_SEARCH_VALUE = -1e9
 
     def __init__(
@@ -1170,9 +1129,9 @@ class _UniZeroBuffer:
         trailing slot" scheme - deliberately, so that a token's position
         (`_CausalTransformer`'s positional-embedding index) can always
         just be its plain array index with *no* separate position lookup,
-        in both this class's full-sequence callers (`NativeUniZero.
+        in both this class's full-sequence callers (`NativeResearchImZero.
         _embed_root_batch`/`_train_step`) and the incremental KV-cache
-        path (`NativeUniZero._replay_context_to_cache`) - a
+        path (`NativeResearchImZero._replay_context_to_cache`) - a
         short-history lane's real tokens get the exact same position
         numbers a long-history lane's corresponding real tokens would.
         Harmless either way under RoPE (module docstring's "Positional
@@ -1377,7 +1336,7 @@ class _UniZeroBuffer:
             ep["search_value"][t] = search_values[i]
 
 
-class NativeUniZero(CustomAlgorithm):
+class NativeResearchImZero(CustomAlgorithm):
     def __init__(self, env: gym.Env, hyperparams: dict[str, Any], seed: int | None, device: str) -> None:
         super().__init__(env, hyperparams, seed, device)
         if seed is not None:
@@ -1391,17 +1350,20 @@ class NativeUniZero(CustomAlgorithm):
 
         self.embed_dim = int(hyperparams.get("embed_dim", 128))
         num_layers = max(1, int(hyperparams.get("num_layers", 2)))
-        num_heads = max(1, int(hyperparams.get("num_heads", 8)))
-        dropout = float(hyperparams.get("dropout", 0.1))
+        num_heads = max(1, int(hyperparams.get("num_heads", 4)))
+        dropout = float(hyperparams.get("dropout", 0.0))
         self.context_length = max(0, int(hyperparams.get("context_length", 6)))
-        self.unroll_steps = max(1, int(hyperparams.get("unroll_steps", 10)))
-        self.support_size = max(1, int(hyperparams.get("value_support_size", 50)))
-        self.label_smoothing_eps = max(0.0, float(hyperparams.get("label_smoothing_eps", 0.1)))
+        self.unroll_steps = max(1, int(hyperparams.get("unroll_steps", 5)))
+        self.support_size = max(1, int(hyperparams.get("value_support_size", 300)))
+        self.label_smoothing_eps = max(0.0, float(hyperparams.get("label_smoothing_eps", 0.0)))
+        # Entropy *bonus* - a generic MuZero-family exploration
+        # regularizer (kept from `unizero.py`, `efficientzero.py` has no
+        # equivalent knob) - subtracted from the total loss, not added,
+        # since higher policy entropy is the goal here.
         self.policy_entropy_coef = float(hyperparams.get("policy_entropy_coef", 5e-3))
-        self.target_update_theta = max(0.0, min(1.0, float(hyperparams.get("target_update_theta", 0.05))))
-        # `1` (default): RoPE. `0`: reference's own actual default, a
-        # learned absolute embedding - module docstring's "Positional
-        # encoding toggle" section.
+        # `1` (default): RoPE. `0`: learned absolute embedding - module
+        # docstring's "everything else" section (reused from `unizero.py`
+        # as-is).
         self.rotary_emb = bool(int(hyperparams.get("rotary_emb", 1)))
 
         self.tokenizer = _Tokenizer(self._obs_space, self.embed_dim, 2 * self.embed_dim).to(device)
@@ -1410,83 +1372,65 @@ class NativeUniZero(CustomAlgorithm):
             self.embed_dim, num_layers, num_heads, dropout, rotary_emb=self.rotary_emb,
         ).to(device)
         self.heads = _Heads(self.embed_dim, 2 * self.embed_dim, self._action_space, self.support_size).to(device)
+        # SimSiam projector/predictor (module docstring's "no target
+        # network" section) - `efficientzero.py`'s own consistency-loss
+        # machinery, operating on `embed_dim`-sized token embeddings here
+        # (the tokenizer's real-observation embedding vs. `heads.latent`'s
+        # predicted-next-embedding, both already in that same space)
+        # rather than `efficientzero.py`'s own fixed-size representation
+        # latent - same role either way.
+        proj_dim = int(hyperparams.get("proj_dim", 64))
+        self.projector = _Projector(self.embed_dim, proj_dim).to(device)
+        self.predictor = _Predictor(proj_dim).to(device)
         self._params = (
             list(self.tokenizer.parameters()) + list(self.action_embed.parameters())
             + list(self.transformer.parameters()) + list(self.heads.parameters())
+            + list(self.projector.parameters()) + list(self.predictor.parameters())
         )
+        # Plain Adam, no weight decay - `efficientzero.py`'s own default;
+        # no target network here at all (module docstring's "no target
+        # network" section) so there's nothing an `AdamW`-style decay was
+        # ever specifically compensating for either.
+        self.optimizer = torch.optim.Adam(self._params, lr=float(hyperparams.get("learning_rate", 2e-4)))
 
-        # Target network - an EMA/momentum-updated copy of `tokenizer` +
-        # `transformer` + `heads` (module docstring's "Target network"
-        # section), matching the reference's own `self._target_model`
-        # (`update_type='momentum'`, `target_update_theta=0.05`). Used for
-        # two things `_train_step` needs a *slowly-moving*, non-self-
-        # referential estimate for: (1) the latent-consistency loss's
-        # target embedding, and (2) the n-step TD target's bootstrap
-        # value - see each site's own comment for why training *against*
-        # the online network's own live estimate of either is a feedback
-        # loop, not just a stale-vs-fresh style choice. Never touched by
-        # `self.optimizer` - `requires_grad_(False)` and permanently
-        # `.eval()` (no dropout/BatchNorm train-mode noise either) - only
-        # `_update_target_network()` ever writes to it, and only via
-        # `torch.no_grad()`.
-        self.target_tokenizer = copy.deepcopy(self.tokenizer)
-        self.target_transformer = copy.deepcopy(self.transformer)
-        self.target_heads = copy.deepcopy(self.heads)
-        for target_module in (self.target_tokenizer, self.target_transformer, self.target_heads):
-            target_module.eval()
-            for p in target_module.parameters():
-                p.requires_grad_(False)
-        # AdamW (not plain Adam) with weight decay and betas=(0.9, 0.95) -
-        # matches the reference's own `configure_optimizer_unizero`/
-        # `lzero/policy/unizero.py` default (`optim_type='AdamW'`,
-        # `weight_decay=1e-4`, hardcoded `betas=(0.9, 0.95)` for that
-        # branch) rather than this file's own earlier plain-Adam,
-        # no-weight-decay choice.
-        self.optimizer = torch.optim.AdamW(
-            self._params, lr=float(hyperparams.get("learning_rate", 1e-4)),
-            weight_decay=float(hyperparams.get("weight_decay", 1e-4)), betas=(0.9, 0.95),
-        )
-
-        self.gamma = float(hyperparams.get("gamma", 0.997))
-        self.batch_size = int(hyperparams.get("batch_size", 256))
+        self.gamma = float(hyperparams.get("gamma", 0.99))
+        self.batch_size = int(hyperparams.get("batch_size", 64))
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
         self.num_sampled_actions = max(2, int(hyperparams.get("num_sampled_actions", 8)))
-        self.num_simulations = max(2, int(hyperparams.get("num_simulations", 50)))
-        self.pb_c_base = float(hyperparams.get("pb_c_base", 19652.0))
-        self.pb_c_init = float(hyperparams.get("pb_c_init", 1.25))
-        self.root_dirichlet_alpha = float(hyperparams.get("root_dirichlet_alpha", 0.3))
-        self.root_noise_weight = max(0.0, min(1.0, float(hyperparams.get("root_noise_weight", 0.25))))
+        self.num_simulations = max(2, int(hyperparams.get("num_simulations", 32)))
+        # Gumbel-Top-k + Sequential Halving (module docstring's "Search"
+        # section) - `efficientzero.py`'s own defaults, not PUCT's
+        # `pb_c_base`/`pb_c_init`/Dirichlet noise.
+        self.num_top_actions = max(2, int(hyperparams.get("num_top_actions", 8)))
+        self.c_visit = float(hyperparams.get("c_visit", 50.0))
+        self.c_scale = float(hyperparams.get("c_scale", 0.1))
+        self.policy_target_temperature = max(1e-6, float(hyperparams.get("policy_target_temperature", 1.0)))
         self.value_minmax_delta = float(hyperparams.get("value_minmax_delta", 0.01))
         self.value_loss_coef = float(hyperparams.get("value_loss_coef", 0.25))
         self.policy_loss_coef = float(hyperparams.get("policy_loss_coef", 1.0))
         self.reward_loss_coef = float(hyperparams.get("reward_loss_coef", 1.0))
-        self.consistency_loss_coef = float(hyperparams.get("consistency_loss_coef", 10.0))
+        self.consistency_loss_coef = float(hyperparams.get("consistency_loss_coef", 2.0))
         self.continuous_prior_scale = float(hyperparams.get("continuous_prior_scale", 2.5))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
         self.train_steps_per_iter = max(1, int(hyperparams.get("train_steps_per_iter", 1)))
-        self.learning_starts = int(hyperparams.get("learning_starts", 0))
+        self.learning_starts = int(hyperparams.get("learning_starts", 500))
         self.max_grad_norm = float(hyperparams.get("max_grad_norm", 5.0))
-        self.priority_alpha = max(0.0, float(hyperparams.get("priority_alpha", 0.0)))
+        self.priority_alpha = max(0.0, float(hyperparams.get("priority_alpha", 1.0)))
         self.priority_beta = max(0.0, float(hyperparams.get("priority_beta", 1.0)))
         self.min_priority = max(1e-8, float(hyperparams.get("min_priority", 1e-6)))
         self.reanalyze_freq = max(1, int(hyperparams.get("reanalyze_freq", 200)))
-        self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 0)))
+        self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 64)))
 
         sample_obs_arr = obs_to_array(self._obs_space.sample(), self._obs_space)
         self._obs_shape = sample_obs_arr.shape
-        # Discrete: one prior per real action (`n_actions`). Continuous
-        # ("Sampled UniZero" - module docstring's "Search" section): the
-        # root's own `num_sampled_actions` candidate actions *and* their
-        # visit-count distribution, flattened together
-        # (`[candidates.flatten(), weights], len = num_sampled_actions *
-        # (action_dim + 1)`) - not a single blended action any more
-        # (this file's own earlier, cruder choice) - `search()`'s own
-        # continuous branch and `_train_step`'s continuous policy-loss
-        # branch are this field's only two producers/consumers.
-        policy_target_dim = (
-            self.n_actions if self.discrete else self.num_sampled_actions * (self.action_dim + 1)
-        )
-        self.buffer = _UniZeroBuffer(
+        # Discrete: one prior per real action (`n_actions`). Continuous:
+        # the visit-weighted-average sampled candidate action
+        # (`efficientzero.py`'s own, simpler choice - module docstring's
+        # "Search" section - not `unizero.py`'s flattened
+        # candidates-and-weights format, since there's no importance-
+        # weighted-NLL policy loss here to consume that richer target).
+        policy_target_dim = self.n_actions if self.discrete else self.action_dim
+        self.buffer = _ResearchImZeroBuffer(
             capacity_episodes=int(hyperparams.get("buffer_size", 2_000)),
             obs_shape=self._obs_shape, action_dim=self.action_dim, policy_target_dim=policy_target_dim,
             context_length=self.context_length, num_lanes=num_envs_of(env),
@@ -1512,7 +1456,7 @@ class NativeUniZero(CustomAlgorithm):
         self, ctx_obs: np.ndarray, ctx_action: np.ndarray, ctx_valid: np.ndarray, current_obs: np.ndarray,
     ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
         """`ctx_*`: `(B, context_length, ...)`, right-padded (see
-        `_UniZeroBuffer._pad_one`). `current_obs`: `(B, *obs_shape)`.
+        `_ResearchImZeroBuffer._pad_one`). `current_obs`: `(B, *obs_shape)`.
         Returns `(tokens (B, Lmax, E), pad_mask (B, Lmax) bool, valid_len
         (B,) int)`, `Lmax = valid_len.max()` - the raw root token
         sequence the *training* teacher-forcing window starts from (used
@@ -1677,9 +1621,19 @@ class NativeUniZero(CustomAlgorithm):
             return caches2
 
     # ------------------------------------------------------------------
-    # Search - a genuine batched PUCT search tree, see module docstring.
+    # Search - a genuine batched Gumbel search tree, see module docstring.
     # ------------------------------------------------------------------
     def _sample_continuous_candidates(self, mean: torch.Tensor, std: torch.Tensor) -> tuple[list[np.ndarray], np.ndarray]:
+        """K = `num_sampled_actions` candidate child actions for one node,
+        sampled from *that node's own* predicted Gaussian policy - `k1`
+        "on policy" (its own std) plus `k2` "wide" (inflated std,
+        `continuous_prior_scale`x), the paper's `A_{S1}`/`A_{S2}` split
+        (`efficientzero.py`'s own method, ported verbatim). Each
+        candidate's prior is the (unnormalized) log-density of the
+        on-policy Gaussian at that action - a consistent proposal-density
+        prior for every slot regardless of which of the two samplers
+        actually drew it, fed into the exact same Gumbel-Top-k/Sequential
+        Halving/improved-policy formulas the discrete case uses."""
         mean_np = mean.squeeze(0).detach().cpu().numpy()
         std_np = std.squeeze(0).detach().cpu().numpy()
         low, high = self._action_space.low, self._action_space.high
@@ -1695,28 +1649,30 @@ class NativeUniZero(CustomAlgorithm):
     def search(
         self, obs_batch: np.ndarray, root_caches: list[_TransformerCache | None], deterministic: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
-        """Batched, classic PUCT search (`_puct_select_child`) with root
-        Dirichlet noise - reference's own default UniZero search
-        (`gumbel_algo=False`, `UniZeroMCTSCtree`,
-        `lzero/mcts/tree_search/mcts_ctree.py`); *not* Gumbel/Sequential-
-        Halving any more (this file's own earlier choice, ported from
-        `efficientzero.py` - kept there, for EfficientZero V2's own
-        default search, unaffected by this change). The *policy target*
-        this returns is therefore also the reference's own: a plain
-        visit-count distribution over the root's children, not Gumbel's
-        "improved policy"/completed-Q blend.
+        """Batched Gumbel-Top-k + Sequential Halving search
+        (`efficientzero.py`'s own search algorithm, see module docstring's
+        "Search" section) - ALL B lanes' trees are searched together: one
+        shared root tokenizer+Transformer pass, then `num_simulations`
+        rounds where every lane descends its OWN tree by exactly one edge
+        and all B lanes' chosen leaf expansions are computed in one
+        batched `_step_imagine` call. Returns a length-B list of
+        `{"env_action", "policy_target", "value_target"}`.
 
         `obs_batch`: `(B, *obs_shape)`, `root_caches[i]`: lane `i`'s
         existing real-history cache (or `None`) - `learn()`/`predict()`
         pass their own persistent per-lane cache directly, `_reanalyze()`
         passes a fresh cold-start replay from `_replay_context_to_cache`
-        (module docstring's "Persistent, incrementally-extended per-lane
-        root cache" section) - never mutated here (see
+        (module docstring's "everything else" section, `unizero.py`'s own
+        machinery reused as-is here) - never mutated here (see
         `_TransformerCache`'s own docstring), so it's always safe for the
         caller to keep using its own copy afterward. `deterministic[i]`
-        (defaults to all-`False`, i.e. "collecting") additionally gates
-        root Dirichlet noise off for lane `i` - reference's own
-        `_forward_eval` doesn't add it, `_forward_collect` does."""
+        (defaults to all-`False`, i.e. "collecting") only affects whether
+        the returned `env_action` is the argmax of the final policy target
+        or sampled from it - unlike PUCT's root Dirichlet noise, Gumbel-
+        Top-k's own per-simulation resampling at the root is its own,
+        always-on exploration source, nothing to gate off for eval here
+        (`efficientzero.py`'s own choice, see that file's module
+        docstring's "No Dirichlet exploration noise" bullet)."""
         batch_size = obs_batch.shape[0]
         det = np.zeros(batch_size, dtype=bool) if deterministic is None else np.broadcast_to(deterministic, (batch_size,))
         with torch.no_grad():
@@ -1731,39 +1687,49 @@ class NativeUniZero(CustomAlgorithm):
             else:
                 root_mean, root_std = self.heads.policy_gaussian(h_root)
 
+        n_slots = self.n_actions if self.discrete else self.num_sampled_actions
+        num_top_actions = max(2, min(self.num_top_actions, n_slots))
         roots: list[_SearchNode] = []
         for i in range(batch_size):
             root = _SearchNode(prior=1.0)
             if self.discrete:
-                priors = _softmax(root_logits[i].detach().cpu().numpy().astype(np.float64))
+                # Raw logits, not softmax'd - `v_mix`/`improved_policy`
+                # apply `_softmax` themselves where needed, and the
+                # Gumbel-Top-k trick below specifically needs logits (its
+                # `argmax(logit + Gumbel noise)` sampling identity only
+                # holds in log-space).
+                priors = root_logits[i].detach().cpu().numpy().astype(np.float64)
                 candidates = None
             else:
-                candidates, log_probs = self._sample_continuous_candidates(root_mean[i : i + 1], root_std[i : i + 1])
-                priors = _softmax(log_probs)
-            if not det[i]:
-                priors = _add_dirichlet_noise(priors, self.root_dirichlet_alpha, self.root_noise_weight)
+                candidates, priors = self._sample_continuous_candidates(root_mean[i : i + 1], root_std[i : i + 1])
             root.expand(priors, root_state_out[i], 0.0, candidate_actions=candidates)
             root.visit_count = 1
             root.value_sum = float(root_value[i].item())
             roots.append(root)
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
+        gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature
+        schedule = _HalvingSchedule(self.num_simulations, num_top_actions)
 
-        for _sim_idx in range(self.num_simulations):
+        for sim_idx in range(self.num_simulations):
             leaf_nodes: list[_SearchNode] = []
-            parent_states: list[Any] = []
+            parent_caches: list[Any] = []
             chosen_actions: list[Any] = []
             search_paths: list[list[_SearchNode]] = []
             for lane in range(batch_size):
-                node = roots[lane]
+                root = roots[lane]
+                if sim_idx == 0:
+                    scores = gumbel[lane] + np.array([c.prior for c in root.children])
+                    root.selected_children_idx = list(np.argsort(-scores)[:num_top_actions])
+                node = root
                 path = [node]
                 while node.expanded():
-                    idx = _puct_select_child(node, minmax_list[lane], self.gamma, self.pb_c_base, self.pb_c_init)
+                    idx = _select_action(node, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
                     node = node.children[idx]
                     path.append(node)
                 parent = path[-2]
                 leaf_nodes.append(node)
-                parent_states.append(parent.cache)
+                parent_caches.append(parent.cache)
                 chosen_actions.append(node.candidate_action if not self.discrete else parent.children.index(node))
                 search_paths.append(path)
 
@@ -1773,7 +1739,7 @@ class NativeUniZero(CustomAlgorithm):
             else:
                 action_t = torch.as_tensor(np.stack(chosen_actions), dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                child_states, h_act, h_obs = self._step_imagine(parent_states, action_t)
+                child_caches, h_act, h_obs = self._step_imagine(parent_caches, action_t)
                 reward_scalar = self.heads.reward(h_act)
                 next_value = self.heads.value(h_obs)
                 if self.discrete:
@@ -1785,37 +1751,46 @@ class NativeUniZero(CustomAlgorithm):
                 leaf = leaf_nodes[lane]
                 rv = float(reward_scalar[lane].item())
                 if self.discrete:
-                    priors = _softmax(next_logits[lane].detach().cpu().numpy().astype(np.float64))
-                    leaf.expand(priors, child_states[lane], rv)
+                    priors = next_logits[lane].detach().cpu().numpy().astype(np.float64)
+                    leaf.expand(priors, child_caches[lane], rv)
                 else:
-                    candidates, log_probs = self._sample_continuous_candidates(next_mean[lane : lane + 1], next_std[lane : lane + 1])
-                    leaf.expand(_softmax(log_probs), child_states[lane], rv, candidate_actions=candidates)
+                    candidates, priors = self._sample_continuous_candidates(next_mean[lane : lane + 1], next_std[lane : lane + 1])
+                    leaf.expand(priors, child_caches[lane], rv, candidate_actions=candidates)
                 _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], self.gamma)
+
+            if schedule.maybe_advance(sim_idx):
+                for lane in range(batch_size):
+                    _sequential_halving(
+                        roots[lane], gumbel[lane], minmax_list[lane], schedule.current_top, self.gamma, self.c_visit, self.c_scale,
+                    )
 
         results: list[dict[str, Any]] = []
         for lane in range(batch_size):
             root = roots[lane]
-            visits = np.array([c.visit_count for c in root.children], dtype=np.float64)
-            policy_target = (visits / max(float(visits.sum()), 1e-8)).astype(np.float32)
-            best_idx = int(np.argmax(visits))
+            transformed = _transformed_completed_qs(root, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
+            improved = root.improved_policy(transformed)
+            best_idx = int(root.selected_children_idx[0]) if root.selected_children_idx else int(np.argmax(improved))
             if self.discrete:
+                policy_target = improved.astype(np.float32)
                 if det[lane]:
-                    env_action: Any = best_idx
+                    env_action: Any = int(np.argmax(policy_target))
                 else:
-                    env_action = int(np.random.choice(len(policy_target), p=policy_target))
+                    probs = policy_target / max(float(policy_target.sum()), 1e-8)
+                    env_action = int(np.random.choice(len(probs), p=probs))
             else:
                 candidates_arr = np.stack([c.candidate_action for c in root.children])
+                # `efficientzero.py`'s own, simpler continuous policy
+                # target: the visit-weighted (well, improved-policy-
+                # weighted) *average* candidate action, not the root's
+                # sampled candidates and their weights kept separate
+                # (`unizero.py`'s own Sampled-UniZero choice) - consumed
+                # by `_train_step`'s plain MSE continuous policy loss
+                # below, not an importance-weighted NLL.
+                policy_target = (improved[:, None] * candidates_arr).sum(axis=0).astype(np.float32)
                 env_action = candidates_arr[best_idx].astype(np.float32)
-                # Sampled UniZero's own policy target (module docstring's
-                # "Search" section): the root's own sampled candidates
-                # *and* their visit-count distribution together, not
-                # collapsed into a single blended action - `_train_step`'s
-                # continuous policy loss fits a genuine importance-
-                # weighted NLL against this, not an MSE point-estimate
-                # regression toward a mean.
-                policy_target = np.concatenate([candidates_arr.reshape(-1), policy_target]).astype(np.float32)
             results.append({"env_action": env_action, "policy_target": policy_target, "value_target": root.value()})
         return results
+
 
     # ------------------------------------------------------------------
     # Reanalyze - ported wholesale from `efficientzero.py`'s `_reanalyze`.
@@ -1840,39 +1815,6 @@ class NativeUniZero(CustomAlgorithm):
         return {"reanalyze_mean_search_value": float(search_values.mean())}
 
     # ------------------------------------------------------------------
-    # Target network - EMA/momentum update, called once per `_train_step`
-    # right after `self.optimizer.step()` (module docstring's "Target
-    # network" section; reference's own `self._target_model.update(...)`,
-    # `lzero/policy/unizero.py`'s `_forward_learn`, called at the same
-    # point in its own training loop).
-    # ------------------------------------------------------------------
-    def _update_target_network(self) -> None:
-        """`target_param <- (1-theta)*target_param + theta*online_param`
-        for every parameter of `tokenizer`/`transformer`/`heads` (the
-        three modules `self.target_tokenizer`/`self.target_transformer`/
-        `self.target_heads` mirror - see `__init__`'s own comment for why
-        only these three, not every online module). Buffers (e.g. a
-        `LayerNorm`'s, if it had running stats - this file's doesn't, but
-        cheap to handle correctly anyway) are hard-copied, not EMA'd -
-        there's no sense smoothing a buffer that's itself already a
-        running statistic. `theta=0` would freeze the target forever;
-        `theta=1` would make it track the online network exactly (no
-        target effect at all) - `self.target_update_theta` (default
-        `0.05`, reference's own) sits deliberately far toward the "slow"
-        end of that range."""
-        theta = self.target_update_theta
-        with torch.no_grad():
-            for target_module, online_module in (
-                (self.target_tokenizer, self.tokenizer),
-                (self.target_transformer, self.transformer),
-                (self.target_heads, self.heads),
-            ):
-                for target_p, online_p in zip(target_module.parameters(), online_module.parameters()):
-                    target_p.mul_(1.0 - theta).add_(online_p, alpha=theta)
-                for target_b, online_b in zip(target_module.buffers(), online_module.buffers()):
-                    target_b.copy_(online_b)
-
-    # ------------------------------------------------------------------
     # Training - one forward pass over the full teacher-forced window
     # (context + real interleaved obs/action tokens), reading every step's
     # losses off that single pass (module docstring's "Full-trajectory
@@ -1891,12 +1833,14 @@ class NativeUniZero(CustomAlgorithm):
         policy_target = torch.as_tensor(batch["policy_target"], dtype=torch.float32, device=device)
         mask = torch.as_tensor(batch["mask"], dtype=torch.float32, device=device)
         td_reward = torch.as_tensor(batch["td_reward"], dtype=torch.float32, device=device)
-        td_obs = torch.as_tensor(batch["td_obs"], dtype=torch.float32, device=device)
         td_discount = torch.as_tensor(batch["td_discount"], dtype=torch.float32, device=device)
         td_bootstrap_mask = torch.as_tensor(batch["td_bootstrap_mask"], dtype=torch.float32, device=device)
-        # `batch["search_value"]` (`_reanalyze()`'s periodically-refreshed
-        # MCTS root value, per real transition) is deliberately *not*
-        # read here any more - see the value-target comment below.
+        # `_reanalyze()`'s periodically-refreshed MCTS root value, per
+        # real transition (`_NO_SEARCH_VALUE` sentinel for never-
+        # reanalyzed ones) - blended into the value target below via
+        # `max()`, `efficientzero.py`'s own `value_target: 'max'` mode
+        # (module docstring's "no target network" section).
+        search_value = torch.as_tensor(batch["search_value"], dtype=torch.float32, device=device)
         is_weight = torch.as_tensor(batch["is_weight"], dtype=torch.float32, device=device)
 
         # Raw token embeddings for the whole window: context (compact,
@@ -1918,16 +1862,6 @@ class NativeUniZero(CustomAlgorithm):
         )  # (B, Lmax0, E); `valid_len[i]` = lane `i`'s own real length (incl. obs0)
         act_embs = self.action_embed(action.view(b * k_steps, self.action_dim)).view(b, k_steps, self.embed_dim)
         next_obs_embs_grad = self.tokenizer(next_obs.view(b * k_steps, *self._obs_shape)).view(b, k_steps, self.embed_dim)
-        # Latent-consistency loss's own target embedding - the *target*
-        # tokenizer's (not online `self.tokenizer`'s) embedding of the
-        # same real next-observations, under `no_grad` (module
-        # docstring's "Target network" section; see the loss site below
-        # for why a target network, not just `.detach()` on the online
-        # tokenizer's own output, is the point).
-        with torch.no_grad():
-            target_next_obs_embs = self.target_tokenizer(
-                next_obs.view(b * k_steps, *self._obs_shape),
-            ).view(b, k_steps, self.embed_dim)
 
         lmax0 = root_tokens.shape[1]
         total_len = lmax0 + 2 * k_steps
@@ -1965,60 +1899,31 @@ class NativeUniZero(CustomAlgorithm):
             h_act_k = hidden[batch_idx, obs0_pos + 2 * k + 1]  # act_k's own hidden state
 
             value_pred_logits = self.heads.value_logits(h_obs_k)
-            # Bootstrap value comes from the *target* network
-            # (`self.target_tokenizer`/`self.target_transformer`/
-            # `self.target_heads`, module docstring's "Target network"
-            # section) over the TD-landing observation with its own
-            # (empty) context - cheap, and the "with its own context"
-            # part is exactly analogous to `efficientzero.py`'s own
-            # `self.representation(td_obs[:, k])` bootstrap call. Context
-            # is empty for *every* lane here, so every lane's `valid_len`
-            # is uniformly `1` and `[:, -1, :]` unambiguously means "the
-            # only (td_obs's own) token" - no per-lane offset needed.
-            # Reference (`lzero/mcts/buffer/game_buffer_unizero.py`'s
-            # `sample()`) passes `policy._target_model` into
-            # `_compute_target_reward_value`, not the online model - using
-            # the online network here instead would mean training the
-            # value head *towards a target it itself just produced*,
-            # which is the classic bootstrapped-TD moving-target problem
-            # a target network exists specifically to break (it's the
-            # same "chasing its own tail" self-reference the old
-            # `max(td_target, search_value)` value target - removed
-            # above - had a different flavor of). Still uses an *empty*
-            # context for the landing observation rather than that
-            # observation's own real history (a further, separate
-            # simplification this docstring is not hiding: doing that
-            # properly needs the replay buffer to also carry each TD
-            # landing point's own preceding context, which it doesn't
-            # today).
+            # Bootstrap value comes from the *online* network, under
+            # `no_grad` (module docstring's "no target network" section) -
+            # `efficientzero.py`'s own `self.representation(td_obs[:, k])`
+            # bootstrap call, not a separate target network. Context is
+            # empty for *every* lane here, so every lane's `valid_len` is
+            # uniformly `1` and `[:, -1, :]` unambiguously means "the only
+            # (td_obs's own) token" - no per-lane offset needed. This
+            # *does* mean the online value head is trained partly towards
+            # a target it itself just produced (the classic bootstrapped-
+            # TD moving-target problem a target network exists to break) -
+            # the `max(td_target, search_value)` blend right below is
+            # this file's chosen mitigation instead (`efficientzero.py`'s
+            # own `value_target: 'max'` mode): a transition that's been
+            # reanalyzed with the network's *own current* weights carries
+            # a fresher root-value estimate than a plain online-net
+            # bootstrap that's chasing its own recent update.
             with torch.no_grad():
-                td_obs_emb = self.target_tokenizer(
+                td_obs_emb = self.tokenizer(
                     torch.as_tensor(batch["td_obs"][:, k], dtype=torch.float32, device=device),
                 )
                 td_pad = torch.ones(b, 1, dtype=torch.bool, device=device)
-                td_hidden = self.target_transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
-                bootstrap_value = self.target_heads.value(td_hidden) * td_bootstrap_mask[:, k]
+                td_hidden = self.transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
+                bootstrap_value = self.heads.value(td_hidden) * td_bootstrap_mask[:, k]
                 td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
-                # Plain n-step TD(`td_steps`) target - *not* blended with
-                # `search_value` via `max()`. The reference LightZero
-                # UniZero (`lzero/mcts/buffer/game_buffer_unizero.py`'s
-                # `_compute_target_reward_value`, `use_root_value=False`
-                # by default - `lzero/mcts/buffer/game_buffer.py`) always
-                # recomputes this bootstrap value fresh from the *current*
-                # network at the landing observation (which is what
-                # `bootstrap_value` above already is - "value is 100%
-                # reanalyzed" per that file's own docstring) and never
-                # blends it with a stale MCTS root/search value. Doing the
-                # `max()` blend (borrowed from `efficientzero.py`, which
-                # *is* correct for EfficientZero's own MCTS-heavy target)
-                # here instead one-sidedly ratchets the target upward
-                # whenever a lucky/overestimated search value briefly
-                # exceeds the bootstrap TD value, which self-reinforces
-                # (the network is trained *towards* its own noisy search
-                # overestimates) and was the likely cause of the
-                # "quick reward spike, then degrades" pattern reported
-                # even with a from-scratch-recompute self-play path.
-                value_target = td_target
+                value_target = torch.maximum(td_target, search_value[:, k])
             value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
             v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
             value_loss = value_loss + (v_loss * wm).sum() / denom
@@ -2038,58 +1943,43 @@ class NativeUniZero(CustomAlgorithm):
                 entropy_k = -(logp.exp() * logp).sum(-1)
             else:
                 mean, std = self.heads.policy_gaussian(h_obs_k)
-                # Sampled UniZero's own policy loss (module docstring's
-                # "Search" section, Hubert et al. 2021's Sampled-MuZero
-                # policy-improvement estimator): a genuine importance-
-                # weighted NLL against `search()`'s own (candidates,
-                # visit-count weights) pair, `-sum_i w_i * log N(action_i;
-                # mean, std)` - *not* this file's earlier MSE toward a
-                # single visit-weighted-average action, which threw away
-                # the target distribution's own shape (unimodal-mean
-                # matching a possibly-multimodal empirical distribution
-                # over `num_sampled_actions` candidates instead of
-                # genuinely fitting a density to it).
-                num_cand = self.num_sampled_actions
-                cand_and_weights = policy_target[:, k]  # (B, K*(A+1))
-                candidates_k = cand_and_weights[:, : num_cand * self.action_dim].view(b, num_cand, self.action_dim)
-                weights_k = cand_and_weights[:, num_cand * self.action_dim :]  # (B, K)
-                var = std.clamp_min(1e-6) ** 2  # (B, A)
-                diff = candidates_k - mean.unsqueeze(1)  # (B, K, A)
-                log_prob = -0.5 * (
-                    (diff ** 2) / var.unsqueeze(1) + torch.log(2.0 * math.pi * var.unsqueeze(1))
-                ).sum(-1)  # (B, K)
-                p_loss = -(weights_k * log_prob).sum(-1)
+                # `efficientzero.py`'s own, simpler continuous policy loss
+                # (module docstring's "Search" section): plain MSE toward
+                # `search()`'s visit-weighted-*average* candidate action
+                # (`policy_target[:, k]`, shape `(B, action_dim)`) - not
+                # `unizero.py`'s own importance-weighted NLL against the
+                # full sampled-candidate set.
+                p_loss = F.mse_loss(mean, policy_target[:, k], reduction="none").sum(-1)
                 # Differential entropy of an (assumed-diagonal) Gaussian,
                 # summed over action dims - closed form, no sampling
                 # needed: `0.5*log(2*pi*e*sigma^2)` per dim.
+                var = std.clamp_min(1e-6) ** 2
                 entropy_k = (0.5 * torch.log(2.0 * math.pi * math.e * var)).sum(-1)
             policy_loss = policy_loss + (p_loss * wm).sum() / denom
             policy_entropy = policy_entropy + (entropy_k * wm).sum() / denom
 
-            # Latent-consistency ("predict next latent") loss:
-            # `heads.latent(h_act_k)` should approximate the *real* next
-            # observation's own token embedding - reference's own
-            # `predict_latent_loss_type='mse'` (`obs_loss_weight=10`
-            # default), a plain MSE against the *target* tokenizer's
-            # embedding (`target_next_obs_embs`, computed once above,
-            # under `no_grad`) - not this file's earlier SimSiam
-            # (projector+predictor+cosine, stop-gradient on the *online*
-            # tokenizer's own output, no target network at all). Training
-            # the world model's next-latent prediction to chase a target
-            # that's a deterministic function of the *same* weights being
-            # updated (the online tokenizer, merely `.detach()`-ed) is a
-            # softer version of the same self-reference problem the
-            # bootstrap-value comment above describes - collapse (every
-            # observation embeds to the same point, trivially "predicted"
-            # perfectly) is a real failure mode for that setup, which is
-            # why SimSiam-family methods lean so heavily on stop-gradient
-            # *plus* extra architecture (predictor, `BatchNorm1d`) to
-            # resist it. A momentum target network is the reference's own
-            # (and the wider self-supervised-learning literature's - BYOL,
-            # MoCo) answer to the same collapse risk, without needing
-            # either extra network.
+            # SimSiam consistency loss (module docstring's "no target
+            # network" section, `efficientzero.py`'s own recipe): the
+            # dynamics-predicted next-token embedding (`heads.latent
+            # (h_act_k)`) should approximate the *real* next
+            # observation's own token embedding, trained via negative
+            # cosine similarity against a stop-gradiented copy of the
+            # *online* tokenizer's own embedding of it (`next_obs_embs_
+            # grad[:, k].detach()` - already computed above as part of
+            # this window's own input tokens, no extra forward pass
+            # needed) rather than a separate momentum target network.
+            # `_Projector`applied to both branches (shared, SimSiam's own
+            # asymmetric-predictor-only-on-one-side convention),
+            # `_Predictor` only on the predicted branch - `BatchNorm1d`
+            # inside both is what actually prevents the every-observation-
+            # embeds-to-the-same-point collapse stop-gradient alone
+            # doesn't (Chen & He, 2021, Table 2c - see `_Projector`'s own
+            # docstring).
+            true_next_emb = next_obs_embs_grad[:, k].detach()
+            p_true = F.normalize(self.projector(true_next_emb), dim=-1).detach()
             z_pred = self.heads.latent(h_act_k)
-            c_loss = F.mse_loss(z_pred, target_next_obs_embs[:, k], reduction="none").mean(-1)
+            p_pred = F.normalize(self.predictor(self.projector(z_pred)), dim=-1)
+            c_loss = -(p_true * p_pred).sum(-1)
             consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
         n = float(k_steps)
@@ -2110,7 +2000,6 @@ class NativeUniZero(CustomAlgorithm):
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self._params, self.max_grad_norm)
         self.optimizer.step()
-        self._update_target_network()
 
         assert first_step_value_pred is not None and first_step_value_target is not None
         fresh_priority = (first_step_value_pred - first_step_value_target).abs().cpu().numpy()
@@ -2145,23 +2034,15 @@ class NativeUniZero(CustomAlgorithm):
             if num_timesteps < self.learning_starts:
                 for _ in range(n_envs):
                     raw_action = self._action_space.sample()
-                    if self.discrete:
-                        policy_target = np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
-                    else:
-                        # No real search yet during random warmup - repeat
-                        # the one sampled action across all
-                        # `num_sampled_actions` "candidate" slots with a
-                        # uniform weight, so this fallback's own
-                        # `policy_target` shape always matches `search()`'s
-                        # own (candidates, visit-weights) encoding
-                        # (`policy_target_dim`, `__init__`'s own comment) -
-                        # these transitions get trained on by `_train_step`
-                        # exactly like any other, just towards a
-                        # (degenerate, single-point) target distribution.
-                        raw_flat = np.asarray(raw_action, dtype=np.float32).reshape(-1)
-                        candidates = np.tile(raw_flat, (self.num_sampled_actions, 1))
-                        weights = np.full(self.num_sampled_actions, 1.0 / self.num_sampled_actions, dtype=np.float32)
-                        policy_target = np.concatenate([candidates.reshape(-1), weights]).astype(np.float32)
+                    policy_target = (
+                        np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
+                        if self.discrete
+                        # No real search yet during random warmup - the
+                        # sampled action itself is the fallback "target"
+                        # (`efficientzero.py`'s own choice, matching this
+                        # file's `policy_target_dim = action_dim`).
+                        else np.asarray(raw_action, dtype=np.float32).reshape(-1)
+                    )
                     env_action = action_to_env(raw_action, self._action_space)
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
@@ -2247,32 +2128,22 @@ class NativeUniZero(CustomAlgorithm):
                 "action_embed_state_dict": self.action_embed.state_dict(),
                 "transformer_state_dict": self.transformer.state_dict(),
                 "heads_state_dict": self.heads.state_dict(),
-                "target_tokenizer_state_dict": self.target_tokenizer.state_dict(),
-                "target_transformer_state_dict": self.target_transformer.state_dict(),
-                "target_heads_state_dict": self.target_heads.state_dict(),
+                "projector_state_dict": self.projector.state_dict(),
+                "predictor_state_dict": self.predictor.state_dict(),
                 "hyperparams": self.hyperparams,
             },
             path,
         )
 
     @classmethod
-    def load(cls, path: Path, env: gym.Env, device: str = "cpu") -> "NativeUniZero":
+    def load(cls, path: Path, env: gym.Env, device: str = "cpu") -> "NativeResearchImZero":
         payload = torch.load(path, map_location="cpu", weights_only=False)
         algo = cls(env, payload.get("hyperparams", {}), None, device)
         algo.tokenizer.load_state_dict(payload["tokenizer_state_dict"])
         algo.action_embed.load_state_dict(payload["action_embed_state_dict"])
         algo.transformer.load_state_dict(payload["transformer_state_dict"])
         algo.heads.load_state_dict(payload["heads_state_dict"])
-        # Older checkpoints (saved before the target network existed)
-        # have no `target_*_state_dict` keys - fall back to a plain copy
-        # of the just-loaded online weights, same as a freshly
-        # constructed `NativeUniZero` starts out with in `__init__`.
-        if "target_tokenizer_state_dict" in payload:
-            algo.target_tokenizer.load_state_dict(payload["target_tokenizer_state_dict"])
-            algo.target_transformer.load_state_dict(payload["target_transformer_state_dict"])
-            algo.target_heads.load_state_dict(payload["target_heads_state_dict"])
-        else:
-            algo.target_tokenizer.load_state_dict(algo.tokenizer.state_dict())
-            algo.target_transformer.load_state_dict(algo.transformer.state_dict())
-            algo.target_heads.load_state_dict(algo.heads.state_dict())
+        if "projector_state_dict" in payload:
+            algo.projector.load_state_dict(payload["projector_state_dict"])
+            algo.predictor.load_state_dict(payload["predictor_state_dict"])
         return algo

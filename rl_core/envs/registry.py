@@ -53,8 +53,8 @@ register_finrl_envs()
 
 ActionKind = Literal["discrete", "continuous"]
 
-_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es", "dreamer", "world_models_ha", "efficientzero", "unizero"]
-_CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es", "dreamer", "mbpo", "pets", "world_models_ha", "efficientzero", "unizero"]
+_DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es", "dreamer", "world_models_ha", "efficientzero", "unizero", "researchimzero"]
+_CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es", "dreamer", "mbpo", "pets", "world_models_ha", "efficientzero", "unizero", "researchimzero"]
 
 @dataclass
 class EnvSpec:

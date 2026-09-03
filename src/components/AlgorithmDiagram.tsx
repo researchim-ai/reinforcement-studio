@@ -62,7 +62,7 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (id.includes('pets')) return 'pets'
   if (id.includes('world_models_ha') || id.includes('world-models-ha')) return 'world_models_ha'
   if (id.includes('efficientzero') || id.includes('efficient-zero') || id.includes('muzero')) return 'efficientzero'
-  if (id.includes('unizero')) return 'unizero'
+  if (id.includes('unizero') || id.includes('researchimzero')) return 'unizero'
   if (id === 'ippo' || id.includes('ippo')) return 'ippo'
   if (id === 'qmix' || id.includes('qmix')) return 'qmix'
   return 'generic'

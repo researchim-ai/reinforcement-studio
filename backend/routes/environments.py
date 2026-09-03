@@ -422,39 +422,104 @@ ALGORITHM_CATALOG = [
                         "последовательностью токенов [obs₀, act₀, obs₁, ...] с RoPE и персистентным "
                         "KV-cache. Discrete и continuous.",
         "hyperparams": [
+            {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-4, "min": 1e-6, "max": 1e-1},
+            {"key": "weight_decay", "label": "AdamW weight decay", "type": "float", "default": 1e-4, "min": 0.0, "max": 1.0},
+            {"key": "embed_dim", "label": "Размерность токена (embed_dim)", "type": "int", "default": 128, "min": 8, "max": 1024},
+            {"key": "num_layers", "label": "Слоёв Transformer'а", "type": "int", "default": 2, "min": 1, "max": 12},
+            {"key": "num_heads", "label": "Голов self-attention", "type": "int", "default": 8, "min": 1, "max": 32},
+            {"key": "dropout", "label": "Dropout внутри Transformer'а", "type": "float", "default": 0.1, "min": 0.0, "max": 0.5},
+            {
+                "key": "rotary_emb", "label": "Positional encoding", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "RoPE (быстрее — lossless O(1) KV-cache eviction)"},
+                    {"value": 0, "label": "Learned absolute embedding (как в референсе, медленнее)"},
+                ],
+            },
+            {"key": "context_length", "label": "Окно памяти (прошлых транзакций)", "type": "int", "default": 6, "min": 0, "max": 64},
+            {"key": "buffer_size", "label": "Replay buffer (эпизодов)", "type": "int", "default": 2_000, "min": 10, "max": 100_000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 256, "min": 4, "max": 1024},
+            {"key": "unroll_steps", "label": "Длина training unroll'а / глубина поиска", "type": "int", "default": 10, "min": 1, "max": 30},
+            {"key": "td_steps", "label": "Горизонт n-step value target", "type": "int", "default": 5, "min": 1, "max": 50},
+            {"key": "num_sampled_actions", "label": "Continuous: кандидатов-действий на узел (K)", "type": "int", "default": 8, "min": 2, "max": 64},
+            {"key": "num_simulations", "label": "Симуляций PUCT-поиска на реальный шаг", "type": "int", "default": 50, "min": 2, "max": 256},
+            {"key": "pb_c_base", "label": "PUCT: pb_c_base", "type": "float", "default": 19652.0, "min": 1.0, "max": 100_000.0},
+            {"key": "pb_c_init", "label": "PUCT: pb_c_init", "type": "float", "default": 1.25, "min": 0.01, "max": 10.0},
+            {"key": "root_dirichlet_alpha", "label": "Dirichlet-шум в корне: α", "type": "float", "default": 0.3, "min": 0.01, "max": 10.0},
+            {"key": "root_noise_weight", "label": "Dirichlet-шум в корне: вес", "type": "float", "default": 0.25, "min": 0.0, "max": 1.0},
+            {"key": "value_minmax_delta", "label": "Мин. эпсилон нормализации Q (MinMaxStats)", "type": "float", "default": 0.01, "min": 1e-4, "max": 1.0},
+            {"key": "value_support_size", "label": "Категориальный support value/reward-головы (±N бинов)", "type": "int", "default": 50, "min": 5, "max": 1000},
+            {"key": "label_smoothing_eps", "label": "Label smoothing value/reward-таргетов (ε)", "type": "float", "default": 0.1, "min": 0.0, "max": 0.5},
+            {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.997, "min": 0.5, "max": 0.999},
+            {"key": "value_loss_coef", "label": "Вес value loss", "type": "float", "default": 0.25, "min": 0.0, "max": 10.0},
+            {"key": "policy_loss_coef", "label": "Вес policy loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
+            {"key": "reward_loss_coef", "label": "Вес reward loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
+            {"key": "consistency_loss_coef", "label": "Вес consistency (latent) loss", "type": "float", "default": 10.0, "min": 0.0, "max": 20.0},
+            {"key": "policy_entropy_coef", "label": "Вес policy entropy bonus", "type": "float", "default": 5e-3, "min": 0.0, "max": 0.1},
+            {"key": "target_update_theta", "label": "EMA target-модели (θ, per train-step)", "type": "float", "default": 0.05, "min": 0.0, "max": 1.0},
+            {"key": "continuous_prior_scale", "label": "Continuous: расширение std для prior-кандидатов", "type": "float", "default": 2.5, "min": 1.0, "max": 10.0},
+            {"key": "train_freq", "label": "Реальных шагов между обновлениями (суммарно по всем env)", "type": "int", "default": 1, "min": 1, "max": 1000},
+            {"key": "train_steps_per_iter", "label": "Градиентных шагов за каждые train_freq реальных шагов", "type": "int", "default": 1, "min": 1, "max": 100},
+            {"key": "learning_starts", "label": "Реальных шагов до начала обучения", "type": "int", "default": 2000, "min": 0, "max": 100_000},
+            {"key": "max_grad_norm", "label": "Max grad norm", "type": "float", "default": 5.0, "min": 0.1, "max": 100.0},
+            {"key": "priority_alpha", "label": "Prioritized replay: степень приоритизации (α, 0=uniform/выкл.)", "type": "float", "default": 0.0, "min": 0.0, "max": 1.0},
+            {"key": "priority_beta", "label": "Prioritized replay: коррекция смещения (β, importance sampling)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
+            {"key": "min_priority", "label": "Минимальный приоритет перехода", "type": "float", "default": 1e-6, "min": 1e-8, "max": 1.0},
+            {"key": "reanalyze_freq", "label": "Реальных шагов между reanalyze-проходами", "type": "int", "default": 200, "min": 1, "max": 100_000},
+            {"key": "reanalyze_batch_size", "label": "Переходов, обновляемых за один reanalyze-проход (0 = выключить)", "type": "int", "default": 0, "min": 0, "max": 1024},
+        ],
+    },
+    {
+        "id": "researchimzero",
+        "name": "ResearchImZero (наша версия)",
+        "kind": "gym",
+        "description": "Наш собственный алгоритм: архитектура UniZero (causal Transformer + RoPE + "
+                        "персистентный KV-cache), но с тренировочным рецептом EfficientZero (Gumbel-поиск, "
+                        "SimSiam consistency, без target-модели, PER + reanalyze включены по умолчанию) — "
+                        "то, что реально быстро и хорошо обучалось на практике. Discrete и continuous.",
+        "hyperparams": [
             {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 2e-4, "min": 1e-6, "max": 1e-1},
             {"key": "embed_dim", "label": "Размерность токена (embed_dim)", "type": "int", "default": 128, "min": 8, "max": 1024},
             {"key": "num_layers", "label": "Слоёв Transformer'а", "type": "int", "default": 2, "min": 1, "max": 12},
             {"key": "num_heads", "label": "Голов self-attention", "type": "int", "default": 4, "min": 1, "max": 32},
             {"key": "dropout", "label": "Dropout внутри Transformer'а", "type": "float", "default": 0.0, "min": 0.0, "max": 0.5},
+            {
+                "key": "rotary_emb", "label": "Positional encoding", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "RoPE (быстрее — lossless O(1) KV-cache eviction)"},
+                    {"value": 0, "label": "Learned absolute embedding (медленнее)"},
+                ],
+            },
             {"key": "context_length", "label": "Окно памяти (прошлых транзакций)", "type": "int", "default": 6, "min": 0, "max": 64},
             {"key": "buffer_size", "label": "Replay buffer (эпизодов)", "type": "int", "default": 2_000, "min": 10, "max": 100_000},
             {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 4, "max": 1024},
             {"key": "unroll_steps", "label": "Длина training unroll'а / глубина поиска", "type": "int", "default": 5, "min": 1, "max": 30},
             {"key": "td_steps", "label": "Горизонт n-step value target", "type": "int", "default": 5, "min": 1, "max": 50},
             {"key": "num_sampled_actions", "label": "Continuous: кандидатов-действий на узел (K)", "type": "int", "default": 8, "min": 2, "max": 64},
-            {"key": "num_simulations", "label": "Симуляций поиска на реальный шаг", "type": "int", "default": 32, "min": 2, "max": 256},
+            {"key": "num_simulations", "label": "Симуляций Gumbel-поиска на реальный шаг", "type": "int", "default": 32, "min": 2, "max": 256},
             {"key": "num_top_actions", "label": "Корневых кандидатов в Sequential Halving (m)", "type": "int", "default": 8, "min": 2, "max": 64},
             {"key": "c_visit", "label": "Sigma-transform: c_visit", "type": "float", "default": 50.0, "min": 1.0, "max": 200.0},
             {"key": "c_scale", "label": "Sigma-transform: c_scale", "type": "float", "default": 0.1, "min": 0.01, "max": 5.0},
+            {"key": "policy_target_temperature", "label": "Температура шума Гумбеля в корне", "type": "float", "default": 1.0, "min": 0.01, "max": 10.0},
             {"key": "value_minmax_delta", "label": "Мин. эпсилон нормализации Q (MinMaxStats)", "type": "float", "default": 0.01, "min": 1e-4, "max": 1.0},
             {"key": "value_support_size", "label": "Категориальный support value/reward-головы (±N бинов)", "type": "int", "default": 300, "min": 5, "max": 1000},
+            {"key": "label_smoothing_eps", "label": "Label smoothing value/reward-таргетов (ε)", "type": "float", "default": 0.0, "min": 0.0, "max": 0.5},
             {"key": "gamma", "label": "Discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.999},
             {"key": "value_loss_coef", "label": "Вес value loss", "type": "float", "default": 0.25, "min": 0.0, "max": 10.0},
             {"key": "policy_loss_coef", "label": "Вес policy loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
             {"key": "reward_loss_coef", "label": "Вес reward loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
-            {"key": "consistency_loss_coef", "label": "Вес consistency (SimSiam) loss", "type": "float", "default": 2.0, "min": 0.0, "max": 10.0},
+            {"key": "consistency_loss_coef", "label": "Вес consistency (SimSiam) loss", "type": "float", "default": 2.0, "min": 0.0, "max": 20.0},
+            {"key": "proj_dim", "label": "SimSiam projector/predictor: размерность", "type": "int", "default": 64, "min": 8, "max": 512},
+            {"key": "policy_entropy_coef", "label": "Вес policy entropy bonus", "type": "float", "default": 5e-3, "min": 0.0, "max": 0.1},
             {"key": "continuous_prior_scale", "label": "Continuous: расширение std для prior-кандидатов", "type": "float", "default": 2.5, "min": 1.0, "max": 10.0},
-            {"key": "policy_target_temperature", "label": "Температура шума Гумбеля в корне", "type": "float", "default": 1.0, "min": 0.01, "max": 10.0},
             {"key": "train_freq", "label": "Реальных шагов между обновлениями (суммарно по всем env)", "type": "int", "default": 1, "min": 1, "max": 1000},
             {"key": "train_steps_per_iter", "label": "Градиентных шагов за каждые train_freq реальных шагов", "type": "int", "default": 1, "min": 1, "max": 100},
-            {"key": "learning_starts", "label": "Случайных шагов до начала поиска/обучения", "type": "int", "default": 500, "min": 0, "max": 100_000},
+            {"key": "learning_starts", "label": "Реальных шагов до начала обучения", "type": "int", "default": 500, "min": 0, "max": 100_000},
             {"key": "max_grad_norm", "label": "Max grad norm", "type": "float", "default": 5.0, "min": 0.1, "max": 100.0},
-            {"key": "priority_alpha", "label": "Prioritized replay: степень приоритизации (α, 0=uniform)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
+            {"key": "priority_alpha", "label": "Prioritized replay: степень приоритизации (α, 0=uniform/выкл.)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
             {"key": "priority_beta", "label": "Prioritized replay: коррекция смещения (β, importance sampling)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
             {"key": "min_priority", "label": "Минимальный приоритет перехода", "type": "float", "default": 1e-6, "min": 1e-8, "max": 1.0},
             {"key": "reanalyze_freq", "label": "Реальных шагов между reanalyze-проходами", "type": "int", "default": 200, "min": 1, "max": 100_000},
-            {"key": "reanalyze_batch_size", "label": "Переходов, обновляемых за один reanalyze-проход (0 = выключить)", "type": "int", "default": 0, "min": 0, "max": 1024},
+            {"key": "reanalyze_batch_size", "label": "Переходов, обновляемых за один reanalyze-проход (0 = выключить)", "type": "int", "default": 64, "min": 0, "max": 1024},
         ],
     },
     {
@@ -581,6 +646,36 @@ def _d(ru: str, en: str) -> dict[str, str]:
 # `_HP_DESCRIPTIONS_BY_ALGO` below, applied on top of (and, if present,
 # instead of) this dict by `_attach_hyperparam_descriptions()`.
 _HP_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "weight_decay": _d(
+        "L2-регуляризация весов сети в оптимизаторе (AdamW) — штрафует слишком большие веса, снижая риск "
+        "переобучения. 0 полностью выключает регуляризацию.",
+        "L2 weight regularization inside the optimizer (AdamW) — penalizes overly large weights, reducing "
+        "overfitting risk. 0 fully disables it.",
+    ),
+    "label_smoothing_eps": _d(
+        "Label smoothing (ε) для категориальных value/reward-таргетов: итоговый таргет = (1-ε)×two-hot + "
+        "ε/N_бинов — сглаживает распределение, снижая риск переуверенности сети в конкретном бине. 0 — обычный "
+        "two-hot без сглаживания.",
+        "Label smoothing (ε) for the categorical value/reward targets: final target = (1-ε)×two-hot + "
+        "ε/num_bins — smooths the distribution, reducing overconfidence in a single bin. 0 is a plain two-hot "
+        "with no smoothing.",
+    ),
+    "policy_entropy_coef": _d(
+        "Вес энтропийного бонуса политики, ВЫЧИТАЕМого из общего лосса — поощряет более разнообразную "
+        "(менее уверенную) политику, снижая риск преждевременной сходимости к субоптимальному действию. "
+        "0 выключает бонус.",
+        "Weight of the policy entropy bonus, SUBTRACTED from the total loss — encourages a more diverse (less "
+        "overconfident) policy, reducing the risk of premature convergence to a suboptimal action. 0 disables "
+        "the bonus.",
+    ),
+    "target_update_theta": _d(
+        "Коэффициент EMA-обновления target-сети (используется для bootstrap value и latent-consistency таргета): "
+        "target ← (1-θ)×target + θ×online, применяется на каждом шаге обучения. Меньше θ — медленнее и стабильнее "
+        "обновление target-сети.",
+        "EMA update coefficient for the target network (used for the bootstrap value and the latent-consistency "
+        "target): target ← (1-θ)×target + θ×online, applied every training step. Smaller θ means a slower, more "
+        "stable target-network update.",
+    ),
     "learning_rate": _d(
         "Скорость обучения — размер шага градиентного спуска при обновлении весов сети. Слишком большое значение "
         "делает обучение нестабильным (лоссы скачут или расходятся), слишком маленькое — обучение идёт очень медленно.",
@@ -1273,12 +1368,53 @@ _HP_DESCRIPTIONS_BY_ALGO: dict[tuple[str, str], dict[str, str]] = {
         "collected data per VAE + MDN-RNN update — each seq_len steps long.",
     ),
     ("unizero", "num_simulations"): _d(
-        "UniZero: сколько симуляций Gumbel-поиска выполняется для выбора ОДНОГО реального действия среды "
-        "(дерево перестраивается заново на каждом шаге, каждая симуляция — два forward pass'а через Transformer) "
-        "— больше симуляций даёт точнее посчитанные Q/visit-статистики дерева, но дороже по времени на шаг.",
-        "UniZero: how many Gumbel-search simulations are run to pick a SINGLE real environment action (the tree "
-        "is rebuilt from scratch every step, each simulation is two Transformer forward passes) — more "
-        "simulations give more accurate tree Q/visit statistics but cost more time per step.",
+        "UniZero: сколько симуляций классического PUCT-поиска (как в AlphaZero/MuZero) выполняется для выбора "
+        "ОДНОГО реального действия среды (дерево перестраивается заново на каждом шаге, каждая симуляция — два "
+        "forward pass'а через Transformer) — больше симуляций даёт точнее посчитанные Q/visit-статистики "
+        "дерева, но дороже по времени на шаг.",
+        "UniZero: how many classic PUCT-search simulations (AlphaZero/MuZero-style) are run to pick a SINGLE "
+        "real environment action (the tree is rebuilt from scratch every step, each simulation is two "
+        "Transformer forward passes) — more simulations give more accurate tree Q/visit statistics but cost "
+        "more time per step.",
+    ),
+    ("unizero", "pb_c_base"): _d(
+        "UniZero, PUCT-формула: базовая константа, регулирующая, как быстро вес exploration-слагаемого растёт "
+        "с числом посещений узла (чем больше pb_c_base, тем медленнее рост).",
+        "UniZero, PUCT formula: base constant controlling how quickly the exploration term's weight grows with "
+        "a node's visit count (larger pb_c_base = slower growth).",
+    ),
+    ("unizero", "pb_c_init"): _d(
+        "UniZero, PUCT-формула: начальный вес exploration-слагаемого (prior × sqrt(N_родителя) / (1+N_ребёнка)) "
+        "относительно нормализованного Q-значения.",
+        "UniZero, PUCT formula: initial weight of the exploration term (prior × sqrt(parent visits) / "
+        "(1+child visits)) relative to the normalized Q-value.",
+    ),
+    ("unizero", "root_dirichlet_alpha"): _d(
+        "UniZero: параметр α распределения Дирихле, из которого сэмплируется шум, добавляемый к приорам "
+        "действий в корне поиска — только во время сбора данных (не при eval) — для дополнительного "
+        "исследования.",
+        "UniZero: α parameter of the Dirichlet distribution the noise mixed into the root's action priors is "
+        "sampled from — only during data collection (not eval) — for extra exploration.",
+    ),
+    ("unizero", "root_noise_weight"): _d(
+        "UniZero: доля Dirichlet-шума, смешиваемого с приорами действий в корне поиска "
+        "((1-вес)×prior + вес×шум) — 0 полностью выключает шум.",
+        "UniZero: fraction of Dirichlet noise mixed into the root's action priors "
+        "((1-weight)×prior + weight×noise) — 0 fully disables the noise.",
+    ),
+    ("unizero", "rotary_emb"): _d(
+        "UniZero: способ кодирования позиции токена в Transformer'е. RoPE (по умолчанию) поворачивает "
+        "query/key перед скалярным произведением — внимание зависит только от относительного смещения "
+        "позиций, поэтому обрезка старых токенов из KV-кэша ничего не портит (дешёвый персистентный кэш на "
+        "весь эпизод). Learned absolute embedding — как в оригинальной реализации LightZero: обучаемая "
+        "таблица позиций, добавляемая к эмбеддингу токена; обрезка кэша под ней лишь приблизительно "
+        "корректна (сдвиг базы позиции), а не точна, поэтому медленнее.",
+        "UniZero: how the Transformer encodes a token's position. RoPE (default) rotates query/key before "
+        "the dot product, so attention depends only on the relative offset between positions — trimming old "
+        "tokens from the KV-cache changes nothing (a cheap cache that persists for the whole episode). "
+        "Learned absolute embedding — as in the original LightZero implementation: a trainable position "
+        "table added to the token embedding; cache trimming under it is only approximately correct (a "
+        "position-base shift), not exact, hence slower.",
     ),
     ("qmix", "train_freq"): _d(
         "QMIX: через сколько шагов среды выполняется очередное обновление командной Q-сети/mixing network.",
