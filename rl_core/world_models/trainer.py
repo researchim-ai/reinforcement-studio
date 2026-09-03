@@ -211,7 +211,15 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
     seq_buffer = SequenceReplayBuffer(max(total_steps, 4_000), obs_shape, action_dim, num_lanes=num_envs) if needs_sequences else None
     transition_buffer = ContinuousReplayBuffer(max(total_steps, 10_000), obs_shape, action_dim) if kind == "ensemble" else None
 
-    state: dict[str, Any] = {"step": 0, "last_write": 0, "last_preview": 0, "extra_metrics": {}, "last_gif": None, "last_gif_step": 0}
+    state: dict[str, Any] = {
+        "step": 0, "last_write": 0, "last_preview": 0, "extra_metrics": {}, "last_gif": None, "last_gif_step": 0,
+        # Cumulative total across every `collect_rollout_auto` call so far -
+        # that helper's own `stats["episodes"]` is only "how many finished
+        # *this* collection batch", so it has to be accumulated here to get
+        # a running total (mirrors `runner_utils.py`'s own
+        # `episodes_completed` bookkeeping for native/custom algorithms).
+        "episodes_completed": 0,
+    }
     start_time = time.time()
 
     def write_snapshot(step: int, status: str) -> None:
@@ -219,6 +227,7 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
         snapshot = {
             "run_id": run_dir.name, "kind": "world_model", "status": status,
             "algo": kind, "env_id": env_id, "step": int(step), "total_timesteps": int(total_steps),
+            "num_envs": num_envs, "episodes_completed": state["episodes_completed"],
             "fps": round(step / elapsed, 1) if elapsed > 0 else 0, "elapsed_seconds": round(elapsed, 1),
         }
         snapshot.update(state["extra_metrics"])
@@ -247,6 +256,7 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
             # collected rather than the raw (possibly not evenly
             # divisible by `num_envs`) request.
             state["step"] += max(1, collect_per_iter // num_envs) * num_envs
+            state["episodes_completed"] += collect_stats["episodes"]
 
             enough_data = (
                 (seq_buffer is not None and seq_buffer.num_episodes >= 2 and len(seq_buffer) >= seq_len)

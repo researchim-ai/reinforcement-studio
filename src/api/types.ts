@@ -607,6 +607,21 @@ export interface MetricsSnapshot {
   clip_fraction?: number | null
   fps?: number
   elapsed_seconds?: number
+  // How many *parallel* env lanes this run collects from — plain int,
+  // always `1` for a single env (`training.num_envs` not set, or the SB3
+  // path below which never reads it at all). Native/custom algorithms
+  // (rl_core/algorithms/runner_utils.py) and standalone World Model runs
+  // (rl_core/world_models/trainer.py) report the real, possibly->1 value;
+  // the SB3 path (rl_core/algorithms/sb3_runner.py) always reports `1`
+  // since it never wraps `training.num_envs` into an `AsyncVectorEnv`.
+  num_envs?: number
+  // Cumulative count of episodes/trajectories that have reached
+  // terminated/truncated since this run started (not a moving-average
+  // window like `episode_reward_mean` — a running total that only ever
+  // grows). `undefined` for run kinds that don't track it yet
+  // (AlphaZero counts "games"/iterations instead, see `latest.games_played`
+  // if that ever gets added).
+  episodes_completed?: number
   // A full episode played end-to-end and packed into a single-play GIF
   // (rendered every `render_every_steps` — see rl_core/algorithms/
   // metrics_callback.py::render_episode) rather than a single freeze-frame,

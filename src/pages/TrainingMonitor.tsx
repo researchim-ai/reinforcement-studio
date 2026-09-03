@@ -560,6 +560,8 @@ export function TrainingMonitor() {
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <StatCard label="Шаг / итерация" value={`${latest?.step ?? 0} / ${latest?.total_timesteps ?? '—'}`} />
+              <StatCard label="Параллельных сред" value={String(latest?.num_envs ?? 1)} />
+              <StatCard label="Траекторий завершено" value={latest?.episodes_completed != null ? String(latest.episodes_completed) : '—'} />
               {isAlphaZero ? (
                 <>
                   <StatCard label="Win-rate vs prev" value={latest?.win_rate_vs_prev != null ? `${(latest.win_rate_vs_prev * 100).toFixed(0)}%` : '—'} />

@@ -133,6 +133,41 @@ Remaining simplifications vs. either parent file: no multitask/LPIPS/
 pixel-decoder/open-loop-consistency/async-Ray-workers machinery (same
 as both parents); reanalyze runs synchronously in-loop, not in a separate
 process (same trade-off both parents make).
+
+**Performance, not architecture.** None of the below changes what gets
+computed - same search algorithm, same losses, same defaults - only how
+fast: `search()`'s per-simulation, per-lane Python loop used to call
+`.item()`/`.detach().cpu().numpy()` on a fresh one-row CUDA tensor slice
+*inside* that loop (`batch_size * num_simulations` separate GPU syncs
+per real env step, the actual reason a from-scratch profiling pass found
+this process CPU-bound at 100% while the GPU sat mostly idle even though
+it "looked" GPU-heavy on paper); every such site now converts its whole-
+batch tensor to numpy exactly once per simulation and only ever indexes
+plain numpy rows inside the per-lane loop. All of `search()`'s own
+forward passes plus the two persistent-cache helpers
+(`_replay_context_to_cache`/`_advance_lane_caches`) now run under
+`torch.inference_mode()` instead of `torch.no_grad()` - strictly stronger
+(inference tensors can never leak into a later autograd graph at all,
+closing off the exact class of bug behind this file's one past `CUDA out
+of memory` incident) and slightly cheaper (no version-counter/view
+bookkeeping `no_grad()` still pays for). `_train_step`'s own forward pass
+runs under automatic mixed precision (`use_amp`, default on for CUDA,
+always off on CPU) - bf16 where the GPU supports it (no loss scaling
+needed, fp32's exponent range), fp16 with a `GradScaler` otherwise -
+PyTorch's own standard recipe, roughly halving both step time and memory
+on a supported GPU. `__init__` also flips on `cudnn.benchmark` and TF32
+matmuls (`torch.set_float32_matmul_precision("high")`) once, process-wide,
+whenever running on CUDA - free wins for the CNN `_Tokenizer` on image
+envs and every Linear/attention matmul respectively, no-ops elsewhere.
+
+None of this touches **environment stepping** itself - that's `num_envs`
+(`rl_core/algorithms/vec_env.py`'s own job, shared by every native
+algorithm): `num_envs > 1` already runs one `AsyncVectorEnv` subprocess
+worker per lane, true multi-core env parallelism, with `search()` itself
+already batching all `num_envs` lanes' trees into one shared GPU forward
+pass per simulation - so the single highest-leverage speed knob outside
+this file is simply raising `training.num_envs` in the experiment config
+to however many CPU cores are free, not anything below.
 """
 from __future__ import annotations
 
@@ -233,6 +268,14 @@ DEFAULT_HYPERPARAMS = {
     "min_priority": 1e-6,
     "reanalyze_freq": 200,
     "reanalyze_batch_size": 64,
+    # Automatic mixed precision for `_train_step`'s forward/backward pass
+    # (module docstring's "Performance, not architecture" section) -
+    # `1` (default): on, whenever running on CUDA (always off on CPU,
+    # regardless of this flag - `__init__`'s own `self.use_amp`). Pure
+    # speed/memory knob, changes no computed value beyond ordinary
+    # floating-point rounding - set to `0` to debug a suspected precision
+    # issue in isolation.
+    "use_amp": 1,
     # `1` (default): RoPE - `_CausalTransformer`'s own default, lossless
     # `O(1)`-per-real-step KV-cache eviction, reused from `unizero.py`
     # as-is (module docstring's "everything else" section). `0`: learned
@@ -1393,6 +1436,32 @@ class NativeResearchImZero(CustomAlgorithm):
         # ever specifically compensating for either.
         self.optimizer = torch.optim.Adam(self._params, lr=float(hyperparams.get("learning_rate", 2e-4)))
 
+        # Pure speed knobs - none of these change what's computed, only
+        # how fast (module docstring's "Performance, not architecture"
+        # section): TF32 matmuls + `cudnn.benchmark` are free wins on any
+        # Ampere-or-newer GPU (no-ops elsewhere), automatic mixed
+        # precision (`autocast` in `_train_step`, gated by `use_amp`)
+        # roughly halves training-step wall time and memory on CUDA by
+        # running most of the forward pass in bf16/fp16 while keeping the
+        # optimizer's own master weights and reductions in fp32 - PyTorch's
+        # own numerically-safe default recipe, not a precision hack this
+        # file invented. All three are CPU-safe no-ops (`use_amp` forces
+        # itself off outside CUDA below), so tests/CPU-only setups are
+        # unaffected either way.
+        self._is_cuda = str(device).startswith("cuda")
+        if self._is_cuda:
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+        self.use_amp = bool(int(hyperparams.get("use_amp", 1))) and self._is_cuda
+        self._amp_dtype = (
+            torch.bfloat16 if (self._is_cuda and torch.cuda.is_bf16_supported()) else torch.float16
+        )
+        # bf16 has fp32's exponent range, so it never needs loss scaling
+        # (`GradScaler` is a no-op-by-construction whenever `enabled=False`
+        # below) - only the fp16 fallback (older GPUs without native bf16)
+        # actually exercises it.
+        self._grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self._amp_dtype is torch.float16)
+
         self.gamma = float(hyperparams.get("gamma", 0.99))
         self.batch_size = int(hyperparams.get("batch_size", 64))
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
@@ -1545,7 +1614,7 @@ class NativeResearchImZero(CustomAlgorithm):
         n_valid = ctx_valid.sum(axis=1)
         max_n = int(n_valid.max()) if b > 0 else 0
         device = self.device
-        with torch.no_grad():
+        with torch.inference_mode():
             for t in range(max_n):
                 active = [i for i in range(b) if t < n_valid[i]]
                 if not active:
@@ -1603,8 +1672,18 @@ class NativeResearchImZero(CustomAlgorithm):
         memory` well before the episode ends - `_train_step`/`_reanalyze`
         never call this method (they build their own short-lived,
         intentionally-graphed batches via `_embed_root_batch`), so nothing
-        here ever legitimately needs gradients."""
-        with torch.no_grad():
+        here ever legitimately needs gradients. `torch.inference_mode()`,
+        not just `torch.no_grad()` - stronger than a speed optimization
+        here specifically: an inference-mode tensor is *structurally*
+        barred from ever being captured into a later autograd graph (no
+        version counter at all), where a `no_grad()`-created tensor
+        merely *starts out* not requiring grad but could still, in
+        principle, end up used somewhere that does. Given this exact
+        method already caused one real `CUDA out of memory` incident from
+        a graph-leak in an earlier revision (see this docstring's own
+        "without `no_grad()` here" paragraph above), the stronger
+        guarantee is worth having on top of the speedup."""
+        with torch.inference_mode():
             obs_emb = self.tokenizer(torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device))
             positions_obs, embed_positions_obs = _cache_positions(caches, self.device)
             _, caches1 = self.transformer.forward_incremental_batch(
@@ -1623,7 +1702,7 @@ class NativeResearchImZero(CustomAlgorithm):
     # ------------------------------------------------------------------
     # Search - a genuine batched Gumbel search tree, see module docstring.
     # ------------------------------------------------------------------
-    def _sample_continuous_candidates(self, mean: torch.Tensor, std: torch.Tensor) -> tuple[list[np.ndarray], np.ndarray]:
+    def _sample_continuous_candidates(self, mean_np: np.ndarray, std_np: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
         """K = `num_sampled_actions` candidate child actions for one node,
         sampled from *that node's own* predicted Gaussian policy - `k1`
         "on policy" (its own std) plus `k2` "wide" (inflated std,
@@ -1633,9 +1712,16 @@ class NativeResearchImZero(CustomAlgorithm):
         on-policy Gaussian at that action - a consistent proposal-density
         prior for every slot regardless of which of the two samplers
         actually drew it, fed into the exact same Gumbel-Top-k/Sequential
-        Halving/improved-policy formulas the discrete case uses."""
-        mean_np = mean.squeeze(0).detach().cpu().numpy()
-        std_np = std.squeeze(0).detach().cpu().numpy()
+        Halving/improved-policy formulas the discrete case uses.
+
+        `mean_np`/`std_np`: already-`.cpu().numpy()`-converted `(action_dim,)`
+        rows - *not* tensors any more (performance: `search()`'s own
+        per-simulation, per-lane loop below used to call `.detach().cpu()`
+        on a fresh one-row tensor slice per lane per simulation, which is
+        one GPU sync/transfer each time; converting the *whole* batch
+        tensor to numpy once per simulation and slicing plain numpy rows
+        here instead turns `batch_size * num_simulations` GPU syncs into
+        one)."""
         low, high = self._action_space.low, self._action_space.high
         k1 = max(1, self.num_sampled_actions // 2)
         k2 = max(1, self.num_sampled_actions - k1)
@@ -1675,7 +1761,14 @@ class NativeResearchImZero(CustomAlgorithm):
         docstring's "No Dirichlet exploration noise" bullet)."""
         batch_size = obs_batch.shape[0]
         det = np.zeros(batch_size, dtype=bool) if deterministic is None else np.broadcast_to(deterministic, (batch_size,))
-        with torch.no_grad():
+        # `torch.inference_mode()`, not `torch.no_grad()` - search never
+        # needs autograd bookkeeping at all (not even a later `.backward()`
+        # the way some `no_grad()` blocks elsewhere in this file still
+        # get inspected under), so the (small but non-zero, and this is
+        # by far the hottest loop in the whole algorithm - `num_simulations`
+        # forward passes per real env step) extra version-counter/view-
+        # tracking overhead `no_grad()` still pays is pure waste here.
+        with torch.inference_mode():
             obs_emb = self.tokenizer(torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device))
             positions0, embed_positions0 = _cache_positions(root_caches, self.device)
             h_root, root_state_out = self.transformer.forward_incremental_batch(
@@ -1686,6 +1779,16 @@ class NativeResearchImZero(CustomAlgorithm):
                 root_logits = self.heads.policy_logits(h_root)
             else:
                 root_mean, root_std = self.heads.policy_gaussian(h_root)
+            # One GPU->CPU transfer for the *whole* root batch, not one per
+            # lane (see `_sample_continuous_candidates`'s own docstring for
+            # why this matters as much as it does) - every per-lane use
+            # below is then plain numpy indexing, no further device sync.
+            root_value_np = root_value.detach().cpu().numpy()
+            if self.discrete:
+                root_logits_np = root_logits.detach().cpu().numpy().astype(np.float64)
+            else:
+                root_mean_np = root_mean.detach().cpu().numpy()
+                root_std_np = root_std.detach().cpu().numpy()
 
         n_slots = self.n_actions if self.discrete else self.num_sampled_actions
         num_top_actions = max(2, min(self.num_top_actions, n_slots))
@@ -1698,13 +1801,13 @@ class NativeResearchImZero(CustomAlgorithm):
                 # Gumbel-Top-k trick below specifically needs logits (its
                 # `argmax(logit + Gumbel noise)` sampling identity only
                 # holds in log-space).
-                priors = root_logits[i].detach().cpu().numpy().astype(np.float64)
+                priors = root_logits_np[i]
                 candidates = None
             else:
-                candidates, priors = self._sample_continuous_candidates(root_mean[i : i + 1], root_std[i : i + 1])
+                candidates, priors = self._sample_continuous_candidates(root_mean_np[i], root_std_np[i])
             root.expand(priors, root_state_out[i], 0.0, candidate_actions=candidates)
             root.visit_count = 1
-            root.value_sum = float(root_value[i].item())
+            root.value_sum = float(root_value_np[i])
             roots.append(root)
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
@@ -1738,7 +1841,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 action_t = F.one_hot(idx_t, num_classes=self.n_actions).float()
             else:
                 action_t = torch.as_tensor(np.stack(chosen_actions), dtype=torch.float32, device=self.device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 child_caches, h_act, h_obs = self._step_imagine(parent_caches, action_t)
                 reward_scalar = self.heads.reward(h_act)
                 next_value = self.heads.value(h_obs)
@@ -1746,17 +1849,31 @@ class NativeResearchImZero(CustomAlgorithm):
                     next_logits = self.heads.policy_logits(h_obs)
                 else:
                     next_mean, next_std = self.heads.policy_gaussian(h_obs)
+                # Again: one whole-batch GPU->CPU transfer per simulation,
+                # not `batch_size` of them - this is the single biggest
+                # search-time cost cut in this file (each `.item()`/
+                # `.cpu()` call on a CUDA tensor is its own device sync;
+                # `num_simulations * batch_size` of those per real env
+                # step is exactly the "GPU busy but Python/CPU-bound"
+                # profile a from-scratch profiling pass of this search
+                # loop turned up).
+                reward_np = reward_scalar.detach().cpu().numpy()
+                value_np = next_value.detach().cpu().numpy()
+                if self.discrete:
+                    next_logits_np = next_logits.detach().cpu().numpy().astype(np.float64)
+                else:
+                    next_mean_np = next_mean.detach().cpu().numpy()
+                    next_std_np = next_std.detach().cpu().numpy()
 
             for lane in range(batch_size):
                 leaf = leaf_nodes[lane]
-                rv = float(reward_scalar[lane].item())
+                rv = float(reward_np[lane])
                 if self.discrete:
-                    priors = next_logits[lane].detach().cpu().numpy().astype(np.float64)
-                    leaf.expand(priors, child_caches[lane], rv)
+                    leaf.expand(next_logits_np[lane], child_caches[lane], rv)
                 else:
-                    candidates, priors = self._sample_continuous_candidates(next_mean[lane : lane + 1], next_std[lane : lane + 1])
+                    candidates, priors = self._sample_continuous_candidates(next_mean_np[lane], next_std_np[lane])
                     leaf.expand(priors, child_caches[lane], rv, candidate_actions=candidates)
-                _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], self.gamma)
+                _backpropagate(search_paths[lane], float(value_np[lane]), minmax_list[lane], self.gamma)
 
             if schedule.maybe_advance(sim_idx):
                 for lane in range(batch_size):
@@ -1857,149 +1974,162 @@ class NativeResearchImZero(CustomAlgorithm):
         # uses - a fixed shared offset would leave a position-numbering
         # gap for every lane whose own context is shorter than the
         # batch's longest).
-        root_tokens, root_pad, valid_len = self._embed_root_batch(
-            batch["context_obs"], batch["context_action"], batch["context_valid"], batch["obs0"],
-        )  # (B, Lmax0, E); `valid_len[i]` = lane `i`'s own real length (incl. obs0)
-        act_embs = self.action_embed(action.view(b * k_steps, self.action_dim)).view(b, k_steps, self.embed_dim)
-        next_obs_embs_grad = self.tokenizer(next_obs.view(b * k_steps, *self._obs_shape)).view(b, k_steps, self.embed_dim)
+        # Autocast wraps every forward call below (tokenizer, action
+        # embed, transformer, heads, projector/predictor) - the whole
+        # graph this step's `total_loss.backward()` runs through, not
+        # just the online-net calls - `use_amp`/`self._amp_dtype`
+        # (`__init__`'s own "Performance, not architecture" comment). A
+        # pure no-op on CPU (`self.use_amp` is forced `False` there).
+        with torch.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self.use_amp):
+            root_tokens, root_pad, valid_len = self._embed_root_batch(
+                batch["context_obs"], batch["context_action"], batch["context_valid"], batch["obs0"],
+            )  # (B, Lmax0, E); `valid_len[i]` = lane `i`'s own real length (incl. obs0)
+            act_embs = self.action_embed(action.view(b * k_steps, self.action_dim)).view(b, k_steps, self.embed_dim)
+            next_obs_embs_grad = self.tokenizer(next_obs.view(b * k_steps, *self._obs_shape)).view(b, k_steps, self.embed_dim)
 
-        lmax0 = root_tokens.shape[1]
-        total_len = lmax0 + 2 * k_steps
-        tokens = torch.zeros(b, total_len, self.embed_dim, device=device)
-        pad_mask = torch.zeros(b, total_len, dtype=torch.bool, device=device)
-        tokens[:, :lmax0] = root_tokens
-        pad_mask[:, :lmax0] = root_pad
-        for i in range(b):
-            base_i = int(valid_len[i])
-            end_i = base_i + 2 * k_steps
-            tokens[i, base_i:end_i:2] = act_embs[i]
-            tokens[i, base_i + 1 : end_i : 2] = next_obs_embs_grad[i]
-            pad_mask[i, base_i:end_i] = True
+            lmax0 = root_tokens.shape[1]
+            total_len = lmax0 + 2 * k_steps
+            tokens = torch.zeros(b, total_len, self.embed_dim, device=device)
+            pad_mask = torch.zeros(b, total_len, dtype=torch.bool, device=device)
+            tokens[:, :lmax0] = root_tokens
+            pad_mask[:, :lmax0] = root_pad
+            for i in range(b):
+                base_i = int(valid_len[i])
+                end_i = base_i + 2 * k_steps
+                tokens[i, base_i:end_i:2] = act_embs[i]
+                tokens[i, base_i + 1 : end_i : 2] = next_obs_embs_grad[i]
+                pad_mask[i, base_i:end_i] = True
 
-        hidden = self.transformer(tokens, pad_mask)
-        # `obs0_pos[i]` = lane `i`'s own obs0 token position (its context's
-        # last real slot) - differs per lane now, so every hidden-state
-        # read below gathers by index instead of slicing a shared offset.
-        obs0_pos = torch.as_tensor(valid_len - 1, dtype=torch.long, device=device)
-        batch_idx = torch.arange(b, device=device)
+            hidden = self.transformer(tokens, pad_mask)
+            # `obs0_pos[i]` = lane `i`'s own obs0 token position (its context's
+            # last real slot) - differs per lane now, so every hidden-state
+            # read below gathers by index instead of slicing a shared offset.
+            obs0_pos = torch.as_tensor(valid_len - 1, dtype=torch.long, device=device)
+            batch_idx = torch.arange(b, device=device)
 
-        reward_loss = torch.zeros((), device=device)
-        value_loss = torch.zeros((), device=device)
-        policy_loss = torch.zeros((), device=device)
-        consistency_loss = torch.zeros((), device=device)
-        policy_entropy = torch.zeros((), device=device)
-        first_step_value_pred: torch.Tensor | None = None
-        first_step_value_target: torch.Tensor | None = None
+            reward_loss = torch.zeros((), device=device)
+            value_loss = torch.zeros((), device=device)
+            policy_loss = torch.zeros((), device=device)
+            consistency_loss = torch.zeros((), device=device)
+            policy_entropy = torch.zeros((), device=device)
+            first_step_value_pred: torch.Tensor | None = None
+            first_step_value_target: torch.Tensor | None = None
 
-        for k in range(k_steps):
-            m = mask[:, k]
-            wm = m * is_weight
-            denom = m.sum().clamp_min(1.0)
-            h_obs_k = hidden[batch_idx, obs0_pos + 2 * k]  # obs_k's own hidden state
-            h_act_k = hidden[batch_idx, obs0_pos + 2 * k + 1]  # act_k's own hidden state
+            for k in range(k_steps):
+                m = mask[:, k]
+                wm = m * is_weight
+                denom = m.sum().clamp_min(1.0)
+                h_obs_k = hidden[batch_idx, obs0_pos + 2 * k]  # obs_k's own hidden state
+                h_act_k = hidden[batch_idx, obs0_pos + 2 * k + 1]  # act_k's own hidden state
 
-            value_pred_logits = self.heads.value_logits(h_obs_k)
-            # Bootstrap value comes from the *online* network, under
-            # `no_grad` (module docstring's "no target network" section) -
-            # `efficientzero.py`'s own `self.representation(td_obs[:, k])`
-            # bootstrap call, not a separate target network. Context is
-            # empty for *every* lane here, so every lane's `valid_len` is
-            # uniformly `1` and `[:, -1, :]` unambiguously means "the only
-            # (td_obs's own) token" - no per-lane offset needed. This
-            # *does* mean the online value head is trained partly towards
-            # a target it itself just produced (the classic bootstrapped-
-            # TD moving-target problem a target network exists to break) -
-            # the `max(td_target, search_value)` blend right below is
-            # this file's chosen mitigation instead (`efficientzero.py`'s
-            # own `value_target: 'max'` mode): a transition that's been
-            # reanalyzed with the network's *own current* weights carries
-            # a fresher root-value estimate than a plain online-net
-            # bootstrap that's chasing its own recent update.
-            with torch.no_grad():
-                td_obs_emb = self.tokenizer(
-                    torch.as_tensor(batch["td_obs"][:, k], dtype=torch.float32, device=device),
-                )
-                td_pad = torch.ones(b, 1, dtype=torch.bool, device=device)
-                td_hidden = self.transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
-                bootstrap_value = self.heads.value(td_hidden) * td_bootstrap_mask[:, k]
-                td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
-                value_target = torch.maximum(td_target, search_value[:, k])
-            value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
-            v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
-            value_loss = value_loss + (v_loss * wm).sum() / denom
-            if k == 0:
+                value_pred_logits = self.heads.value_logits(h_obs_k)
+                # Bootstrap value comes from the *online* network, under
+                # `no_grad` (module docstring's "no target network" section) -
+                # `efficientzero.py`'s own `self.representation(td_obs[:, k])`
+                # bootstrap call, not a separate target network. Context is
+                # empty for *every* lane here, so every lane's `valid_len` is
+                # uniformly `1` and `[:, -1, :]` unambiguously means "the only
+                # (td_obs's own) token" - no per-lane offset needed. This
+                # *does* mean the online value head is trained partly towards
+                # a target it itself just produced (the classic bootstrapped-
+                # TD moving-target problem a target network exists to break) -
+                # the `max(td_target, search_value)` blend right below is
+                # this file's chosen mitigation instead (`efficientzero.py`'s
+                # own `value_target: 'max'` mode): a transition that's been
+                # reanalyzed with the network's *own current* weights carries
+                # a fresher root-value estimate than a plain online-net
+                # bootstrap that's chasing its own recent update.
                 with torch.no_grad():
-                    first_step_value_pred = _logits_to_scalar(value_pred_logits, self.support_size).detach()
-                    first_step_value_target = value_target.detach()
+                    td_obs_emb = self.tokenizer(
+                        torch.as_tensor(batch["td_obs"][:, k], dtype=torch.float32, device=device),
+                    )
+                    td_pad = torch.ones(b, 1, dtype=torch.bool, device=device)
+                    td_hidden = self.transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
+                    bootstrap_value = self.heads.value(td_hidden) * td_bootstrap_mask[:, k]
+                    td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
+                    value_target = torch.maximum(td_target, search_value[:, k])
+                value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
+                v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
+                value_loss = value_loss + (v_loss * wm).sum() / denom
+                if k == 0:
+                    with torch.no_grad():
+                        first_step_value_pred = _logits_to_scalar(value_pred_logits, self.support_size).detach()
+                        first_step_value_target = value_target.detach()
 
-            reward_logits_k = self.heads.reward_logits(h_act_k)
-            reward_two_hot = _scalar_to_two_hot(reward[:, k], self.support_size, self.label_smoothing_eps)
-            r_loss = -(reward_two_hot * F.log_softmax(reward_logits_k, dim=-1)).sum(-1)
-            reward_loss = reward_loss + (r_loss * wm).sum() / denom
+                reward_logits_k = self.heads.reward_logits(h_act_k)
+                reward_two_hot = _scalar_to_two_hot(reward[:, k], self.support_size, self.label_smoothing_eps)
+                r_loss = -(reward_two_hot * F.log_softmax(reward_logits_k, dim=-1)).sum(-1)
+                reward_loss = reward_loss + (r_loss * wm).sum() / denom
 
-            if self.discrete:
-                logp = F.log_softmax(self.heads.policy_logits(h_obs_k), dim=-1)
-                p_loss = -(policy_target[:, k] * logp).sum(-1)
-                entropy_k = -(logp.exp() * logp).sum(-1)
-            else:
-                mean, std = self.heads.policy_gaussian(h_obs_k)
-                # `efficientzero.py`'s own, simpler continuous policy loss
-                # (module docstring's "Search" section): plain MSE toward
-                # `search()`'s visit-weighted-*average* candidate action
-                # (`policy_target[:, k]`, shape `(B, action_dim)`) - not
-                # `unizero.py`'s own importance-weighted NLL against the
-                # full sampled-candidate set.
-                p_loss = F.mse_loss(mean, policy_target[:, k], reduction="none").sum(-1)
-                # Differential entropy of an (assumed-diagonal) Gaussian,
-                # summed over action dims - closed form, no sampling
-                # needed: `0.5*log(2*pi*e*sigma^2)` per dim.
-                var = std.clamp_min(1e-6) ** 2
-                entropy_k = (0.5 * torch.log(2.0 * math.pi * math.e * var)).sum(-1)
-            policy_loss = policy_loss + (p_loss * wm).sum() / denom
-            policy_entropy = policy_entropy + (entropy_k * wm).sum() / denom
+                if self.discrete:
+                    logp = F.log_softmax(self.heads.policy_logits(h_obs_k), dim=-1)
+                    p_loss = -(policy_target[:, k] * logp).sum(-1)
+                    entropy_k = -(logp.exp() * logp).sum(-1)
+                else:
+                    mean, std = self.heads.policy_gaussian(h_obs_k)
+                    # `efficientzero.py`'s own, simpler continuous policy loss
+                    # (module docstring's "Search" section): plain MSE toward
+                    # `search()`'s visit-weighted-*average* candidate action
+                    # (`policy_target[:, k]`, shape `(B, action_dim)`) - not
+                    # `unizero.py`'s own importance-weighted NLL against the
+                    # full sampled-candidate set.
+                    p_loss = F.mse_loss(mean, policy_target[:, k], reduction="none").sum(-1)
+                    # Differential entropy of an (assumed-diagonal) Gaussian,
+                    # summed over action dims - closed form, no sampling
+                    # needed: `0.5*log(2*pi*e*sigma^2)` per dim.
+                    var = std.clamp_min(1e-6) ** 2
+                    entropy_k = (0.5 * torch.log(2.0 * math.pi * math.e * var)).sum(-1)
+                policy_loss = policy_loss + (p_loss * wm).sum() / denom
+                policy_entropy = policy_entropy + (entropy_k * wm).sum() / denom
 
-            # SimSiam consistency loss (module docstring's "no target
-            # network" section, `efficientzero.py`'s own recipe): the
-            # dynamics-predicted next-token embedding (`heads.latent
-            # (h_act_k)`) should approximate the *real* next
-            # observation's own token embedding, trained via negative
-            # cosine similarity against a stop-gradiented copy of the
-            # *online* tokenizer's own embedding of it (`next_obs_embs_
-            # grad[:, k].detach()` - already computed above as part of
-            # this window's own input tokens, no extra forward pass
-            # needed) rather than a separate momentum target network.
-            # `_Projector`applied to both branches (shared, SimSiam's own
-            # asymmetric-predictor-only-on-one-side convention),
-            # `_Predictor` only on the predicted branch - `BatchNorm1d`
-            # inside both is what actually prevents the every-observation-
-            # embeds-to-the-same-point collapse stop-gradient alone
-            # doesn't (Chen & He, 2021, Table 2c - see `_Projector`'s own
-            # docstring).
-            true_next_emb = next_obs_embs_grad[:, k].detach()
-            p_true = F.normalize(self.projector(true_next_emb), dim=-1).detach()
-            z_pred = self.heads.latent(h_act_k)
-            p_pred = F.normalize(self.predictor(self.projector(z_pred)), dim=-1)
-            c_loss = -(p_true * p_pred).sum(-1)
-            consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
+                # SimSiam consistency loss (module docstring's "no target
+                # network" section, `efficientzero.py`'s own recipe): the
+                # dynamics-predicted next-token embedding (`heads.latent
+                # (h_act_k)`) should approximate the *real* next
+                # observation's own token embedding, trained via negative
+                # cosine similarity against a stop-gradiented copy of the
+                # *online* tokenizer's own embedding of it (`next_obs_embs_
+                # grad[:, k].detach()` - already computed above as part of
+                # this window's own input tokens, no extra forward pass
+                # needed) rather than a separate momentum target network.
+                # `_Projector`applied to both branches (shared, SimSiam's own
+                # asymmetric-predictor-only-on-one-side convention),
+                # `_Predictor` only on the predicted branch - `BatchNorm1d`
+                # inside both is what actually prevents the every-observation-
+                # embeds-to-the-same-point collapse stop-gradient alone
+                # doesn't (Chen & He, 2021, Table 2c - see `_Projector`'s own
+                # docstring).
+                true_next_emb = next_obs_embs_grad[:, k].detach()
+                p_true = F.normalize(self.projector(true_next_emb), dim=-1).detach()
+                z_pred = self.heads.latent(h_act_k)
+                p_pred = F.normalize(self.predictor(self.projector(z_pred)), dim=-1)
+                c_loss = -(p_true * p_pred).sum(-1)
+                consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
-        n = float(k_steps)
-        reward_loss, value_loss, policy_loss, consistency_loss, policy_entropy = (
-            reward_loss / n, value_loss / n, policy_loss / n, consistency_loss / n, policy_entropy / n,
-        )
-        total_loss = (
-            self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
-            + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
-            # Entropy *bonus* - reference's own `policy_entropy_weight`
-            # (default `5e-3`): subtracted from the total loss (not
-            # added) since higher policy entropy is the *goal* here, one
-            # of MuZero-family exploration regularizers this file had no
-            # equivalent of before.
-            - self.policy_entropy_coef * policy_entropy
-        )
+            n = float(k_steps)
+            reward_loss, value_loss, policy_loss, consistency_loss, policy_entropy = (
+                reward_loss / n, value_loss / n, policy_loss / n, consistency_loss / n, policy_entropy / n,
+            )
+            total_loss = (
+                self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
+                + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
+                # Entropy *bonus* - reference's own `policy_entropy_weight`
+                # (default `5e-3`): subtracted from the total loss (not
+                # added) since higher policy entropy is the *goal* here, one
+                # of MuZero-family exploration regularizers this file had no
+                # equivalent of before.
+                - self.policy_entropy_coef * policy_entropy
+            )
+        # `GradScaler` is `enabled=False` (pure passthrough) whenever
+        # we're not doing fp16 autocast (`__init__`'s own
+        # `self._grad_scaler`) - bf16/CPU/no-AMP all just call
+        # `.backward()`/`.step()` exactly as before.
         self.optimizer.zero_grad()
-        total_loss.backward()
+        self._grad_scaler.scale(total_loss).backward()
+        self._grad_scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self._params, self.max_grad_norm)
-        self.optimizer.step()
+        self._grad_scaler.step(self.optimizer)
+        self._grad_scaler.update()
 
         assert first_step_value_pred is not None and first_step_value_target is not None
         fresh_priority = (first_step_value_pred - first_step_value_target).abs().cpu().numpy()

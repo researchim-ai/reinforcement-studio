@@ -520,6 +520,13 @@ ALGORITHM_CATALOG = [
             {"key": "min_priority", "label": "Минимальный приоритет перехода", "type": "float", "default": 1e-6, "min": 1e-8, "max": 1.0},
             {"key": "reanalyze_freq", "label": "Реальных шагов между reanalyze-проходами", "type": "int", "default": 200, "min": 1, "max": 100_000},
             {"key": "reanalyze_batch_size", "label": "Переходов, обновляемых за один reanalyze-проход (0 = выключить)", "type": "int", "default": 64, "min": 0, "max": 1024},
+            {
+                "key": "use_amp", "label": "Mixed precision (AMP) на GPU", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "Да — bf16/fp16 автокаст в train_step (быстрее и меньше памяти на GPU, без CPU)"},
+                    {"value": 0, "label": "Нет — всё в fp32"},
+                ],
+            },
         ],
     },
     {

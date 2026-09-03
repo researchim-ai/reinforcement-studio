@@ -194,6 +194,16 @@ class MetricsCallback(BaseCallback):
         self._last_gif: str | None = None
         self._last_gif_step = 0
         self._stopped_early = False
+        # Cumulative episode counter — SB3 only exposes a *trailing* window
+        # via `model.ep_info_buffer` (a `deque(maxlen=100)`, see
+        # `_episode_stats` below), so a running total needs its own
+        # bookkeeping here, summed off `dones` every step (`_on_step`
+        # below) - SB3 puts `env.step()`'s own `dones` array into
+        # `self.locals` via `callback.update_locals(locals())` right before
+        # calling `on_step()`, for both on-policy (`collect_rollouts` in
+        # `on_policy_algorithm.py`) and off-policy (`off_policy_algorithm.py`)
+        # algorithms alike.
+        self._episodes_completed = 0
 
     def _stop_requested(self) -> bool:
         if not self._stop_requested_cached and self.num_timesteps - self._last_stop_check >= _STOP_CHECK_EVERY_STEPS:
@@ -255,6 +265,7 @@ class MetricsCallback(BaseCallback):
             "total_timesteps": int(self.total_timesteps),
             "episode_reward_mean": mean_reward,
             "episode_length_mean": mean_length,
+            "episodes_completed": self._episodes_completed,
             "fps": round(self.num_timesteps / elapsed, 1) if elapsed > 0 else 0,
             "elapsed_seconds": round(elapsed, 1),
         }
@@ -283,6 +294,9 @@ class MetricsCallback(BaseCallback):
         self._write_snapshot("running")
 
     def _on_step(self) -> bool:
+        dones = self.locals.get("dones")
+        if dones is not None:
+            self._episodes_completed += int(np.sum(dones))
         if self.num_timesteps - self._last_write >= self.write_every_steps:
             self._last_write = self.num_timesteps
             self._write_snapshot("running")

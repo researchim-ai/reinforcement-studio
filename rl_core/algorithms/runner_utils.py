@@ -164,6 +164,15 @@ def run_custom_algorithm(
     state: dict[str, Any] = {
         "last_write": 0, "last_render": 0, "last_stop_check": 0, "stop_requested": False, "step": 0, "last_gif": None,
         "last_gif_step": 0,
+        # Cumulative count of episodes that have reached terminated/truncated
+        # so far, across every lane — a running total (unlike
+        # `episode_reward_mean`'s trailing-100 window), incremented once per
+        # `writer(episode_reward=...)` call below since `on_policy.py`/every
+        # native algorithm's own collection loop calls `callback.on_step`
+        # exactly once per lane that finished this real step (never a batch
+        # of several at once), so "one call with a non-`None` episode_reward"
+        # and "one completed episode" are the same event here.
+        "episodes_completed": 0,
         # Anything algorithms report via `TrainingCallback.on_step(metrics=...)`
         # that isn't one of the special episode_*_reward keys handled below —
         # exploration stats (epsilon, RND bonus/loss) as well as training
@@ -212,6 +221,7 @@ def run_custom_algorithm(
                 sum(recent_intrinsic_rewards[-100:]) / len(recent_intrinsic_rewards[-100:])
             ) if recent_intrinsic_rewards else None,
             "episode_length_mean": (sum(recent_lengths[-100:]) / len(recent_lengths[-100:])) if recent_lengths else None,
+            "episodes_completed": state["episodes_completed"],
             "fps": round(step / elapsed, 1) if elapsed > 0 else 0,
             "elapsed_seconds": round(elapsed, 1),
         }
@@ -256,6 +266,7 @@ def run_custom_algorithm(
                 recent_intrinsic_rewards.append(float(metrics["episode_intrinsic_reward"]))
         if episode_reward is not None:
             recent_rewards.append(episode_reward)
+            state["episodes_completed"] += 1
         if episode_length is not None:
             recent_lengths.append(episode_length)
         if num_timesteps - state["last_write"] >= _WRITE_EVERY_STEPS:

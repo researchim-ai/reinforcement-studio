@@ -179,6 +179,14 @@ def _run_sb3(algo_cls: type, algo_label: str, hyperparams: dict[str, Any], confi
         "action_space": _space_info(train_env.action_space),
         "wrappers": wrapper_specs,
         "seed": seed,
+        # Always `1` on this path — unlike `runner_utils.py`'s native/custom
+        # algorithms (and standalone World Model runs), `_run_sb3` never
+        # reads `training.num_envs`/wraps `train_env` in an `AsyncVectorEnv`;
+        # SB3's own `.learn()` just wraps the single `Monitor`-wrapped env
+        # into a `DummyVecEnv` internally. Reported explicitly (not left
+        # absent) so the Training Monitor's "Параллельных сред" card has a
+        # real, honest number for every run kind instead of a blank dash.
+        "num_envs": 1,
     }
     if resume_cfg:
         static_info["resumed_from"] = resume_cfg
