@@ -168,9 +168,80 @@ already batching all `num_envs` lanes' trees into one shared GPU forward
 pass per simulation - so the single highest-leverage speed knob outside
 this file is simply raising `training.num_envs` in the experiment config
 to however many CPU cores are free, not anything below.
+
+**Schedules, not fixed constants** (all toggleable, all default to the
+new behavior, all fall back to this file's original flat/static behavior
+when turned off - added after the above shipped and got run for a while,
+not part of the original UniZero/EfficientZero synergy above): a
+constant learning rate, `priority_beta`, and search-exploration
+temperature for an entire run turned out to individually leave
+performance on the table once a run went on long enough to reach the
+late-training regime PER + no-target-network self-referential bootstrap
+is most exposed in.
+- **`lr_schedule`** (default on): cosine-decays `learning_rate` down to
+  `learning_rate * lr_min_fraction` from `learning_starts` onward
+  (`_update_learning_rate`) - damps the value-loss oscillation a
+  constantly-high LR otherwise feeds once PER has sharpened in on a few
+  high-priority transitions late in training.
+- **`use_target_for_bootstrap`** (default on): a slow-moving EMA/Polyak
+  copy of tokenizer+transformer+heads (`target_update_theta` per step,
+  `_update_target_network`) provides the n-step TD bootstrap value
+  instead of the online net - this file's original "no target network"
+  design (above) leaned entirely on SimSiam + `max(td_target,
+  search_value)` to paper over the classic bootstrapped-TD moving-target
+  problem; this restores a real fix for it, for just that one use (never
+  for the consistency loss's own target - that's still always the online
+  tokenizer, deliberately, per that section above). Paired with
+  **`search_value_max_staleness`**: `value_target`'s `max()` only lets a
+  reanalyzed `search_value` win if it was refreshed within that many
+  `_reanalyze()` generations - an indefinitely-stale-but-still-large
+  `search_value` no longer wins forever just because it once was.
+- **`priority_beta_start` → `priority_beta`** (default `0.4` → `1.0`):
+  the PER importance-sampling correction anneals up across training
+  (`_update_priority_beta`) instead of applying full-strength IS
+  correction from step one, when the value network the priority signal
+  itself depends on is still close to random.
+- **`priority_policy_weight`** (default `0.1`): replay priority also
+  factors in a transition's own policy-target error
+  (`first_step_policy_error`), not just its value error - a transition
+  whose policy target the network gets badly wrong is just as worth
+  replaying soon as one whose value estimate is off.
+- **Targeted reanalyze**: `sample_for_reanalyze` picks episodes/
+  transitions weighted by priority *and* how many generations since they
+  were last refreshed (`_episode_last_reanalyzed_gen`/`reanalyzed_gen`),
+  not uniformly by episode length regardless of either.
+- **`temperature_anneal_start_scale`** (default `1.5`): both the root
+  Gumbel noise scale and `policy_entropy_coef` get scaled up early in
+  training and decay to their configured face value
+  (`_current_exploration_scale`) - more exploration/entropy bonus while
+  the policy is still close to random, tapering off as it isn't.
+- **`intrinsic_exploration`** (default off): optional Random Network
+  Distillation novelty bonus (`dqn.py`/`rainbow_dqn.py`'s own
+  `RNDModule`, same hyperparameter names for consistency) added to the
+  real reward before it ever reaches the buffer/TD targets - off by
+  default since, unlike everything else in this section, it changes what
+  reward is actually being optimized, not just how training gets there;
+  worth turning on for the sparse/hard-exploration environments (the
+  NetHack-family runs) this file was originally tuned against.
+- **`adaptive_loss_weights`** (default on): Kendall et al. (2018)
+  homoscedastic-uncertainty weighting - a learnable `log_var` per task
+  loss (reward/value/policy/consistency; the entropy bonus is excluded,
+  it isn't a task loss) replaces this file's original static `*_loss_coef`
+  ratios (`value_loss_coef=0.25` vs `consistency_loss_coef=2.0` was one
+  never-revisited guess) with weights that adapt to each task's own loss
+  scale during training; the `*_loss_coef` values still matter as each
+  task's prior multiplier, not as the final weight.
+- **`auto_scale_replay_ratio`** (default on): `train_steps_per_iter`
+  scales with `num_envs // 4` - `train_freq`/`train_steps_per_iter` count
+  real steps summed across every lane, so more parallel envs otherwise
+  means strictly fewer gradient steps per transition collected, with no
+  corresponding increase in how much training happens on the extra data.
+  A no-op for `num_envs<=4`, so any existing single-env run/config is
+  completely unaffected.
 """
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 from typing import Any
@@ -182,6 +253,7 @@ import torch.nn.functional as F
 import gymnasium as gym
 
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
+from rl_core.algorithms.native.exploration import RNDModule, uses_rnd
 from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_flat_dim, obs_to_array
 from rl_core.algorithms.vec_env import (
     action_space as venv_action_space,
@@ -196,6 +268,17 @@ DEFAULT_HYPERPARAMS = {
     # `efficientzero.py`'s own default (plain `Adam`, not `AdamW` - see
     # module docstring's "no target network"/optimizer discussion).
     "learning_rate": 2e-4,
+    # `1` (default): cosine-decay `learning_rate` down to
+    # `learning_rate * lr_min_fraction` over the run, starting only once
+    # `learning_starts` real steps have passed (before that, no gradient
+    # steps happen at all) - flat `lr` for the *entire* run otherwise had
+    # no mechanism to damp the late-training value-loss oscillation a
+    # constantly-high LR feeds into once PER has sharpened in on a few
+    # high-priority (and, with no target network, self-referential)
+    # transitions. `0`: keep `learning_rate` flat, exactly as before this
+    # option existed.
+    "lr_schedule": 1,
+    "lr_min_fraction": 0.05,
     "embed_dim": 128,
     "num_layers": 2,
     # Lighter than `unizero.py`'s reference-matching `8` - module
@@ -225,6 +308,16 @@ DEFAULT_HYPERPARAMS = {
     "c_visit": 50.0,
     "c_scale": 0.1,
     "policy_target_temperature": 1.0,
+    # Both the root Gumbel noise scale (`search()`'s own exploration
+    # source, module docstring's "Search" section) and `policy_entropy_
+    # coef` get multiplied by a shared factor that starts at this value
+    # (more exploration/entropy bonus early, when the policy is still
+    # near-random and there's little to lose from extra noise) and
+    # linearly decays to `1.0` (both knobs at their configured face
+    # value) as training progresses - `_current_exploration_scale()`.
+    # `1.0` here disables the schedule entirely (flat scale of `1.0` the
+    # whole run, exactly as before this existed).
+    "temperature_anneal_start_scale": 1.5,
     "value_minmax_delta": 0.01,
     # `efficientzero.py`'s own, much wider default - not `unizero.py`'s
     # narrower `50` (module docstring's "Lighter default hyperparameters"
@@ -245,6 +338,24 @@ DEFAULT_HYPERPARAMS = {
     # good NetHack runs, between `efficientzero.py`'s policy-level `5.0`
     # and this file's UniZero-parent's reference-matching `10.0`).
     "consistency_loss_coef": 2.0,
+    # Kendall et al. (2018) homoscedastic-uncertainty multi-task
+    # weighting - `1` (default): each of the four task losses (reward,
+    # value, policy, consistency; the entropy *bonus* is excluded, it
+    # isn't a task loss) gets its own learnable `log_var` alongside the
+    # network's own parameters (`self.loss_log_vars`, optimized by the
+    # exact same `self.optimizer`), and the loss actually backpropped is
+    # `sum_i(coef_i * exp(-log_var_i) * loss_i + log_var_i)` instead of
+    # `sum_i(coef_i * loss_i)` directly - a task whose loss is
+    # consistently *larger* than the others' (this file's own
+    # `value_loss_coef=0.25` vs `consistency_loss_coef=2.0` gap was one
+    # symptom: a static ratio guessed once, never revisited) automatically
+    # gets down-weighted relative to one that's already small, rather
+    # than every task's relative weight being whatever this file's own
+    # `*_loss_coef` defaults happened to guess. The `*_loss_coef` values
+    # above still matter here too - as each task's *prior* multiplier
+    # before its own learned precision is applied, not as the final
+    # weight. `0`: exactly the old, static-`*_loss_coef`-only behavior.
+    "adaptive_loss_weights": 1,
     # SimSiam projector/predictor hidden+output dim (`_Projector`/
     # `_Predictor`) - `efficientzero.py`'s own default.
     "proj_dim": 64,
@@ -254,6 +365,10 @@ DEFAULT_HYPERPARAMS = {
     "continuous_prior_scale": 2.5,
     "train_freq": 1,
     "train_steps_per_iter": 1,
+    # See `__init__`'s own `self._replay_ratio_scale` comment - `1`
+    # (default): keep replay ratio roughly constant as `num_envs` grows
+    # instead of letting it silently fall. No-op for `num_envs<=4`.
+    "auto_scale_replay_ratio": 1,
     # `efficientzero.py`'s own default, and this file's own earlier
     # (pre-reference-matching) good-runs' choice - not `0` (module
     # docstring's own "learning_starts=500, not 0" section explains why
@@ -264,10 +379,50 @@ DEFAULT_HYPERPARAMS = {
     # default here - `efficientzero.py`'s own defaults (not `unizero.py`'s
     # reference-matching `0.0`/`0`, both off there).
     "priority_alpha": 1.0,
+    # Final importance-sampling correction exponent (Schaul et al., 2016)
+    # - linearly annealed *up* from `priority_beta_start` to this value
+    # across training (module docstring's "Schedules, not fixed
+    # constants" section), not applied at full strength from step one:
+    # early on, `value_pred`/`value_target` are both still close to
+    # random, so IS-correcting hard against a priority signal that
+    # isn't trustworthy yet mostly just down-weights the few transitions
+    # PER *did* get right for the wrong reasons. Set
+    # `priority_beta_start` equal to this to disable annealing (flat
+    # `priority_beta` the entire run, exactly as before this existed).
     "priority_beta": 1.0,
+    "priority_beta_start": 0.4,
+    # How much a transition's *policy*-target error (cross-entropy for
+    # discrete, MSE for continuous - `first_step_policy_error` in
+    # `_train_step`) adds to its replay priority, on top of the original
+    # `|value_pred - value_target|` term - `0.0` recovers the old,
+    # value-error-only priority exactly.
+    "priority_policy_weight": 0.1,
     "min_priority": 1e-6,
     "reanalyze_freq": 200,
     "reanalyze_batch_size": 64,
+    # `1` (default): a slow-moving EMA/Polyak copy of tokenizer+
+    # transformer+heads (`target_update_theta` per `_train_step` call)
+    # provides the n-step TD bootstrap value in place of the online net
+    # (module docstring's "Schedules, not fixed constants" section) -
+    # breaks the classic bootstrapped-TD moving-target problem (the
+    # online value head training partly towards a target it itself just
+    # produced) that this file's original "no target network at all"
+    # design otherwise leaned entirely on SimSiam + `max(td_target,
+    # search_value)` to paper over. `0`: bootstrap straight off the
+    # online net, exactly as before this option existed (never for the
+    # consistency loss's own target either way - that's still always the
+    # online tokenizer, deliberately; see the module docstring).
+    "use_target_for_bootstrap": 1,
+    "target_update_theta": 0.02,
+    # How many `_reanalyze()` "generations" (module docstring's
+    # "Schedules, not fixed constants" section) a transition's own
+    # `search_value` may be behind the buffer's current one and still be
+    # allowed to participate in `value_target = max(td_target,
+    # search_value)` - past this, it's treated the same as never having
+    # been reanalyzed at all (`td_target` alone), instead of an
+    # indefinitely-stale-but-still-winning `max()` term. `search_value`
+    # itself is never *lowered* here - only how much it's *trusted*.
+    "search_value_max_staleness": 5,
     # Automatic mixed precision for `_train_step`'s forward/backward pass
     # (module docstring's "Performance, not architecture" section) -
     # `1` (default): on, whenever running on CUDA (always off on CPU,
@@ -276,6 +431,23 @@ DEFAULT_HYPERPARAMS = {
     # floating-point rounding - set to `0` to debug a suspected precision
     # issue in isolation.
     "use_amp": 1,
+    # Random Network Distillation (Burda et al., 2019) intrinsic reward -
+    # `dqn.py`/`rainbow_dqn.py`'s own `RNDModule`, same
+    # `intrinsic_exploration`/`rnd_*` knob names for consistency across
+    # every native algorithm in this app. `0` (default, off): behaves
+    # exactly as before this option existed - opt-in, not on by default,
+    # since it changes what reward the agent actually optimizes (real +
+    # novelty bonus, not just real) rather than being a pure training-
+    # speed/stability knob. Worth turning on for sparse/hard-exploration
+    # environments (the NetHack-family runs this file was originally
+    # tuned against) - `episode_extrinsic_reward`/`episode_intrinsic_
+    # reward` metrics let you see the two parts separately once enabled.
+    "intrinsic_exploration": 0,
+    "rnd_bonus_coef": 0.1,
+    "rnd_learning_rate": 1e-4,
+    "rnd_feature_dim": 128,
+    "rnd_hidden_dim": 128,
+    "rnd_bonus_clip": 5.0,
     # `1` (default): RoPE - `_CausalTransformer`'s own default, lossless
     # `O(1)`-per-real-step KV-cache eviction, reused from `unizero.py`
     # as-is (module docstring's "everything else" section). `0`: learned
@@ -1158,6 +1330,18 @@ class _ResearchImZeroBuffer:
         self.min_priority = max(1e-8, min_priority)
         self.episodes: list[dict[str, np.ndarray]] = []
         self._episode_alpha_sum: list[float] = []
+        # `sample_for_reanalyze`'s own bookkeeping (module docstring's
+        # "Schedules, not fixed constants" section) - `_reanalyze_
+        # generation` is a plain call counter (one "generation" per
+        # `update_reanalyzed_targets` call, i.e. per real `_reanalyze()`
+        # pass), `_episode_last_reanalyzed_gen[i]` the most recent
+        # generation that touched *any* transition in episode `i` (`-1`:
+        # never). Together they let `sample_for_reanalyze` prefer
+        # episodes/transitions that are both high-priority *and* long
+        # overdue for a refresh, instead of picking uniformly by episode
+        # length regardless of either.
+        self._episode_last_reanalyzed_gen: list[float] = []
+        self._reanalyze_generation = 0
         self._max_priority = 1.0
         self._cur: list[dict[str, list[Any]]] = [self._new_episode() for _ in range(max(1, num_lanes))]
 
@@ -1218,12 +1402,18 @@ class _ResearchImZeroBuffer:
             "policy_target": np.stack(cur["policy_target"]),
             "priority": np.full(ep_len, self._max_priority, dtype=np.float64),
             "search_value": np.full(ep_len, self._NO_SEARCH_VALUE, dtype=np.float32),
+            # `-1`: never reanalyzed - `sample_for_reanalyze`'s own
+            # per-transition staleness tracking (see `__init__`'s own
+            # comment on `_episode_last_reanalyzed_gen`).
+            "reanalyzed_gen": np.full(ep_len, -1, dtype=np.int64),
         }
         self.episodes.append(episode)
         self._episode_alpha_sum.append(float(np.sum(episode["priority"] ** self.priority_alpha)))
+        self._episode_last_reanalyzed_gen.append(-1.0)
         if len(self.episodes) > self.capacity:
             self.episodes.pop(0)
             self._episode_alpha_sum.pop(0)
+            self._episode_last_reanalyzed_gen.pop(0)
         self._cur[lane] = self._new_episode()
 
     def __len__(self) -> int:
@@ -1232,6 +1422,15 @@ class _ResearchImZeroBuffer:
     @property
     def num_episodes(self) -> int:
         return len(self.episodes)
+
+    @property
+    def reanalyze_generation(self) -> int:
+        """Current `_reanalyze_generation` counter - `_train_step`'s own
+        freshness gate on `search_value` reads this to compute how many
+        generations old a given sampled transition's own `search_value`
+        is (see `DEFAULT_HYPERPARAMS["search_value_max_staleness"]`'s own
+        docstring)."""
+        return self._reanalyze_generation
 
     def _context_for(self, ep: dict[str, np.ndarray], start: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         length = self.context_length
@@ -1256,6 +1455,11 @@ class _ResearchImZeroBuffer:
         td_discount = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_bootstrap_mask = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         search_value = np.full((batch_size, unroll_steps), self._NO_SEARCH_VALUE, dtype=np.float32)
+        # `-1`: never reanalyzed - `_train_step`'s own freshness gate on
+        # whether `search_value` is allowed to participate in
+        # `value_target`'s `max()` (see `DEFAULT_HYPERPARAMS
+        # ["search_value_max_staleness"]`'s own docstring).
+        search_value_gen = np.full((batch_size, unroll_steps), -1, dtype=np.int64)
         episode_idx = np.zeros(batch_size, dtype=np.int64)
         timestep = np.zeros(batch_size, dtype=np.int64)
         sample_prob = np.zeros(batch_size, dtype=np.float64)
@@ -1299,6 +1503,7 @@ class _ResearchImZeroBuffer:
                 next_obs[b, k] = ep["next_obs"][idx]
                 policy_target[b, k] = ep["policy_target"][idx]
                 search_value[b, k] = ep["search_value"][idx]
+                search_value_gen[b, k] = ep["reanalyzed_gen"][idx]
 
                 n = min(td_steps, t_len - idx)
                 td_sum, discount = 0.0, 1.0
@@ -1319,7 +1524,8 @@ class _ResearchImZeroBuffer:
             "obs0": obs0, "action": action, "reward": reward, "next_obs": next_obs,
             "policy_target": policy_target, "mask": mask, "td_reward": td_reward,
             "td_obs": td_obs, "td_discount": td_discount, "td_bootstrap_mask": td_bootstrap_mask,
-            "search_value": search_value, "episode_idx": episode_idx, "timestep": timestep,
+            "search_value": search_value, "search_value_gen": search_value_gen,
+            "episode_idx": episode_idx, "timestep": timestep,
             "is_weight": is_weight.astype(np.float32),
         }
 
@@ -1349,8 +1555,24 @@ class _ResearchImZeroBuffer:
                 np.zeros((0, length, *self.obs_shape), dtype=np.float32), np.zeros((0, length, self.action_dim), dtype=np.float32),
                 np.zeros((0, length), dtype=bool),
             )
-        lengths = np.asarray([len(ep["reward"]) for ep in self.episodes], dtype=np.float64)
-        ep_choices = np.random.choice(n_episodes, size=n, p=lengths / lengths.sum())
+        # Episode-level pick: `_episode_alpha_sum[i]` (same PER weight
+        # `sample()`'s own episode selection uses) times a staleness
+        # multiplier - `gen - last_reanalyzed_gen[i] + 1` generations
+        # since anything in episode `i` was last refreshed (`+1` so a
+        # just-touched episode still has *some* chance, not zero), or
+        # `gen + 1` for a never-reanalyzed episode (at least as eager as
+        # the stalest possible existing one, so brand-new episodes don't
+        # starve forever behind old high-priority ones) - not the old
+        # "weighted by length only" scheme, which was blind to both
+        # priority and staleness entirely.
+        gen = float(self._reanalyze_generation)
+        last_gen = np.asarray(self._episode_last_reanalyzed_gen, dtype=np.float64)
+        ep_staleness = np.where(last_gen < 0, gen + 1.0, np.maximum(1.0, gen - last_gen + 1.0))
+        alpha_sums = np.asarray(self._episode_alpha_sum, dtype=np.float64)
+        ep_scores = alpha_sums * ep_staleness
+        total_score = float(ep_scores.sum())
+        ep_probs = ep_scores / total_score if total_score > 0 else np.full(n_episodes, 1.0 / n_episodes)
+        ep_choices = np.random.choice(n_episodes, size=n, p=ep_probs)
         episode_idx = np.zeros(n, dtype=np.int64)
         timestep = np.zeros(n, dtype=np.int64)
         obs_out = np.zeros((n, *self.obs_shape), dtype=np.float32)
@@ -1359,7 +1581,17 @@ class _ResearchImZeroBuffer:
         ctx_valid = np.zeros((n, length), dtype=bool)
         for i, ep_i in enumerate(ep_choices.tolist()):
             ep = self.episodes[ep_i]
-            t = int(np.random.randint(len(ep["reward"])))
+            t_len = len(ep["reward"])
+            # Same idea, one level down: within the chosen episode, favor
+            # whichever transitions are themselves both high-priority and
+            # individually stale, not just "this episode as a whole is
+            # overdue" - two episodes tied on the episode-level score
+            # above can still have very different per-transition needs.
+            rgen = ep["reanalyzed_gen"].astype(np.float64)
+            t_staleness = np.where(rgen < 0, gen + 1.0, np.maximum(1.0, gen - rgen + 1.0))
+            weight = (ep["priority"] ** self.priority_alpha) * t_staleness
+            weight_sum = float(weight.sum())
+            t = int(np.random.choice(t_len, p=weight / weight_sum)) if weight_sum > 0 else int(np.random.randint(t_len))
             episode_idx[i] = ep_i
             timestep[i] = t
             obs_out[i] = ep["obs"][t]
@@ -1369,6 +1601,8 @@ class _ResearchImZeroBuffer:
     def update_reanalyzed_targets(
         self, episode_idx: np.ndarray, timestep: np.ndarray, policy_targets: np.ndarray, search_values: np.ndarray,
     ) -> None:
+        self._reanalyze_generation += 1
+        gen = self._reanalyze_generation
         for i, (ep_i, t) in enumerate(zip(episode_idx.tolist(), timestep.tolist())):
             if not (0 <= ep_i < len(self.episodes)):
                 continue
@@ -1377,6 +1611,8 @@ class _ResearchImZeroBuffer:
                 continue
             ep["policy_target"][t] = policy_targets[i]
             ep["search_value"][t] = search_values[i]
+            ep["reanalyzed_gen"][t] = gen
+            self._episode_last_reanalyzed_gen[ep_i] = float(gen)
 
 
 class NativeResearchImZero(CustomAlgorithm):
@@ -1415,6 +1651,22 @@ class NativeResearchImZero(CustomAlgorithm):
             self.embed_dim, num_layers, num_heads, dropout, rotary_emb=self.rotary_emb,
         ).to(device)
         self.heads = _Heads(self.embed_dim, 2 * self.embed_dim, self._action_space, self.support_size).to(device)
+        # EMA/Polyak target copy, bootstrap-value-only (module docstring's
+        # "Schedules, not fixed constants" section) - never trained
+        # directly (no `requires_grad_(False)` needed since nothing ever
+        # builds an optimizer over it; still explicitly `.eval()`'d so its
+        # own `BatchNorm1d`-having submodules, if any get added later,
+        # don't drift on whatever batch statistics a stray forward pass
+        # happens to see). Deliberately *not* used for the consistency
+        # loss's own target (that stays the online tokenizer, stop-
+        # gradiented per-call, per `use_target_for_bootstrap`'s own
+        # docstring) - only for `_train_step`'s n-step TD bootstrap.
+        self.target_tokenizer = copy.deepcopy(self.tokenizer).eval()
+        self.target_transformer = copy.deepcopy(self.transformer).eval()
+        self.target_heads = copy.deepcopy(self.heads).eval()
+        for module in (self.target_tokenizer, self.target_transformer, self.target_heads):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
         # SimSiam projector/predictor (module docstring's "no target
         # network" section) - `efficientzero.py`'s own consistency-loss
         # machinery, operating on `embed_dim`-sized token embeddings here
@@ -1425,16 +1677,37 @@ class NativeResearchImZero(CustomAlgorithm):
         proj_dim = int(hyperparams.get("proj_dim", 64))
         self.projector = _Projector(self.embed_dim, proj_dim).to(device)
         self.predictor = _Predictor(proj_dim).to(device)
+        self.adaptive_loss_weights = bool(int(hyperparams.get("adaptive_loss_weights", 1)))
+        # Order: [reward, value, policy, consistency] - `0.0` initial
+        # `log_var` for every task means `exp(-log_var)=1`, i.e. training
+        # starts out exactly equivalent to the static-`*_loss_coef`-only
+        # behavior and only diverges from it as these get learned (see
+        # `DEFAULT_HYPERPARAMS["adaptive_loss_weights"]`'s own docstring).
+        self.loss_log_vars = nn.Parameter(torch.zeros(4, device=device))
         self._params = (
             list(self.tokenizer.parameters()) + list(self.action_embed.parameters())
             + list(self.transformer.parameters()) + list(self.heads.parameters())
             + list(self.projector.parameters()) + list(self.predictor.parameters())
+            + ([self.loss_log_vars] if self.adaptive_loss_weights else [])
         )
         # Plain Adam, no weight decay - `efficientzero.py`'s own default;
         # no target network here at all (module docstring's "no target
         # network" section) so there's nothing an `AdamW`-style decay was
         # ever specifically compensating for either.
-        self.optimizer = torch.optim.Adam(self._params, lr=float(hyperparams.get("learning_rate", 2e-4)))
+        self.base_learning_rate = float(hyperparams.get("learning_rate", 2e-4))
+        self.optimizer = torch.optim.Adam(self._params, lr=self.base_learning_rate)
+        self.lr_schedule = bool(int(hyperparams.get("lr_schedule", 1)))
+        self.lr_min_fraction = max(0.0, min(1.0, float(hyperparams.get("lr_min_fraction", 0.05))))
+        # Progress-fraction bookkeeping shared by every training-progress-
+        # dependent schedule below (LR decay, priority-beta annealing,
+        # search/entropy temperature annealing) - one `learn()` call sets
+        # `_total_timesteps_estimate` once from its own `total_timesteps`
+        # argument (`__init__` doesn't get one), `_num_timesteps` tracks
+        # the real global step counter every schedule reads its own
+        # progress fraction off of.
+        self._num_timesteps = 0
+        self._total_timesteps_estimate = 1
+        self._grad_step_count = 0
 
         # Pure speed knobs - none of these change what's computed, only
         # how fast (module docstring's "Performance, not architecture"
@@ -1474,6 +1747,7 @@ class NativeResearchImZero(CustomAlgorithm):
         self.c_visit = float(hyperparams.get("c_visit", 50.0))
         self.c_scale = float(hyperparams.get("c_scale", 0.1))
         self.policy_target_temperature = max(1e-6, float(hyperparams.get("policy_target_temperature", 1.0)))
+        self.temperature_anneal_start_scale = max(1.0, float(hyperparams.get("temperature_anneal_start_scale", 1.5)))
         self.value_minmax_delta = float(hyperparams.get("value_minmax_delta", 0.01))
         self.value_loss_coef = float(hyperparams.get("value_loss_coef", 0.25))
         self.policy_loss_coef = float(hyperparams.get("policy_loss_coef", 1.0))
@@ -1481,14 +1755,48 @@ class NativeResearchImZero(CustomAlgorithm):
         self.consistency_loss_coef = float(hyperparams.get("consistency_loss_coef", 2.0))
         self.continuous_prior_scale = float(hyperparams.get("continuous_prior_scale", 2.5))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
-        self.train_steps_per_iter = max(1, int(hyperparams.get("train_steps_per_iter", 1)))
+        _train_steps_per_iter_base = max(1, int(hyperparams.get("train_steps_per_iter", 1)))
+        # Replay ratio (gradient steps per real transition collected) was
+        # otherwise silently *falling* as `num_envs` rises: `train_freq`/
+        # `train_steps_per_iter` count real steps *summed across every
+        # lane*, so going from 1 to 16 parallel envs means 16x more
+        # transitions land in the buffer between two gradient steps, with
+        # no corresponding increase in how much training happens on them.
+        # `auto_scale_replay_ratio` (default on) restores a roughly
+        # constant replay ratio by scaling `train_steps_per_iter` with
+        # `num_envs // 4` - `1` at `num_envs<=4` (a no-op there, so every
+        # existing single-env run/test/saved config keeps behaving
+        # exactly as before), growing from there. Purely a training-
+        # throughput knob - toggle off to keep the raw
+        # `train_steps_per_iter` value exactly as configured.
+        self._replay_ratio_scale = (
+            max(1, num_envs_of(env) // 4) if bool(int(hyperparams.get("auto_scale_replay_ratio", 1))) else 1
+        )
+        self.train_steps_per_iter = _train_steps_per_iter_base * self._replay_ratio_scale
         self.learning_starts = int(hyperparams.get("learning_starts", 500))
         self.max_grad_norm = float(hyperparams.get("max_grad_norm", 5.0))
         self.priority_alpha = max(0.0, float(hyperparams.get("priority_alpha", 1.0)))
         self.priority_beta = max(0.0, float(hyperparams.get("priority_beta", 1.0)))
+        self.priority_beta_start = max(0.0, float(hyperparams.get("priority_beta_start", 0.4)))
+        self.priority_policy_weight = max(0.0, float(hyperparams.get("priority_policy_weight", 0.1)))
         self.min_priority = max(1e-8, float(hyperparams.get("min_priority", 1e-6)))
         self.reanalyze_freq = max(1, int(hyperparams.get("reanalyze_freq", 200)))
         self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 64)))
+        self.use_target_for_bootstrap = bool(int(hyperparams.get("use_target_for_bootstrap", 1)))
+        self.target_update_theta = float(hyperparams.get("target_update_theta", 0.02))
+        self.search_value_max_staleness = max(0, int(hyperparams.get("search_value_max_staleness", 5)))
+        self.rnd_bonus_coef = float(hyperparams.get("rnd_bonus_coef", 0.1))
+        self.rnd = (
+            RNDModule(
+                self._obs_space, device,
+                feature_dim=int(hyperparams.get("rnd_feature_dim", 128)),
+                hidden_dim=int(hyperparams.get("rnd_hidden_dim", 128)),
+                learning_rate=float(hyperparams.get("rnd_learning_rate", 1e-4)),
+                bonus_clip=float(hyperparams.get("rnd_bonus_clip", 5.0)),
+            )
+            if uses_rnd(hyperparams)
+            else None
+        )
 
         sample_obs_arr = obs_to_array(self._obs_space.sample(), self._obs_space)
         self._obs_shape = sample_obs_arr.shape
@@ -1503,7 +1811,11 @@ class NativeResearchImZero(CustomAlgorithm):
             capacity_episodes=int(hyperparams.get("buffer_size", 2_000)),
             obs_shape=self._obs_shape, action_dim=self.action_dim, policy_target_dim=policy_target_dim,
             context_length=self.context_length, num_lanes=num_envs_of(env),
-            priority_alpha=self.priority_alpha, priority_beta=self.priority_beta, min_priority=self.min_priority,
+            # Starts at `priority_beta_start`, annealed up to
+            # `priority_beta` every `_train_step()` call
+            # (`self.buffer.priority_beta` reassigned there each time,
+            # see `_update_learning_rate`'s sibling schedule helpers).
+            priority_alpha=self.priority_alpha, priority_beta=self.priority_beta_start, min_priority=self.min_priority,
         )
         self._last_metrics: dict[str, float] = {}
         # `learn()`'s own persistent per-lane real-history cache (module
@@ -1811,7 +2123,7 @@ class NativeResearchImZero(CustomAlgorithm):
             roots.append(root)
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
-        gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature
+        gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature * self._current_exploration_scale()
         schedule = _HalvingSchedule(self.num_simulations, num_top_actions)
 
         for sim_idx in range(self.num_simulations):
@@ -1932,12 +2244,92 @@ class NativeResearchImZero(CustomAlgorithm):
         return {"reanalyze_mean_search_value": float(search_values.mean())}
 
     # ------------------------------------------------------------------
+    # Training-progress-dependent schedules (module docstring's
+    # "Schedules, not fixed constants" section) - LR decay, priority-beta
+    # annealing, and search/entropy temperature annealing all read their
+    # own progress off the *same* fraction here, rather than each
+    # tracking it separately.
+    # ------------------------------------------------------------------
+    def _training_progress(self) -> float:
+        """`0.0` right when `learning_starts` gradient steps begin, `1.0`
+        once `self._num_timesteps` (set every real step in `learn()`)
+        reaches the `total_timesteps` this call's `learn()` was given -
+        every schedule below anneals linearly (or cosine, for LR) across
+        this one shared `[0, 1]` fraction."""
+        return min(1.0, max(0.0, self._num_timesteps / max(1, self._total_timesteps_estimate)))
+
+    def _update_learning_rate(self) -> float:
+        """Cosine-decays `self.optimizer`'s LR from `base_learning_rate`
+        down to `base_learning_rate * lr_min_fraction` across training
+        progress (module docstring's "Schedules, not fixed constants"
+        section) - a no-op (flat `base_learning_rate`) whenever
+        `lr_schedule` is off, for exact backwards compatibility with
+        every run/test/saved config that predates this option. Returns
+        the LR actually applied, purely for the returned metrics dict."""
+        if not self.lr_schedule:
+            return self.base_learning_rate
+        progress = self._training_progress()
+        floor = self.base_learning_rate * self.lr_min_fraction
+        lr = floor + 0.5 * (self.base_learning_rate - floor) * (1.0 + math.cos(math.pi * progress))
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
+
+    def _update_priority_beta(self) -> float:
+        """Linearly anneals `self.buffer.priority_beta` from
+        `priority_beta_start` up to `priority_beta` across training
+        progress (see `DEFAULT_HYPERPARAMS["priority_beta"]`'s own
+        docstring for why) - a no-op whenever the two are equal (the
+        pre-this-option flat-`priority_beta` behavior)."""
+        progress = self._training_progress()
+        beta = self.priority_beta_start + (self.priority_beta - self.priority_beta_start) * progress
+        self.buffer.priority_beta = beta
+        return beta
+
+    def _update_target_network(self) -> None:
+        """Polyak/EMA update of `target_tokenizer`/`target_transformer`/
+        `target_heads` towards their online counterparts, one
+        `target_update_theta`-sized step per `_train_step` call - a
+        no-op (never even called) whenever `use_target_for_bootstrap` is
+        off."""
+        theta = self.target_update_theta
+        with torch.no_grad():
+            for target_module, online_module in (
+                (self.target_tokenizer, self.tokenizer),
+                (self.target_transformer, self.transformer),
+                (self.target_heads, self.heads),
+            ):
+                for target_param, online_param in zip(target_module.parameters(), online_module.parameters()):
+                    target_param.mul_(1.0 - theta).add_(online_param, alpha=theta)
+                for target_buf, online_buf in zip(target_module.buffers(), online_module.buffers()):
+                    if torch.is_floating_point(target_buf):
+                        target_buf.mul_(1.0 - theta).add_(online_buf, alpha=theta)
+                    else:
+                        target_buf.copy_(online_buf)
+
+    def _current_exploration_scale(self) -> float:
+        """`1.0` (no-op) once training progress reaches `1.0`, or always
+        if `temperature_anneal_start_scale<=1.0`; otherwise linearly
+        decays from `temperature_anneal_start_scale` down to `1.0` -
+        shared by `search()`'s own root Gumbel noise scale and
+        `_train_step`'s policy-entropy-bonus coefficient (see
+        `DEFAULT_HYPERPARAMS["temperature_anneal_start_scale"]`'s own
+        docstring)."""
+        if self.temperature_anneal_start_scale <= 1.0:
+            return 1.0
+        progress = self._training_progress()
+        return 1.0 + (self.temperature_anneal_start_scale - 1.0) * (1.0 - progress)
+
+    # ------------------------------------------------------------------
     # Training - one forward pass over the full teacher-forced window
     # (context + real interleaved obs/action tokens), reading every step's
     # losses off that single pass (module docstring's "Full-trajectory
     # teacher forcing" bullet).
     # ------------------------------------------------------------------
     def _train_step(self) -> dict[str, float]:
+        current_lr = self._update_learning_rate()
+        current_priority_beta = self._update_priority_beta()
+        self._grad_step_count += 1
         batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.gamma)
         device = self.device
         b, k_steps = self.batch_size, self.unroll_steps
@@ -1958,6 +2350,17 @@ class NativeResearchImZero(CustomAlgorithm):
         # `max()`, `efficientzero.py`'s own `value_target: 'max'` mode
         # (module docstring's "no target network" section).
         search_value = torch.as_tensor(batch["search_value"], dtype=torch.float32, device=device)
+        # Freshness gate (module docstring's "Schedules, not fixed
+        # constants" section): a transition whose `search_value` was
+        # reanalyzed more than `search_value_max_staleness` generations
+        # ago gets treated as if it had never been reanalyzed at all
+        # (`_NO_SEARCH_VALUE`, always loses the `max()` below against
+        # `td_target`) rather than an indefinitely-stale value winning
+        # forever just because it happened to be large.
+        search_value_gen = torch.as_tensor(batch["search_value_gen"], dtype=torch.long, device=device)
+        staleness = self.buffer.reanalyze_generation - search_value_gen
+        is_fresh = (search_value_gen >= 0) & (staleness <= self.search_value_max_staleness)
+        search_value = torch.where(is_fresh, search_value, torch.full_like(search_value, self.buffer._NO_SEARCH_VALUE))
         is_weight = torch.as_tensor(batch["is_weight"], dtype=torch.float32, device=device)
 
         # Raw token embeddings for the whole window: context (compact,
@@ -2014,6 +2417,7 @@ class NativeResearchImZero(CustomAlgorithm):
             policy_entropy = torch.zeros((), device=device)
             first_step_value_pred: torch.Tensor | None = None
             first_step_value_target: torch.Tensor | None = None
+            first_step_policy_error: torch.Tensor | None = None
 
             for k in range(k_steps):
                 m = mask[:, k]
@@ -2040,12 +2444,21 @@ class NativeResearchImZero(CustomAlgorithm):
                 # a fresher root-value estimate than a plain online-net
                 # bootstrap that's chasing its own recent update.
                 with torch.no_grad():
-                    td_obs_emb = self.tokenizer(
+                    # `use_target_for_bootstrap` (default on): the slow-
+                    # moving EMA copy, not the online net, so the value
+                    # head isn't training partly towards a target it
+                    # itself produced moments ago (module docstring's
+                    # "Schedules, not fixed constants" section). Off:
+                    # exactly this file's original online-net bootstrap.
+                    bootstrap_tokenizer = self.target_tokenizer if self.use_target_for_bootstrap else self.tokenizer
+                    bootstrap_transformer = self.target_transformer if self.use_target_for_bootstrap else self.transformer
+                    bootstrap_heads = self.target_heads if self.use_target_for_bootstrap else self.heads
+                    td_obs_emb = bootstrap_tokenizer(
                         torch.as_tensor(batch["td_obs"][:, k], dtype=torch.float32, device=device),
                     )
                     td_pad = torch.ones(b, 1, dtype=torch.bool, device=device)
-                    td_hidden = self.transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
-                    bootstrap_value = self.heads.value(td_hidden) * td_bootstrap_mask[:, k]
+                    td_hidden = bootstrap_transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
+                    bootstrap_value = bootstrap_heads.value(td_hidden) * td_bootstrap_mask[:, k]
                     td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
                     value_target = torch.maximum(td_target, search_value[:, k])
                 value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
@@ -2081,6 +2494,16 @@ class NativeResearchImZero(CustomAlgorithm):
                     entropy_k = (0.5 * torch.log(2.0 * math.pi * math.e * var)).sum(-1)
                 policy_loss = policy_loss + (p_loss * wm).sum() / denom
                 policy_entropy = policy_entropy + (entropy_k * wm).sum() / denom
+                if k == 0:
+                    # Priority (below, after the unroll loop) blends this
+                    # in alongside the value error - a transition whose
+                    # *policy* target the network gets badly wrong is just
+                    # as informative to replay again soon as one whose
+                    # value estimate is off, but the old
+                    # `|value_pred - value_target|`-only priority never
+                    # surfaced it (module docstring's "Schedules, not
+                    # fixed constants" section).
+                    first_step_policy_error = p_loss.detach()
 
                 # SimSiam consistency loss (module docstring's "no target
                 # network" section, `efficientzero.py`'s own recipe): the
@@ -2110,16 +2533,39 @@ class NativeResearchImZero(CustomAlgorithm):
             reward_loss, value_loss, policy_loss, consistency_loss, policy_entropy = (
                 reward_loss / n, value_loss / n, policy_loss / n, consistency_loss / n, policy_entropy / n,
             )
-            total_loss = (
-                self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
-                + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
-                # Entropy *bonus* - reference's own `policy_entropy_weight`
-                # (default `5e-3`): subtracted from the total loss (not
-                # added) since higher policy entropy is the *goal* here, one
-                # of MuZero-family exploration regularizers this file had no
-                # equivalent of before.
-                - self.policy_entropy_coef * policy_entropy
-            )
+            if self.adaptive_loss_weights:
+                # Kendall et al. (2018) - see `DEFAULT_HYPERPARAMS
+                # ["adaptive_loss_weights"]`'s own docstring. `precision_i
+                # = exp(-log_var_i)` down-weights a task whose loss the
+                # network currently can't push down much further (a large,
+                # stubborn loss keeps its own `log_var` high, shrinking its
+                # `precision`), the `+ log_var_i` regularizer is what stops
+                # every `log_var` from simply drifting to `+inf` to trivially
+                # zero out every task's contribution.
+                static_coefs = torch.stack(
+                    [
+                        torch.as_tensor(self.reward_loss_coef, device=device),
+                        torch.as_tensor(self.value_loss_coef, device=device),
+                        torch.as_tensor(self.policy_loss_coef, device=device),
+                        torch.as_tensor(self.consistency_loss_coef, device=device),
+                    ],
+                )
+                task_losses = torch.stack([reward_loss, value_loss, policy_loss, consistency_loss])
+                precision = torch.exp(-self.loss_log_vars)
+                total_loss = (static_coefs * precision * task_losses + self.loss_log_vars).sum()
+            else:
+                total_loss = (
+                    self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
+                    + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
+                )
+            # Entropy *bonus* - reference's own `policy_entropy_weight`
+            # (default `5e-3`): subtracted from the total loss (not
+            # added) since higher policy entropy is the *goal* here, one
+            # of MuZero-family exploration regularizers this file had no
+            # equivalent of before. Not part of the adaptive-weighting
+            # blend above - it's a regularizer, not a task with its own
+            # loss to balance against the others.
+            total_loss = total_loss - self.policy_entropy_coef * self._current_exploration_scale() * policy_entropy
         # `GradScaler` is `enabled=False` (pure passthrough) whenever
         # we're not doing fp16 autocast (`__init__`'s own
         # `self._grad_scaler`) - bf16/CPU/no-AMP all just call
@@ -2130,10 +2576,33 @@ class NativeResearchImZero(CustomAlgorithm):
         torch.nn.utils.clip_grad_norm_(self._params, self.max_grad_norm)
         self._grad_scaler.step(self.optimizer)
         self._grad_scaler.update()
+        if self.use_target_for_bootstrap:
+            self._update_target_network()
 
         assert first_step_value_pred is not None and first_step_value_target is not None
-        fresh_priority = (first_step_value_pred - first_step_value_target).abs().cpu().numpy()
+        assert first_step_policy_error is not None
+        value_error = (first_step_value_pred - first_step_value_target).abs()
+        # `priority_policy_weight` (default `0.1`) - deliberately modest:
+        # `value_error` and a discrete cross-entropy/continuous MSE
+        # `policy_error` live on unrelated, uncalibrated scales, so this
+        # is a heuristic blend, not a principled combination - just
+        # enough to stop pure value-error priority from being blind to
+        # "value is fine, but the policy target here is way off" samples,
+        # without letting one badly-fit transition's policy loss swamp
+        # the value signal the rest of this file's PER machinery was
+        # actually tuned around.
+        combined_priority = value_error + self.priority_policy_weight * first_step_policy_error
+        fresh_priority = combined_priority.cpu().numpy()
         self.buffer.update_priorities(batch["episode_idx"], batch["timestep"], fresh_priority)
+
+        if self.rnd:
+            # `dqn.py`'s own convention: the RND predictor trains off
+            # replayed `next_obs`, not on-the-fly during collection - it
+            # only ever *reads* fresh observations there (`.bonus()`,
+            # under `no_grad`) to compute the novelty bonus itself.
+            self.rnd.update_predictor(
+                batch["next_obs"].reshape(-1, *self._obs_shape), mask=batch["mask"].reshape(-1),
+            )
 
         return {
             "reward_loss": float(reward_loss.item()),
@@ -2144,6 +2613,23 @@ class NativeResearchImZero(CustomAlgorithm):
             "mean_priority": float(fresh_priority.mean()) if fresh_priority.size else 0.0,
             "mean_is_weight": float(is_weight.mean().item()),
             "total_loss": float(total_loss.item()),
+            "learning_rate": current_lr,
+            "priority_beta": current_priority_beta,
+            **(
+                {
+                    "loss_weight_reward": float(torch.exp(-self.loss_log_vars[0]).item()),
+                    "loss_weight_value": float(torch.exp(-self.loss_log_vars[1]).item()),
+                    "loss_weight_policy": float(torch.exp(-self.loss_log_vars[2]).item()),
+                    "loss_weight_consistency": float(torch.exp(-self.loss_log_vars[3]).item()),
+                }
+                if self.adaptive_loss_weights
+                else {}
+            ),
+            **(
+                {"rnd_bonus_mean": float(self.rnd.bonus_mean), "rnd_predictor_loss": float(self.rnd.last_loss)}
+                if self.rnd
+                else {}
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -2154,8 +2640,20 @@ class NativeResearchImZero(CustomAlgorithm):
         obs_list = vec_reset(self.env, seed=self.seed)
         obs_arr = obs_batch_to_array(obs_list, self._obs_space)
         ep_reward = np.zeros(n_envs, dtype=np.float64)
+        ep_extrinsic = np.zeros(n_envs, dtype=np.float64)
+        ep_intrinsic = np.zeros(n_envs, dtype=np.float64)
         ep_length = np.zeros(n_envs, dtype=np.int64)
         num_timesteps = 0
+        # `_training_progress()`'s own denominator - every schedule (LR
+        # decay, priority-beta annealing, search/entropy temperature
+        # annealing) reads its progress fraction off `self._num_timesteps
+        # / self._total_timesteps_estimate`, kept in sync with the local
+        # `num_timesteps` below every real step so `_train_step`/
+        # `_reanalyze` (methods, no `total_timesteps` of their own) can
+        # read it too. A `.learn()` call resumed via `resume_from` at,
+        # say, step 50k of a *new* 100k-step run still anneals cleanly:
+        # this is this call's own total, not the checkpoint's original one.
+        self._total_timesteps_estimate = max(1, total_timesteps)
 
         while num_timesteps < total_timesteps:
             env_actions: list[Any] = []
@@ -2195,9 +2693,26 @@ class NativeResearchImZero(CustomAlgorithm):
             next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, env_actions)
             dones = terminated | truncated
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            # RND intrinsic reward (`intrinsic_exploration`, off by
+            # default - see `DEFAULT_HYPERPARAMS["intrinsic_exploration"]`'s
+            # own docstring): `dqn.py`'s own per-lane convention, one
+            # `.bonus()` call per lane's own fresh `next_obs` (each is
+            # genuinely a new observation needing its own running-stats
+            # update, not a batch that happens to share one). Everything
+            # downstream - buffer storage, TD targets, `ep_reward` -
+            # trains on `total_reward`; `ep_extrinsic`/`ep_intrinsic`
+            # only exist to report the two parts separately once an
+            # episode ends.
+            extrinsic_reward = rewards.astype(np.float64)
+            intrinsic_reward = (
+                np.array([self.rnd_bonus_coef * self.rnd.bonus(next_obs_arr[lane]) for lane in range(n_envs)])
+                if self.rnd
+                else np.zeros(n_envs)
+            )
+            total_reward = extrinsic_reward + intrinsic_reward
             for lane in range(n_envs):
                 self.buffer.add(
-                    obs_arr[lane], action_flats[lane], float(rewards[lane]), next_obs_arr[lane],
+                    obs_arr[lane], action_flats[lane], float(total_reward[lane]), next_obs_arr[lane],
                     policy_targets[lane], bool(dones[lane]), lane=lane,
                 )
             if num_timesteps >= self.learning_starts:
@@ -2205,10 +2720,13 @@ class NativeResearchImZero(CustomAlgorithm):
                 for lane in range(n_envs):
                     self._lane_cache[lane] = None if dones[lane] else new_caches[lane]
             obs_arr = next_obs_arr
-            ep_reward += rewards
+            ep_reward += total_reward
+            ep_extrinsic += extrinsic_reward
+            ep_intrinsic += intrinsic_reward
             ep_length += 1
             prev_num_timesteps = num_timesteps
             num_timesteps += n_envs
+            self._num_timesteps = num_timesteps
 
             if self.buffer.num_episodes >= 1 and num_timesteps >= self.learning_starts:
                 effective_prev = max(prev_num_timesteps, self.learning_starts)
@@ -2227,10 +2745,19 @@ class NativeResearchImZero(CustomAlgorithm):
                 if not dones[lane]:
                     continue
                 any_done = True
-                keep_going = callback.on_step(
-                    num_timesteps, float(ep_reward[lane]), int(ep_length[lane]), self._last_metrics,
+                lane_metrics = (
+                    {
+                        **self._last_metrics,
+                        "episode_extrinsic_reward": float(ep_extrinsic[lane]),
+                        "episode_intrinsic_reward": float(ep_intrinsic[lane]),
+                    }
+                    if self.rnd
+                    else self._last_metrics
                 )
-                ep_reward[lane], ep_length[lane] = 0.0, 0
+                keep_going = callback.on_step(
+                    num_timesteps, float(ep_reward[lane]), int(ep_length[lane]), lane_metrics,
+                )
+                ep_reward[lane], ep_extrinsic[lane], ep_intrinsic[lane], ep_length[lane] = 0.0, 0.0, 0.0, 0
                 if not keep_going:
                     return
             if not any_done:
@@ -2260,7 +2787,12 @@ class NativeResearchImZero(CustomAlgorithm):
                 "heads_state_dict": self.heads.state_dict(),
                 "projector_state_dict": self.projector.state_dict(),
                 "predictor_state_dict": self.predictor.state_dict(),
+                "target_tokenizer_state_dict": self.target_tokenizer.state_dict(),
+                "target_transformer_state_dict": self.target_transformer.state_dict(),
+                "target_heads_state_dict": self.target_heads.state_dict(),
+                "loss_log_vars": self.loss_log_vars.detach().cpu(),
                 "hyperparams": self.hyperparams,
+                **({"rnd_state": self.rnd.checkpoint_state()} if self.rnd else {}),
             },
             path,
         )
@@ -2276,4 +2808,13 @@ class NativeResearchImZero(CustomAlgorithm):
         if "projector_state_dict" in payload:
             algo.projector.load_state_dict(payload["projector_state_dict"])
             algo.predictor.load_state_dict(payload["predictor_state_dict"])
+        if "target_tokenizer_state_dict" in payload:
+            algo.target_tokenizer.load_state_dict(payload["target_tokenizer_state_dict"])
+            algo.target_transformer.load_state_dict(payload["target_transformer_state_dict"])
+            algo.target_heads.load_state_dict(payload["target_heads_state_dict"])
+        if algo.rnd and payload.get("rnd_state"):
+            algo.rnd.load_checkpoint_state(payload["rnd_state"])
+        if "loss_log_vars" in payload:
+            with torch.no_grad():
+                algo.loss_log_vars.copy_(payload["loss_log_vars"].to(device))
         return algo

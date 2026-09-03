@@ -473,11 +473,22 @@ ALGORITHM_CATALOG = [
         "name": "ResearchImZero (наша версия)",
         "kind": "gym",
         "description": "Наш собственный алгоритм: архитектура UniZero (causal Transformer + RoPE + "
-                        "персистентный KV-cache), но с тренировочным рецептом EfficientZero (Gumbel-поиск, "
-                        "SimSiam consistency, без target-модели, PER + reanalyze включены по умолчанию) — "
-                        "то, что реально быстро и хорошо обучалось на практике. Discrete и continuous.",
+                        "персистентный KV-cache) + тренировочный рецепт EfficientZero (Gumbel-поиск, SimSiam "
+                        "consistency, PER + reanalyze), плюс EMA target для bootstrap'а, адаптивные лоссы, "
+                        "расписания LR/exploration и опциональный RND. Discrete и continuous.",
         "hyperparams": [
             {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 2e-4, "min": 1e-6, "max": 1e-1},
+            {
+                "key": "lr_schedule", "label": "LR schedule", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "Cosine decay после learning_starts (стабильнее к концу обучения)"},
+                    {"value": 0, "label": "Постоянный learning rate"},
+                ],
+            },
+            {
+                "key": "lr_min_fraction", "label": "LR schedule: минимум (доля от базового lr)", "type": "float",
+                "default": 0.05, "min": 0.0, "max": 1.0, "visibleWhen": [{"key": "lr_schedule", "eq": 1}],
+            },
             {"key": "embed_dim", "label": "Размерность токена (embed_dim)", "type": "int", "default": 128, "min": 8, "max": 1024},
             {"key": "num_layers", "label": "Слоёв Transformer'а", "type": "int", "default": 2, "min": 1, "max": 12},
             {"key": "num_heads", "label": "Голов self-attention", "type": "int", "default": 4, "min": 1, "max": 32},
@@ -500,6 +511,11 @@ ALGORITHM_CATALOG = [
             {"key": "c_visit", "label": "Sigma-transform: c_visit", "type": "float", "default": 50.0, "min": 1.0, "max": 200.0},
             {"key": "c_scale", "label": "Sigma-transform: c_scale", "type": "float", "default": 0.1, "min": 0.01, "max": 5.0},
             {"key": "policy_target_temperature", "label": "Температура шума Гумбеля в корне", "type": "float", "default": 1.0, "min": 0.01, "max": 10.0},
+            {
+                "key": "temperature_anneal_start_scale",
+                "label": "Больше exploration/entropy в начале обучения (множитель, →1.0 к концу)",
+                "type": "float", "default": 1.5, "min": 1.0, "max": 5.0,
+            },
             {"key": "value_minmax_delta", "label": "Мин. эпсилон нормализации Q (MinMaxStats)", "type": "float", "default": 0.01, "min": 1e-4, "max": 1.0},
             {"key": "value_support_size", "label": "Категориальный support value/reward-головы (±N бинов)", "type": "int", "default": 300, "min": 5, "max": 1000},
             {"key": "label_smoothing_eps", "label": "Label smoothing value/reward-таргетов (ε)", "type": "float", "default": 0.0, "min": 0.0, "max": 0.5},
@@ -508,24 +524,79 @@ ALGORITHM_CATALOG = [
             {"key": "policy_loss_coef", "label": "Вес policy loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
             {"key": "reward_loss_coef", "label": "Вес reward loss", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0},
             {"key": "consistency_loss_coef", "label": "Вес consistency (SimSiam) loss", "type": "float", "default": 2.0, "min": 0.0, "max": 20.0},
+            {
+                "key": "adaptive_loss_weights", "label": "Адаптивное взвешивание лоссов", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "Да — learnable uncertainty weights (Kendall et al.), веса выше — приоритет"},
+                    {"value": 0, "label": "Нет — только статичные *_loss_coef"},
+                ],
+            },
             {"key": "proj_dim", "label": "SimSiam projector/predictor: размерность", "type": "int", "default": 64, "min": 8, "max": 512},
             {"key": "policy_entropy_coef", "label": "Вес policy entropy bonus", "type": "float", "default": 5e-3, "min": 0.0, "max": 0.1},
             {"key": "continuous_prior_scale", "label": "Continuous: расширение std для prior-кандидатов", "type": "float", "default": 2.5, "min": 1.0, "max": 10.0},
             {"key": "train_freq", "label": "Реальных шагов между обновлениями (суммарно по всем env)", "type": "int", "default": 1, "min": 1, "max": 1000},
             {"key": "train_steps_per_iter", "label": "Градиентных шагов за каждые train_freq реальных шагов", "type": "int", "default": 1, "min": 1, "max": 100},
+            {
+                "key": "auto_scale_replay_ratio", "label": "Автоскейл replay ratio под num_envs", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "Да — умножает train_steps_per_iter на num_envs//4 (иначе replay ratio падает с ростом num_envs)"},
+                    {"value": 0, "label": "Нет — train_steps_per_iter как задано"},
+                ],
+            },
             {"key": "learning_starts", "label": "Реальных шагов до начала обучения", "type": "int", "default": 500, "min": 0, "max": 100_000},
             {"key": "max_grad_norm", "label": "Max grad norm", "type": "float", "default": 5.0, "min": 0.1, "max": 100.0},
             {"key": "priority_alpha", "label": "Prioritized replay: степень приоритизации (α, 0=uniform/выкл.)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
-            {"key": "priority_beta", "label": "Prioritized replay: коррекция смещения (β, importance sampling)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
+            {"key": "priority_beta", "label": "Prioritized replay: коррекция смещения (β, importance sampling, конечное значение)", "type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
+            {"key": "priority_beta_start", "label": "Prioritized replay: β в начале обучения (аннилится до priority_beta)", "type": "float", "default": 0.4, "min": 0.0, "max": 1.0},
+            {"key": "priority_policy_weight", "label": "Приоритет: вклад ошибки policy (сверх ошибки value)", "type": "float", "default": 0.1, "min": 0.0, "max": 5.0},
             {"key": "min_priority", "label": "Минимальный приоритет перехода", "type": "float", "default": 1e-6, "min": 1e-8, "max": 1.0},
             {"key": "reanalyze_freq", "label": "Реальных шагов между reanalyze-проходами", "type": "int", "default": 200, "min": 1, "max": 100_000},
             {"key": "reanalyze_batch_size", "label": "Переходов, обновляемых за один reanalyze-проход (0 = выключить)", "type": "int", "default": 64, "min": 0, "max": 1024},
+            {
+                "key": "use_target_for_bootstrap", "label": "EMA target-сеть для value-bootstrap", "type": "int", "default": 1, "min": 0, "max": 1,
+                "options": [
+                    {"value": 1, "label": "Да — Polyak-EMA копия сети (устойчивее без самоссылочного TD-таргета)"},
+                    {"value": 0, "label": "Нет — bootstrap online-сетью напрямую"},
+                ],
+            },
+            {
+                "key": "target_update_theta", "label": "EMA target: скорость обновления (θ)", "type": "float", "default": 0.02, "min": 0.001, "max": 1.0,
+                "visibleWhen": [{"key": "use_target_for_bootstrap", "eq": 1}],
+            },
+            {"key": "search_value_max_staleness", "label": "Reanalyze: макс. \"возраст\" search_value в value target (поколений)", "type": "int", "default": 5, "min": 0, "max": 1000},
             {
                 "key": "use_amp", "label": "Mixed precision (AMP) на GPU", "type": "int", "default": 1, "min": 0, "max": 1,
                 "options": [
                     {"value": 1, "label": "Да — bf16/fp16 автокаст в train_step (быстрее и меньше памяти на GPU, без CPU)"},
                     {"value": 0, "label": "Нет — всё в fp32"},
                 ],
+            },
+            {
+                "key": "intrinsic_exploration", "label": "Intrinsic motivation (RND)", "type": "int", "default": 0, "min": 0, "max": 1,
+                "options": [
+                    {"value": 0, "label": "Нет"},
+                    {"value": 1, "label": "Да — Random Network Distillation (бонус за новизну, полезно для hard-exploration сред)"},
+                ],
+            },
+            {
+                "key": "rnd_bonus_coef", "label": "RND: вес intrinsic-бонуса", "type": "float", "default": 0.1, "min": 0.0, "max": 5.0,
+                "visibleWhen": [{"key": "intrinsic_exploration", "eq": 1}],
+            },
+            {
+                "key": "rnd_learning_rate", "label": "RND: learning rate предиктора", "type": "float", "default": 1e-4, "min": 1e-6, "max": 1e-1,
+                "visibleWhen": [{"key": "intrinsic_exploration", "eq": 1}],
+            },
+            {
+                "key": "rnd_feature_dim", "label": "RND: размерность признаков", "type": "int", "default": 128, "min": 8, "max": 1024,
+                "visibleWhen": [{"key": "intrinsic_exploration", "eq": 1}],
+            },
+            {
+                "key": "rnd_hidden_dim", "label": "RND: размерность скрытого слоя", "type": "int", "default": 128, "min": 8, "max": 1024,
+                "visibleWhen": [{"key": "intrinsic_exploration", "eq": 1}],
+            },
+            {
+                "key": "rnd_bonus_clip", "label": "RND: клиппинг нормализованного бонуса", "type": "float", "default": 5.0, "min": 0.1, "max": 50.0,
+                "visibleWhen": [{"key": "intrinsic_exploration", "eq": 1}],
             },
         ],
     },
