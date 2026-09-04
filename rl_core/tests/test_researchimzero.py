@@ -5,6 +5,7 @@ hyperparams, just check shapes/no-crash, not learned quality" convention as
 `test_unizero.py`/`test_efficientzero.py`."""
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 
@@ -38,6 +39,23 @@ _TINY_DISCRETE = {
     "proj_dim": 8,
 }
 _TINY_CONTINUOUS = {**_TINY_DISCRETE}
+
+
+class _OneStepResearchEnv(gym.Env):
+    observation_space = gym.spaces.Box(-1000, 1000, shape=(4,), dtype=np.float32)
+    action_space = gym.spaces.Discrete(2)
+
+    def __init__(self) -> None:
+        self.episode = 0
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.episode += 1
+        return np.full(4, 10 * self.episode, dtype=np.float32), {}
+
+    def step(self, action):
+        del action
+        return np.full(4, 10 * self.episode + 1, dtype=np.float32), 1.0, True, False, {}
 
 
 def _run_smoke(env_id: str, hyperparams: dict, total_timesteps: int, num_envs: int = 1) -> None:
@@ -89,6 +107,76 @@ class TestNativeResearchImZeroDiscrete:
             assert r["policy_target"].shape == (algo.n_actions,)
             assert np.isclose(float(r["policy_target"].sum()), 1.0, atol=1e-4)
             assert isinstance(r["env_action"], (int, np.integer))
+        env.close()
+
+
+class TestVectorCollectionRegressions:
+    def test_default_training_cadence_is_one_update_per_vector_iteration(self) -> None:
+        env = make_env_or_vec(_OneStepResearchEnv, num_envs=24, parallel=False)
+        algo = NativeResearchImZero(
+            env,
+            {
+                **DEFAULT_HYPERPARAMS,
+                **_TINY_DISCRETE,
+                "learning_starts": 0,
+                "auto_scale_replay_ratio": 0,
+            },
+            seed=0,
+            device="cpu",
+        )
+        train_calls = 0
+
+        def fake_search(obs_batch, root_caches, deterministic=None):
+            del root_caches, deterministic
+            return [
+                {
+                    "env_action": 0,
+                    "policy_target": np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32),
+                    "value_target": 0.0,
+                }
+                for _ in range(obs_batch.shape[0])
+            ]
+
+        def fake_train_step():
+            nonlocal train_calls
+            train_calls += 1
+            return {}
+
+        algo.search = fake_search
+        algo._train_step = fake_train_step
+        algo._advance_lane_caches = lambda caches, obs, actions: [None] * len(caches)
+        algo.learn(48, TrainingCallback(lambda *args, **kwargs: True))
+        assert train_calls == 2
+        assert algo.train_steps_per_iter == 1
+        env.close()
+
+    def test_autoscale_is_explicit_and_not_multiplied_by_crossed_boundaries(self) -> None:
+        env = make_env_or_vec(_OneStepResearchEnv, num_envs=24, parallel=False)
+        algo = NativeResearchImZero(
+            env,
+            {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "auto_scale_replay_ratio": 1},
+            seed=0,
+            device="cpu",
+        )
+        assert algo.train_steps_per_iter == 6
+        env.close()
+
+    def test_terminal_replay_observation_is_not_same_step_reset_observation(self) -> None:
+        env = make_env_or_vec(_OneStepResearchEnv, num_envs=2, parallel=False)
+        algo = NativeResearchImZero(
+            env,
+            {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "learning_starts": 1000},
+            seed=0,
+            device="cpu",
+        )
+        algo.learn(2, TrainingCallback(lambda *args, **kwargs: True))
+        assert algo.buffer.num_episodes == 2
+        for episode in algo.buffer.episodes:
+            # Episode 1 starts at 10, truly terminates at 11, while the
+            # SAME_STEP reset observation for episode 2 is 20.
+            assert np.allclose(episode["obs"][0], 10.0)
+            assert np.allclose(episode["next_obs"][0], 11.0)
+        assert all(cache is None for cache in algo._lane_cache)
         env.close()
 
 
@@ -223,4 +311,98 @@ class TestValueTargetMaxBlend:
         assert batch["search_value"].shape == (algo.batch_size, algo.unroll_steps)
         # Never-reanalyzed transitions keep the buffer's own sentinel.
         assert np.all(batch["search_value"] <= _ResearchImZeroBuffer._NO_SEARCH_VALUE + 1.0)
+        env.close()
+
+
+class TestAdaptiveLossWeights:
+    """`adaptive_loss_weights`'s Kendall-et-al. `precision*loss + log_var`
+    total loss - regression coverage for the exact real-run failure this
+    file's own postmortem found: `consistency_loss`'s old `-cos_sim`
+    formulation (`[-1, 1]`, can go negative) had no interior minimum
+    under this weighting scheme, so `loss_weight_consistency` climbed
+    unbounded (measured 2 -> 9896 in under 7k real NetHack steps,
+    `total_loss` to `-13486`) instead of converging, and effectively
+    starved every other task's gradient. Fixed by shifting consistency
+    to `1 - cos_sim` (`[0, 2]`, always non-negative) plus a defense-in-
+    depth `log_var` clamp - this test runs enough real `_train_step`
+    calls that the old bug would already show clear divergence, and
+    asserts every `loss_weight_*` stays inside the clamp's own bound."""
+
+    def test_consistency_loss_is_never_negative(self) -> None:
+        """The actual root-cause regression check: `adaptive_loss_
+        weights`'s `precision*loss + log_var` term only has an interior
+        minimum (so `precision` converges instead of running away to
+        `+inf`) if `loss >= 0`. `consistency_loss` is a cosine-similarity-
+        based loss, the one task loss here not automatically non-negative
+        by construction (unlike the categorical cross-entropies/MSE the
+        other three tasks use) - it must be `1 - cos_sim` (`[0, 2]`), not
+        `-cos_sim` (`[-1, 1]`, and reliably negative once the model is any
+        good at it - a real NetHack run measured `loss_weight_consistency`
+        climbing `2 -> 9896` in under 7k steps off exactly this sign bug,
+        `total_loss` diverging to `-13486`, training effectively stalling
+        since every other task's gradient got swamped). A short, high-
+        quality-consistency-prediction run is enough to catch a regression
+        here directly, immediately - no need to wait out however many
+        `_train_step` calls an actual unbounded blowup would take to
+        become numerically obvious (which, empirically, is *not* fast
+        with tiny test-sized networks and short buffers - the divergence
+        speed depends on how negative `consistency_loss` gets, which
+        depends on how good the SimSiam prediction already is, not on the
+        bug's presence alone)."""
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeResearchImZero(
+            env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "adaptive_loss_weights": 1}, seed=0, device="cpu",
+        )
+        obs, _info = env.reset(seed=0)
+        for step in range(60):
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, _info = env.step(action)
+            done = bool(terminated or truncated) or step == 59
+            policy_target = np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32)
+            action_flat = np.zeros(algo.n_actions, dtype=np.float32)
+            action_flat[action] = 1.0
+            algo.buffer.add(obs, action_flat, float(reward), next_obs, policy_target, done, lane=0)
+            obs = next_obs if not done else env.reset(seed=step)[0]
+        for _ in range(10):
+            metrics = algo._train_step()
+            assert metrics["consistency_loss"] >= -1e-5, (
+                f"consistency_loss={metrics['consistency_loss']} went negative - "
+                "adaptive_loss_weights's precision term has no interior minimum here anymore"
+            )
+        env.close()
+
+    def test_loss_weights_stay_within_their_own_clamp(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeResearchImZero(
+            env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE, "adaptive_loss_weights": 1}, seed=0, device="cpu",
+        )
+        obs, _info = env.reset(seed=0)
+        for step in range(60):
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, _info = env.step(action)
+            done = bool(terminated or truncated) or step == 59
+            policy_target = np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32)
+            action_flat = np.zeros(algo.n_actions, dtype=np.float32)
+            action_flat[action] = 1.0
+            algo.buffer.add(obs, action_flat, float(reward), next_obs, policy_target, done, lane=0)
+            obs = next_obs if not done else env.reset(seed=step)[0]
+
+        # `exp(5) ~= 148.4` - `_train_step`'s own `log_var.clamp(-5.0, 5.0)`
+        # ceiling (defense-in-depth on top of the sign fix above); a small
+        # margin above it catches an off-by-one without re-allowing the
+        # kind of unbounded blowup this regresses against.
+        max_allowed_weight = math.exp(5.0) * 1.05
+        weight_keys = ["loss_weight_reward", "loss_weight_value", "loss_weight_policy"]
+        for _ in range(30):
+            metrics = algo._train_step()
+            assert np.isfinite(metrics["total_loss"])
+            # `consistency_loss` deliberately isn't adaptively weighted
+            # at all anymore (see `__init__`'s own `self.loss_log_vars`
+            # comment: no genuine noise floor -> it just camps at this
+            # exact clamp ceiling instead, ~200x `policy`'s concurrent
+            # weight, real-run-measured to stall `episode_reward_mean`)
+            # - there's no `loss_weight_consistency` metric key to check.
+            assert "loss_weight_consistency" not in metrics
+            for key in weight_keys:
+                assert 0.0 < metrics[key] <= max_allowed_weight, f"{key}={metrics[key]} escaped its own clamp"
         env.close()

@@ -266,7 +266,7 @@ export interface ExperimentConfig {
     // — a spec built on the fly from just a list of trunk hidden-layer
     // sizes, never saved to disk under a name. Mutually exclusive with
     // `network_spec_id` in practice (the Designer only ever sets one).
-    network_spec?: NetworkSpec | null
+    network_spec?: AnyNetworkSpec | null
     // Same "saved catalog entry vs. inline" pair as `network_spec_id`/
     // `network_spec` above, but for a World Model (rl_core/world_models/) —
     // only meaningful for the four algorithms with `world_model_type` set
@@ -303,7 +303,9 @@ export interface ResumeFrom {
 
 // ------------------------------------------------- Network Architecture Builder
 
-export type NetworkFamily = 'actor_critic' | 'q_network' | 'dueling_q' | 'alphazero'
+export type FlatNetworkFamily = 'actor_critic' | 'q_network' | 'dueling_q' | 'alphazero'
+export type CompositeNetworkFamily = 'efficientzero' | 'unizero' | 'researchimzero'
+export type NetworkFamily = FlatNetworkFamily | CompositeNetworkFamily
 
 export type NetworkLayerType = 'linear' | 'conv2d' | 'maxpool2d' | 'flatten' | 'activation' | 'dropout' | 'batchnorm'
 export type ActivationFn = 'relu' | 'tanh' | 'sigmoid' | 'gelu' | 'leaky_relu'
@@ -329,11 +331,33 @@ export interface NetworkSpec {
   heads: NetworkHead[]
 }
 
+export interface CompositeMlpSpec {
+  hidden_sizes: number[]
+  activation: 'relu' | 'elu' | 'gelu' | 'tanh' | 'leaky_relu'
+  dropout: number
+  batch_norm: boolean
+}
+
+export interface CompositeEncoderSpec {
+  kind: 'auto' | 'vector_mlp' | 'image_cnn' | 'custom'
+  layers: NetworkLayer[]
+}
+
+export interface CompositeNetworkSpec {
+  format: 'composite_v1'
+  family: CompositeNetworkFamily
+  dimensions: Record<string, number>
+  encoder: CompositeEncoderSpec
+  components: Record<string, CompositeMlpSpec>
+}
+
+export type AnyNetworkSpec = NetworkSpec | CompositeNetworkSpec
+
 export interface NetworkDoc {
   name: string
   description: string
   family: NetworkFamily
-  spec: NetworkSpec
+  spec: AnyNetworkSpec
 }
 
 // `network.json`, written next to `config.json` at the start of every run
@@ -344,7 +368,8 @@ export interface NetworkDoc {
 // weights.
 export interface NetworkSnapshot {
   family: NetworkFamily | null
-  spec: NetworkSpec | null
+  format?: 'trunk_heads_v1' | 'composite_v1'
+  spec: AnyNetworkSpec | null
   source: 'inline' | 'catalog' | 'default' | 'unknown'
   network_spec_id?: string | null
   algorithm_id?: string | null
@@ -358,6 +383,7 @@ export interface NetworkMeta {
   name: string
   description: string
   family: NetworkFamily
+  format?: 'trunk_heads_v1' | 'composite_v1'
   broken?: boolean
   error?: string
 }
@@ -365,11 +391,13 @@ export interface NetworkMeta {
 export interface NetworkFamilyInfo {
   id: NetworkFamily
   required_heads: string[]
+  format?: 'trunk_heads_v1' | 'composite_v1'
 }
 
 export interface NetworkPreviewRequest {
   family: NetworkFamily
-  spec: NetworkSpec
+  spec: AnyNetworkSpec
+  hyperparams?: Record<string, number>
   environment_id?: string | null
   wrappers?: WrapperNode[]
   game_id?: string | null
@@ -391,6 +419,10 @@ export interface NetworkPreviewResult {
   trunk_error_index: number | null
   heads: Record<string, NetworkHeadPreview>
   total_params: number | null
+  trainable_params?: number | null
+  output_shape?: number[]
+  components?: ArchitectureComponent[]
+  fixed_outputs?: Record<string, (number | string)[]>
 }
 
 export interface SpaceInfo {
@@ -518,6 +550,7 @@ export interface InspectEnvironment {
 export interface InspectNetwork {
   policy: string
   layers: string[]
+  architecture_components?: ArchitectureComponent[]
   total_params: number
   trainable_params: number
   input_shape: number[]
@@ -652,8 +685,10 @@ export interface MetricsSnapshot {
   hyperparams?: Record<string, number | string | boolean>
   policy?: string
   layers?: string[]
+  architecture_components?: ArchitectureComponent[]
   device?: string
   total_params?: number
+  trainable_params?: number
   seed?: number | null
   observation_space?: SpaceInfo
   action_space?: SpaceInfo
@@ -668,6 +703,29 @@ export interface MetricsSnapshot {
   // Set when this run was started via "Дообучить" (fine-tune/continue) from
   // a previous run or Model Zoo checkpoint — see `training.resume_from`.
   resumed_from?: ResumeFrom
+}
+
+export interface ArchitectureLayer {
+  path: string
+  type: string
+  detail: string
+  params: number
+  trainable_params: number
+}
+
+export interface ArchitectureComponent {
+  name: string
+  type: string
+  role: 'online' | 'target'
+  params: number
+  trainable_params: number
+  layers: ArchitectureLayer[]
+}
+
+export interface RunArchitecture {
+  components: ArchitectureComponent[]
+  total_params: number | null
+  trainable_params: number | null
 }
 
 export interface RunSummary {

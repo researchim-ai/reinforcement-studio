@@ -9,7 +9,13 @@ import { Badge } from '@/components/ui/badge'
 import { Tooltip } from '@/components/ui/tooltip'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
 import { QuickNetworkEditor } from '@/components/designer/QuickNetworkEditor'
-import { FAMILY_LABELS, defaultHiddenSizesForFamily, networkFamilyFor, requiredFamilyFor } from '@/lib/networkBuilder'
+import {
+  FAMILY_LABELS,
+  defaultHiddenSizesForFamily,
+  isCompositeFamily,
+  networkFamilyFor,
+  requiredFamilyFor,
+} from '@/lib/networkBuilder'
 import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
 import { useSettingsStore } from '@/stores/settingsStore'
 import type { AlgorithmSpec, NetworkMeta, WorldModelMeta } from '@/api/types'
@@ -82,6 +88,15 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
   const hasCustomNetwork = hasSavedNetwork || (quickFamily != null && data.quickHiddenLayers != null)
   const visibleHyperparams = selected?.hyperparams.filter((hp) => {
     if (hasCustomNetwork && (hp.key === 'memory_type' || hp.key.startsWith('memory_'))) return false
+    if (
+      hasSavedNetwork
+      && requiredFamily
+      && isCompositeFamily(requiredFamily)
+      && [
+        'latent_dim', 'hidden_dim', 'proj_dim', 'embed_dim', 'num_layers',
+        'num_heads', 'dropout', 'rotary_emb',
+      ].includes(hp.key)
+    ) return false
     if (hp.visibleWhen && !conditionsMatch(hp.visibleWhen, data.hyperparams)) return false
     return true
   })
@@ -149,7 +164,7 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
               <div className="space-y-1 border-t border-border pt-2">
                 <div className="flex items-baseline justify-between gap-2">
                   <Label className="text-[11px] text-muted-foreground">Архитектура сети</Label>
-                  <Link to="/network-builder" className="flex items-center gap-1 text-[10px] text-primary hover:underline">
+                  <Link to={`/network-builder?family=${requiredFamily}`} className="flex items-center gap-1 text-[10px] text-primary hover:underline">
                     <Network className="h-2.5 w-2.5" /> своя
                   </Link>
                 </div>
@@ -169,7 +184,9 @@ export const AlgorithmNode = memo(function AlgorithmNode({ data }: NodeProps & {
                 />
                 {hasCustomNetwork && (
                   <p className="text-[10px] italic text-muted-foreground">
-                    Своя архитектура не поддерживает встроенную память и NoisyNet. RND совместим, поскольку работает отдельно от Q-сети.
+                    {requiredFamily && isCompositeFamily(requiredFamily)
+                      ? 'Размерности и компоненты берутся из сохранённой composite-архитектуры; выходы автоматически согласованы со средой.'
+                      : 'Своя архитектура не поддерживает встроенную память и NoisyNet. RND совместим, поскольку работает отдельно от Q-сети.'}
                   </p>
                 )}
               </div>

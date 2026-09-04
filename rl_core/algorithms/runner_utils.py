@@ -21,7 +21,12 @@ from rl_core.algorithms.vec_env import action_space, is_vector_env, make_env_or_
 from rl_core.device import resolve_device
 from rl_core.envs.factory import is_shared_world_env_id, make_training_env
 from rl_core import scene_store
-from rl_core.inspect import _count_params, _describe_layers, _find_torch_module
+from rl_core.composite_netbuilder import COMPOSITE_FAMILIES, composite_spec_from_hyperparams
+from rl_core.inspect import (
+    _algorithm_architecture_summary,
+    _describe_layers,
+    _find_torch_module,
+)
 from rl_core.metrics_history import append_history, json_safe
 from rl_core.netbuilder_store import resolve_network_spec, write_network_snapshot
 from rl_core.world_models import store as wm_store
@@ -117,6 +122,12 @@ def run_custom_algorithm(
         hyperparams = {k: v for k, v in algo.hyperparams.items() if k not in ("network_spec", "world_model_spec")}
     else:
         algo = cls(train_env, construct_hyperparams, seed, device)
+    if network_spec is None and algo_label in COMPOSITE_FAMILIES:
+        # Persist a fully materialized editable schema even when the run
+        # used legacy scalar architecture knobs. This makes the exact
+        # default architecture saveable/reusable from Monitor and keeps
+        # network.json self-contained.
+        network_spec = composite_spec_from_hyperparams(algo_label, algo.hyperparams)
     write_network_snapshot(run_dir, config, network_spec)
     wm_store.write_world_model_snapshot(run_dir, world_model_spec)
 
@@ -154,8 +165,10 @@ def run_custom_algorithm(
     # module instead of a throwaway one.
     module = _find_torch_module(algo)
     if module is not None:
-        total_params, _ = _count_params(module)
-        static_info["total_params"] = total_params
+        architecture = _algorithm_architecture_summary(algo)
+        (run_dir / "architecture.json").write_text(json.dumps(architecture, indent=2))
+        static_info["total_params"] = architecture["total_params"]
+        static_info["trainable_params"] = architecture["trainable_params"]
         static_info["layers"] = _describe_layers(module)
 
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))

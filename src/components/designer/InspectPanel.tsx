@@ -115,7 +115,9 @@ export const InspectPanel = memo(function InspectPanel({ data, isFetching, scene
               network={{
                 policy: net.policy,
                 layers: net.layers,
+                components: net.architecture_components,
                 totalParams: net.total_params,
+                trainableParams: net.trainable_params,
                 inputShape: net.input_shape,
                 outputShape: net.output_shape,
                 channels: net.channels,

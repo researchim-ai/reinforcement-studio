@@ -138,6 +138,26 @@ async def get_checkpoint_network(name: str):
     default architecture."""
     path = CHECKPOINTS_DIR / f"{name}.network.json"
     snapshot = _read_json(path)
+    config = _read_json(CHECKPOINTS_DIR / f"{name}.config.json")
+    if config and (snapshot is None or not snapshot.get("spec")):
+        try:
+            from rl_core.composite_netbuilder import COMPOSITE_FAMILIES, composite_spec_from_hyperparams
+
+            algorithm = config.get("algorithm", {})
+            family = (snapshot or {}).get("family") or algorithm.get("id")
+            if family in COMPOSITE_FAMILIES:
+                snapshot = {
+                    **(snapshot or {}),
+                    "family": family,
+                    "format": "composite_v1",
+                    "spec": composite_spec_from_hyperparams(family, algorithm.get("hyperparams", {})),
+                    "source": (snapshot or {}).get("source", "default"),
+                    "algorithm_id": family,
+                    "environment_id": config.get("environment", {}).get("id"),
+                }
+                path.write_text(json.dumps(snapshot, indent=2))
+        except Exception:
+            pass
     return snapshot or {"family": None, "spec": None, "source": "unknown"}
 
 

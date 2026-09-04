@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import { ReactFlow, Background, Controls, type Node, type Edge } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { toast } from 'sonner'
@@ -17,14 +18,28 @@ import { useNodePositions } from '@/lib/useNodePositions'
 import { LayerNode, type LayerNodeData } from '@/components/networkbuilder/LayerNode'
 import { LabelNode, type LabelNodeData } from '@/components/networkbuilder/LabelNode'
 import { AddLayerNode, type AddLayerNodeData } from '@/components/networkbuilder/AddLayerNode'
+import { CompositeNetworkBuilder } from '@/components/networkbuilder/CompositeNetworkBuilder'
 import {
   FAMILY_LABELS,
   HEAD_LABELS,
   defaultLayer,
   defaultSpecForFamily,
+  defaultCompositeSpec,
+  isCompositeFamily,
+  isCompositeSpec,
   reconcileHeadsForFamily,
 } from '@/lib/networkBuilder'
-import type { NetworkFamily, NetworkHead, NetworkLayer, NetworkMeta, NetworkPreviewResult, NetworkSpec } from '@/api/types'
+import type {
+  AnyNetworkSpec,
+  CompositeNetworkSpec,
+  FlatNetworkFamily,
+  NetworkFamily,
+  NetworkHead,
+  NetworkLayer,
+  NetworkMeta,
+  NetworkPreviewResult,
+  NetworkSpec,
+} from '@/api/types'
 
 const nodeTypes = { layer: LayerNode, label: LabelNode, add: AddLayerNode }
 
@@ -201,6 +216,11 @@ function buildAddNodes(
 }
 
 export function NetworkBuilderPage() {
+  const [searchParams] = useSearchParams()
+  const requestedFamily = searchParams.get('family')
+  const initialFamily = (
+    requestedFamily && requestedFamily in FAMILY_LABELS ? requestedFamily : 'actor_critic'
+  ) as NetworkFamily
   const queryClient = useQueryClient()
   const { data: networksData } = useNetworks()
   const networks: NetworkMeta[] = networksData?.networks ?? []
@@ -212,13 +232,14 @@ export function NetworkBuilderPage() {
   const [description, setDescription] = useState('')
   const [family, setFamily] = useState<NetworkFamily>('actor_critic')
   const [spec, setSpec] = useState<NetworkSpec>(defaultSpecForFamily('actor_critic'))
+  const [compositeSpec, setCompositeSpec] = useState<CompositeNetworkSpec>(defaultCompositeSpec('efficientzero'))
   const [savedSnapshot, setSavedSnapshot] = useState('')
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  const [newDialogOpen, setNewDialogOpen] = useState(false)
+  const [newDialogOpen, setNewDialogOpen] = useState(!!requestedFamily)
   const [newSlug, setNewSlug] = useState('')
-  const [newFamily, setNewFamily] = useState<NetworkFamily>('actor_critic')
+  const [newFamily, setNewFamily] = useState<NetworkFamily>(initialFamily)
 
   const gymEnvs = useMemo(() => environments.filter((e) => e.kind === 'gym'), [environments])
   const gameEnvs = useMemo(() => environments.filter((e) => e.kind === 'alphazero'), [environments])
@@ -242,20 +263,22 @@ export function NetworkBuilderPage() {
         setName(doc.name)
         setDescription(doc.description)
         setFamily(doc.family)
-        setSpec(doc.spec)
+        if (isCompositeSpec(doc.spec)) setCompositeSpec(doc.spec)
+        else setSpec(doc.spec)
         setSavedSnapshot(JSON.stringify({ name: doc.name, description: doc.description, family: doc.family, spec: doc.spec }))
       })
       .catch((err) => toast.error(err instanceof Error ? err.message : 'Не удалось загрузить архитектуру'))
       .finally(() => setLoading(false))
   }, [selected])
 
-  const dirty = selected ? JSON.stringify({ name, description, family, spec }) !== savedSnapshot : false
+  const activeSpec: AnyNetworkSpec = isCompositeFamily(family) ? compositeSpec : spec
+  const dirty = selected ? JSON.stringify({ name, description, family, spec: activeSpec }) !== savedSnapshot : false
 
   const preview = useNetworkPreview(
     selected
       ? {
           family,
-          spec,
+          spec: activeSpec,
           environmentId: family === 'alphazero' ? null : previewEnvId,
           gameId: family === 'alphazero' ? previewGameId : null,
         }
@@ -275,7 +298,8 @@ export function NetworkBuilderPage() {
     setName(newSlug)
     setDescription('')
     setFamily(newFamily)
-    setSpec(defaultSpecForFamily(newFamily))
+    if (isCompositeFamily(newFamily)) setCompositeSpec(defaultCompositeSpec(newFamily))
+    else setSpec(defaultSpecForFamily(newFamily))
     setSavedSnapshot('')
     setNewDialogOpen(false)
   }, [newSlug, newFamily])
@@ -288,8 +312,8 @@ export function NetworkBuilderPage() {
     }
     setSaving(true)
     try {
-      await api.saveNetwork(selected.slug, { name: name || selected.slug, description, family, spec })
-      setSavedSnapshot(JSON.stringify({ name, description, family, spec }))
+      await api.saveNetwork(selected.slug, { name: name || selected.slug, description, family, spec: activeSpec })
+      setSavedSnapshot(JSON.stringify({ name, description, family, spec: activeSpec }))
       setSelected({ ...selected, isNew: false })
       await queryClient.invalidateQueries({ queryKey: ['networks'] })
       toast.success('Архитектура сохранена')
@@ -298,7 +322,7 @@ export function NetworkBuilderPage() {
     } finally {
       setSaving(false)
     }
-  }, [selected, name, description, family, spec, queryClient])
+  }, [selected, name, description, family, activeSpec, queryClient])
 
   const handleDelete = useCallback(async () => {
     if (!selected || selected.isNew) return
@@ -315,7 +339,11 @@ export function NetworkBuilderPage() {
 
   const handleFamilyChange = useCallback((next: NetworkFamily) => {
     setFamily(next)
-    setSpec((prev) => reconcileHeadsForFamily(prev, next))
+    if (isCompositeFamily(next)) {
+      setCompositeSpec((prev) => (prev.family === next ? prev : defaultCompositeSpec(next)))
+    } else {
+      setSpec((prev) => reconcileHeadsForFamily(prev, next as FlatNetworkFamily))
+    }
   }, [])
 
   const updateTrunkLayer = useCallback((i: number, layer: NetworkLayer) => {
@@ -381,9 +409,10 @@ export function NetworkBuilderPage() {
   }, [])
 
   const { applyPositions, onNodesChange, positions } = useNodePositions()
+  const flatPreviewResult = isCompositeFamily(family) ? undefined : previewResult
   const { nodes: rawNodes, edges } = useMemo(
     () =>
-      buildGraph(spec, previewResult, {
+      buildGraph(spec, flatPreviewResult, {
         updateTrunkLayer,
         removeTrunkLayer,
         moveTrunkLayer,
@@ -393,7 +422,7 @@ export function NetworkBuilderPage() {
         moveHeadLayer,
         addHeadLayer,
       }),
-    [spec, previewResult, updateTrunkLayer, removeTrunkLayer, moveTrunkLayer, addTrunkLayer, updateHeadLayer, removeHeadLayer, moveHeadLayer, addHeadLayer],
+    [spec, flatPreviewResult, updateTrunkLayer, removeTrunkLayer, moveTrunkLayer, addTrunkLayer, updateHeadLayer, removeHeadLayer, moveHeadLayer, addHeadLayer],
   )
   const addNodes = useMemo(
     () => buildAddNodes(spec, positions, { addTrunkLayer, addHeadLayer }),
@@ -520,20 +549,24 @@ export function NetworkBuilderPage() {
             </div>
 
             <div className="min-h-0 flex-1">
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={nodeTypes}
-                onNodesChange={onNodesChange}
-                nodesConnectable={false}
-                elementsSelectable={false}
-                fitView
-                fitViewOptions={{ padding: 0.3 }}
-                proOptions={{ hideAttribution: true }}
-              >
-                <Background />
-                <Controls showInteractive={false} />
-              </ReactFlow>
+              {isCompositeFamily(family) ? (
+                <CompositeNetworkBuilder spec={compositeSpec} preview={previewResult} onChange={setCompositeSpec} />
+              ) : (
+                <ReactFlow
+                  nodes={nodes}
+                  edges={edges}
+                  nodeTypes={nodeTypes}
+                  onNodesChange={onNodesChange}
+                  nodesConnectable={false}
+                  elementsSelectable={false}
+                  fitView
+                  fitViewOptions={{ padding: 0.3 }}
+                  proOptions={{ hideAttribution: true }}
+                >
+                  <Background />
+                  <Controls showInteractive={false} />
+                </ReactFlow>
+              )}
             </div>
           </>
         )}

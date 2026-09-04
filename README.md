@@ -427,6 +427,9 @@ wrapper'ов появляется автоматически, отдельной
 | `q_network` | `q` | DQN |
 | `dueling_q` | `advantage`, `value` | Rainbow DQN |
 | `alphazero` | `policy`, `value` | AlphaZero |
+| `efficientzero` | typed representation, dynamics, prediction, SimSiam | EfficientZero |
+| `unizero` | typed tokenizer, Transformer, reward/value/policy/latent heads | UniZero |
+| `researchimzero` | UniZero-style Transformer + typed SimSiam components | ResearchImZero |
 
 Последний слой каждой головы — «авто»: его размер (число действий,
 `action_size`, `1` для value) подставляется самим движком, а не руками,
@@ -444,10 +447,23 @@ wrapper'ов появляется автоматически, отдельной
 или головы через «+» — не только в конец (см. `useNodePositions` в
 `src/lib/useNodePositions.ts`, используется и здесь, и в Дизайнере).
 
+Для трёх Zero-family алгоритмов та же страница автоматически переключается
+в **component mode**: алгоритмически обязательные связи, Gumbel/PUCT search,
+value-prefix LSTM, interleaved token protocol, KV-cache и размеры конечных
+голов защищены от изменения, а observation encoder, latent/embed-размеры,
+безопасные MLP-компоненты и Transformer depth/heads/FFN доступны для
+настройки. Вход всегда берётся из реального observation space: `auto`
+выбирает проверенный CNN/MLP, `image_cnn` и `vector_mlp` проверяют
+совместимость, а custom chain обязан закончиться плоским вектором. Выходы
+policy/value/reward/latent автоматически вычисляются по action space и
+categorical support. Preview собирает те же классы, что реальный trainer,
+поэтому валидная схема не расходится с runtime.
+
 Архитектуры хранятся как чистый JSON (`ROOT/custom_networks/<slug>.json`,
 без исполнения кода — в отличие от плагинов выше) и подключаются в узле
 алгоритма в Дизайнере (селектор «Архитектура сети», виден только для
-`ppo`/`a2c`/`dqn`/`rainbow_dqn`/`alphazero` — кастомные плагины сами решают,
+`ppo`/`a2c`/`dqn`/`rainbow_dqn`/`alphazero`/`efficientzero`/`unizero`/
+`researchimzero` — кастомные плагины сами решают,
 учитывать её или нет). Технически это просто ещё одно поле конфига
 эксперимента (`algorithm.network_spec_id`) — раннер резолвит его в спек
 (`rl_core/netbuilder_store.py::resolve_network_spec`) и подставляет

@@ -16,7 +16,15 @@ import { AddNode, type AddNodeData } from '@/components/flow/AddNode'
 import { SweepDialog } from '@/components/designer/SweepDialog'
 import { useNodePositions } from '@/lib/useNodePositions'
 import { requiredFamilyFor, quickSpecForFamily } from '@/lib/networkBuilder'
-import type { AlgorithmSpec, EnvKind, EnvSpec, NetworkSpec, ResumeFrom, WrapperNode as WrapperNodeSpec } from '@/api/types'
+import type {
+  AlgorithmSpec,
+  AnyNetworkSpec,
+  EnvKind,
+  EnvSpec,
+  NetworkSpec,
+  ResumeFrom,
+  WrapperNode as WrapperNodeSpec,
+} from '@/api/types'
 
 /** Algorithm hyperparam defaults, with the selected env's overrides (if any)
  * layered on top — e.g. Gomoku ships a much bigger MCTS/network budget than
@@ -86,7 +94,7 @@ export function ExperimentDesigner() {
   // catalog machinery entirely since it must match exactly.
   const [resumeFrom, setResumeFrom] = useState<ResumeFrom | null>(null)
   const [resumeApplied, setResumeApplied] = useState(false)
-  const [resumeNetworkSpec, setResumeNetworkSpec] = useState<NetworkSpec | null>(null)
+  const [resumeNetworkSpec, setResumeNetworkSpec] = useState<AnyNetworkSpec | null>(null)
   const resumePending = (!!resumeRunId || !!resumeCheckpointName) && !resumeApplied
   const { data: resumeRunConfig } = useRunConfig(resumeRunId ?? undefined)
   const { data: resumeCheckpointConfig } = useCheckpointConfig(resumeCheckpointName ?? undefined)

@@ -165,6 +165,12 @@ from rl_core.algorithms.vec_env import (
     vec_reset,
     vec_step,
 )
+from rl_core.composite_netbuilder import (
+    build_component_mlp,
+    build_composite_encoder,
+    dimensions_from_spec,
+    validate_composite_spec,
+)
 from rl_core.world_models.nets import ObsEncoder
 
 DEFAULT_HYPERPARAMS = {
@@ -226,10 +232,17 @@ class _Representation(nn.Module):
     head down to the (much smaller) latent size the dynamics/prediction
     nets actually plan in."""
 
-    def __init__(self, observation_space: gym.Space, latent_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self, observation_space: gym.Space, latent_dim: int, hidden_dim: int,
+        encoder: nn.Module | None = None, component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.encoder = ObsEncoder(observation_space)
-        self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, latent_dim))
+        self.encoder = encoder or ObsEncoder(observation_space)
+        self.head = (
+            build_component_mlp(self.encoder.out_dim, latent_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, latent_dim))
+        )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.head(self.encoder(obs)))
@@ -246,13 +259,20 @@ class _Dynamics(nn.Module):
     is a *cumulative* sum from wherever that reset happened, not a
     standalone per-step reward."""
 
-    def __init__(self, latent_dim: int, action_dim: int, hidden_dim: int, support_size: int) -> None:
+    def __init__(
+        self, latent_dim: int, action_dim: int, hidden_dim: int, support_size: int,
+        component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.support_size = support_size
         self.state_encoder = nn.Linear(latent_dim, hidden_dim)
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
-        self.trunk = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ELU())
+        self.trunk = (
+            build_component_mlp(hidden_dim * 2, hidden_dim, component_config, final_activation=nn.ELU())
+            if component_config is not None
+            else nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ELU())
+        )
         self.next_latent_head = nn.Linear(hidden_dim, latent_dim)
         self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
         self.value_prefix_head = nn.Linear(hidden_dim, 2 * support_size + 1)
@@ -283,11 +303,18 @@ class _Prediction(nn.Module):
     actions get a diagonal Gaussian, exactly like `dreamer.py`'s `_Actor`
     (same tanh-squash-and-rescale-to-bounds convention)."""
 
-    def __init__(self, latent_dim: int, action_space: gym.Space, hidden_dim: int, support_size: int) -> None:
+    def __init__(
+        self, latent_dim: int, action_space: gym.Space, hidden_dim: int, support_size: int,
+        component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.discrete = isinstance(action_space, gym.spaces.Discrete)
         self.support_size = support_size
-        self.trunk = nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.ELU())
+        self.trunk = (
+            build_component_mlp(latent_dim, hidden_dim, component_config, final_activation=nn.ELU())
+            if component_config is not None
+            else nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.ELU())
+        )
         self.value_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         if self.discrete:
             self.action_dim = int(action_space.n)
@@ -332,10 +359,16 @@ class _Projector(nn.Module):
     unit variance *per feature, across the batch*) instead of letting the
     optimizer collapse them all together."""
 
-    def __init__(self, latent_dim: int, proj_dim: int) -> None:
+    def __init__(
+        self, latent_dim: int, proj_dim: int, component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        self.net = (
+            build_component_mlp(latent_dim, proj_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(
+                nn.Linear(latent_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+            )
         )
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
@@ -348,10 +381,14 @@ class _Predictor(nn.Module):
     (asymmetry), with the same anti-collapse `BatchNorm1d` as `_Projector`
     on its hidden layer - see that class's docstring."""
 
-    def __init__(self, proj_dim: int) -> None:
+    def __init__(self, proj_dim: int, component_config: dict[str, Any] | None = None) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        self.net = (
+            build_component_mlp(proj_dim, proj_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(
+                nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+            )
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -902,17 +939,38 @@ class NativeEfficientZero(CustomAlgorithm):
         self.discrete = isinstance(self._action_space, gym.spaces.Discrete)
         self.n_actions = int(self._action_space.n) if self.discrete else None
 
-        latent_dim = int(hyperparams.get("latent_dim", 64))
-        hidden_dim = int(hyperparams.get("hidden_dim", 128))
-        proj_dim = int(hyperparams.get("proj_dim", 64))
+        network_spec = hyperparams.get("network_spec")
+        if network_spec is not None:
+            network_spec = validate_composite_spec(network_spec, "efficientzero")
+            self.hyperparams["network_spec"] = network_spec
+        dimensions = dimensions_from_spec(
+            network_spec,
+            "efficientzero",
+            {
+                "latent_dim": int(hyperparams.get("latent_dim", 64)),
+                "hidden_dim": int(hyperparams.get("hidden_dim", 128)),
+                "proj_dim": int(hyperparams.get("proj_dim", 64)),
+            },
+        )
+        latent_dim = int(dimensions["latent_dim"])
+        hidden_dim = int(dimensions["hidden_dim"])
+        proj_dim = int(dimensions["proj_dim"])
         self.action_dim = obs_flat_dim(self._action_space)
 
         self.support_size = max(1, int(hyperparams.get("value_support_size", 300)))
-        self.representation = _Representation(self._obs_space, latent_dim, hidden_dim).to(device)
-        self.dynamics = _Dynamics(latent_dim, self.action_dim, hidden_dim, self.support_size).to(device)
-        self.prediction = _Prediction(latent_dim, self._action_space, hidden_dim, self.support_size).to(device)
-        self.projector = _Projector(latent_dim, proj_dim).to(device)
-        self.predictor = _Predictor(proj_dim).to(device)
+        components = network_spec["components"] if network_spec is not None else {}
+        encoder = build_composite_encoder(self._obs_space, network_spec) if network_spec is not None else None
+        self.representation = _Representation(
+            self._obs_space, latent_dim, hidden_dim, encoder, components.get("representation"),
+        ).to(device)
+        self.dynamics = _Dynamics(
+            latent_dim, self.action_dim, hidden_dim, self.support_size, components.get("dynamics"),
+        ).to(device)
+        self.prediction = _Prediction(
+            latent_dim, self._action_space, hidden_dim, self.support_size, components.get("prediction"),
+        ).to(device)
+        self.projector = _Projector(latent_dim, proj_dim, components.get("projector")).to(device)
+        self.predictor = _Predictor(proj_dim, components.get("predictor")).to(device)
         self._params = (
             list(self.representation.parameters()) + list(self.dynamics.parameters())
             + list(self.prediction.parameters()) + list(self.projector.parameters())

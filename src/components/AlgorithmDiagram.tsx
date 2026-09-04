@@ -4,6 +4,7 @@ import {
   Target, TrendingUp, Eye, Layers, History, Sparkles, Users,
 } from 'lucide-react'
 import { cn, formatNumber } from '@/lib/utils'
+import type { ArchitectureComponent } from '@/api/types'
 
 type HpValue = number | string | boolean
 type Hyperparams = Record<string, HpValue> | undefined
@@ -386,7 +387,9 @@ function LoopDiagram({ algorithmId, kind, hyperparams }: { algorithmId: string; 
 export interface AlgorithmDiagramNetwork {
   policy?: string
   layers?: string[]
+  components?: ArchitectureComponent[]
   totalParams?: number
+  trainableParams?: number
   inputShape?: number[] | null
   outputShape?: number[] | null
   channels?: number
@@ -424,7 +427,61 @@ function LayerChip({ layer }: { layer: string }) {
   )
 }
 
-const MAX_LAYER_CHIPS = 8
+function componentLabel(name: string): string {
+  const labels: Record<string, string> = {
+    representation: 'Representation / encoder',
+    dynamics: 'Dynamics model',
+    prediction: 'Prediction heads',
+    tokenizer: 'Observation tokenizer',
+    action_embed: 'Action embedding',
+    transformer: 'Causal Transformer',
+    heads: 'Reward · Value · Policy heads',
+    projector: 'SimSiam projector',
+    predictor: 'SimSiam predictor',
+    target_tokenizer: 'EMA observation tokenizer',
+    target_transformer: 'EMA Causal Transformer',
+    target_heads: 'EMA target heads',
+    direct_parameters: 'Отдельные обучаемые параметры',
+  }
+  return labels[name] ?? name.replaceAll('_', ' ')
+}
+
+function ArchitectureComponentCard({ component }: { component: ArchitectureComponent }) {
+  return (
+    <div className={cn(
+      'min-w-0 rounded-lg border bg-background/50',
+      component.role === 'target' && 'border-dashed bg-muted/20',
+    )}>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-border/70 px-3 py-2">
+        <span className="text-xs font-semibold">{componentLabel(component.name)}</span>
+        <span className="font-mono text-[9px] text-muted-foreground">{component.type}</span>
+        {component.role === 'target' && (
+          <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">TARGET / EMA</span>
+        )}
+        <span className="ml-auto font-mono text-[9px] text-muted-foreground">
+          {formatNumber(component.params)} параметров
+          {component.trainable_params !== component.params && ` · ${formatNumber(component.trainable_params)} обучаемых`}
+        </span>
+      </div>
+      {component.layers.length > 0 ? (
+        <div className="divide-y divide-border/40">
+          {component.layers.map((layer, index) => (
+            <div key={`${layer.path}-${index}`} className="grid grid-cols-[minmax(8rem,1.25fr)_minmax(7rem,1fr)_auto] items-center gap-2 px-3 py-1.5 text-[10px]">
+              <span className="truncate font-mono text-muted-foreground" title={layer.path}>{layer.path}</span>
+              <span className="min-w-0">
+                <span className="font-medium">{layer.type}</span>
+                {layer.detail && <span className="ml-1.5 font-mono text-[9px] text-muted-foreground">{layer.detail}</span>}
+              </span>
+              <span className="font-mono text-[9px] text-muted-foreground">{formatNumber(layer.params)}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="px-3 py-2 text-[10px] text-muted-foreground">Нет вложенных слоёв с параметрами</div>
+      )}
+    </div>
+  )
+}
 
 function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null }) {
   if (!network) {
@@ -432,12 +489,22 @@ function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null 
   }
 
   const isBoardNet = network.channels != null && network.numBlocks != null
-  const shownLayers = network.layers?.slice(0, MAX_LAYER_CHIPS) ?? []
-  const hiddenCount = (network.layers?.length ?? 0) - shownLayers.length
+  const shownLayers = network.layers ?? []
+  const hasComponents = (network.components?.length ?? 0) > 0
 
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-1.5">
+      {hasComponents ? (
+        <div className="space-y-2">
+          <ShapeChip label="Вход среды" shape={network.inputShape} />
+          <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+            {network.components!.map((component, index) => (
+              <ArchitectureComponentCard key={`${component.name}-${index}`} component={component} />
+            ))}
+          </div>
+          <ShapeChip label="Действие среды" shape={network.outputShape} />
+        </div>
+      ) : <div className="flex flex-wrap items-center gap-1.5">
         {isBoardNet ? (
           <>
             <ShapeChip label="Вход (доска)" shape={[network.inputPlanes ?? 3, network.rows ?? 0, network.cols ?? 0]} />
@@ -461,20 +528,18 @@ function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null 
                 {i < shownLayers.length - 1 && <StepArrow />}
               </Fragment>
             ))}
-            {hiddenCount > 0 && (
-              <div className="flex w-16 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-background/40 py-1.5 text-[10px] text-muted-foreground">
-                +{hiddenCount}
-              </div>
-            )}
             <StepArrow />
             <ShapeChip label="Выход" shape={network.outputShape} />
           </>
         )}
-      </div>
+      </div>}
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
         {network.policy && <span>Policy: <span className="font-mono text-foreground/80">{network.policy}</span></span>}
         {network.totalParams != null && (
-          <span>Параметры: <span className="font-mono text-foreground/80">{formatNumber(network.totalParams)}</span></span>
+          <span>Всего параметров: <span className="font-mono text-foreground/80">{formatNumber(network.totalParams)}</span></span>
+        )}
+        {network.trainableParams != null && (
+          <span>Обучаемых: <span className="font-mono text-foreground/80">{formatNumber(network.trainableParams)}</span></span>
         )}
         {network.note && <span className="italic">{network.note}</span>}
       </div>

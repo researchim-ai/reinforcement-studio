@@ -281,6 +281,12 @@ from rl_core.algorithms.vec_env import (
     vec_reset,
     vec_step,
 )
+from rl_core.composite_netbuilder import (
+    build_component_mlp,
+    build_composite_encoder,
+    dimensions_from_spec,
+    validate_composite_spec,
+)
 from rl_core.world_models.nets import ObsEncoder
 
 DEFAULT_HYPERPARAMS = {
@@ -434,10 +440,17 @@ class _Tokenizer(nn.Module):
     auto-detecting feature extractor every world model family in this app
     shares (`rl_core/world_models/nets.py::ObsEncoder`)."""
 
-    def __init__(self, observation_space: gym.Space, embed_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self, observation_space: gym.Space, embed_dim: int, hidden_dim: int,
+        encoder: nn.Module | None = None, component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.encoder = ObsEncoder(observation_space)
-        self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, embed_dim))
+        self.encoder = encoder or ObsEncoder(observation_space)
+        self.head = (
+            build_component_mlp(self.encoder.out_dim, embed_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, embed_dim))
+        )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.head(self.encoder(obs)))
@@ -805,13 +818,17 @@ class _CausalSelfAttention(nn.Module):
 
 
 class _TransformerBlock(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float, rotary_emb: bool = True) -> None:
+    def __init__(
+        self, embed_dim: int, num_heads: int, dropout: float, rotary_emb: bool = True,
+        ffn_multiplier: int = 4,
+    ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.attn = _CausalSelfAttention(embed_dim, num_heads, dropout, rotary_emb)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Linear(4 * embed_dim, embed_dim), nn.Dropout(dropout),
+            nn.Linear(embed_dim, ffn_multiplier * embed_dim), nn.GELU(),
+            nn.Linear(ffn_multiplier * embed_dim, embed_dim), nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor, attend_mask: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -859,7 +876,7 @@ def _build_attend_mask(pad_mask: torch.Tensor) -> torch.Tensor:
 class _CausalTransformer(nn.Module):
     def __init__(
         self, embed_dim: int, num_layers: int, num_heads: int, dropout: float,
-        rotary_emb: bool = True, max_positions: int = 4096,
+        rotary_emb: bool = True, max_positions: int = 4096, ffn_multiplier: int = 4,
     ) -> None:
         super().__init__()
         head_dim = embed_dim // num_heads
@@ -870,7 +887,10 @@ class _CausalTransformer(nn.Module):
         self.max_positions = max_positions
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [_TransformerBlock(embed_dim, num_heads, dropout, rotary_emb) for _ in range(num_layers)],
+            [
+                _TransformerBlock(embed_dim, num_heads, dropout, rotary_emb, ffn_multiplier)
+                for _ in range(num_layers)
+            ],
         )
         self.ln_out = nn.LayerNorm(embed_dim)
         # Learned absolute position embedding - only built/used when RoPE
@@ -969,11 +989,18 @@ class _CausalTransformer(nn.Module):
 # docstring's "Head placement" bullet).
 # ----------------------------------------------------------------------
 class _Heads(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, action_space: gym.Space, support_size: int) -> None:
+    def __init__(
+        self, embed_dim: int, hidden_dim: int, action_space: gym.Space, support_size: int,
+        component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.discrete = isinstance(action_space, gym.spaces.Discrete)
         self.support_size = support_size
-        self.trunk = nn.Sequential(nn.Linear(embed_dim, hidden_dim), nn.ELU())
+        self.trunk = (
+            build_component_mlp(embed_dim, hidden_dim, component_config, final_activation=nn.ELU())
+            if component_config is not None
+            else nn.Sequential(nn.Linear(embed_dim, hidden_dim), nn.ELU())
+        )
         self.value_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         self.reward_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         # Predicted *raw* next-token embedding - fed straight back in as
@@ -1389,10 +1416,27 @@ class NativeUniZero(CustomAlgorithm):
         self.n_actions = int(self._action_space.n) if self.discrete else None
         self.action_dim = obs_flat_dim(self._action_space)
 
-        self.embed_dim = int(hyperparams.get("embed_dim", 128))
-        num_layers = max(1, int(hyperparams.get("num_layers", 2)))
-        num_heads = max(1, int(hyperparams.get("num_heads", 8)))
-        dropout = float(hyperparams.get("dropout", 0.1))
+        network_spec = hyperparams.get("network_spec")
+        if network_spec is not None:
+            network_spec = validate_composite_spec(network_spec, "unizero")
+            self.hyperparams["network_spec"] = network_spec
+        dimensions = dimensions_from_spec(
+            network_spec,
+            "unizero",
+            {
+                "embed_dim": int(hyperparams.get("embed_dim", 128)),
+                "num_layers": max(1, int(hyperparams.get("num_layers", 2))),
+                "num_heads": max(1, int(hyperparams.get("num_heads", 8))),
+                "ffn_multiplier": 4,
+                "dropout": float(hyperparams.get("dropout", 0.1)),
+                "rotary_emb": int(hyperparams.get("rotary_emb", 1)),
+            },
+        )
+        self.embed_dim = int(dimensions["embed_dim"])
+        num_layers = int(dimensions["num_layers"])
+        num_heads = int(dimensions["num_heads"])
+        ffn_multiplier = int(dimensions["ffn_multiplier"])
+        dropout = float(dimensions["dropout"])
         self.context_length = max(0, int(hyperparams.get("context_length", 6)))
         self.unroll_steps = max(1, int(hyperparams.get("unroll_steps", 10)))
         self.support_size = max(1, int(hyperparams.get("value_support_size", 50)))
@@ -1402,14 +1446,22 @@ class NativeUniZero(CustomAlgorithm):
         # `1` (default): RoPE. `0`: reference's own actual default, a
         # learned absolute embedding - module docstring's "Positional
         # encoding toggle" section.
-        self.rotary_emb = bool(int(hyperparams.get("rotary_emb", 1)))
+        self.rotary_emb = bool(int(dimensions["rotary_emb"]))
 
-        self.tokenizer = _Tokenizer(self._obs_space, self.embed_dim, 2 * self.embed_dim).to(device)
+        components = network_spec["components"] if network_spec is not None else {}
+        encoder = build_composite_encoder(self._obs_space, network_spec) if network_spec is not None else None
+        self.tokenizer = _Tokenizer(
+            self._obs_space, self.embed_dim, 2 * self.embed_dim, encoder, components.get("tokenizer"),
+        ).to(device)
         self.action_embed = _ActionEmbed(self.action_dim, self.embed_dim, self.discrete).to(device)
         self.transformer = _CausalTransformer(
-            self.embed_dim, num_layers, num_heads, dropout, rotary_emb=self.rotary_emb,
+            self.embed_dim, num_layers, num_heads, dropout,
+            rotary_emb=self.rotary_emb, ffn_multiplier=ffn_multiplier,
         ).to(device)
-        self.heads = _Heads(self.embed_dim, 2 * self.embed_dim, self._action_space, self.support_size).to(device)
+        self.heads = _Heads(
+            self.embed_dim, 2 * self.embed_dim, self._action_space,
+            self.support_size, components.get("heads"),
+        ).to(device)
         self._params = (
             list(self.tokenizer.parameters()) + list(self.action_embed.parameters())
             + list(self.transformer.parameters()) + list(self.heads.parameters())

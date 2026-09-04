@@ -81,8 +81,6 @@ def _run_summary(run_id: str) -> dict[str, Any] | None:
 @router.post("/start")
 async def start_run(req: StartRunRequest):
     run_id = f"{req.environment.get('id', 'run').lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
-    rdir = run_dir(run_id)
-
     config = {
         "run_id": run_id,
         "kind": req.kind,
@@ -92,6 +90,30 @@ async def start_run(req: StartRunRequest):
         "training": req.training,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Fail before spawning a worker (and before creating a run directory)
+    # when a typed composite architecture cannot satisfy this exact
+    # environment's tensor contract.
+    try:
+        from rl_core.composite_netbuilder import is_composite_spec
+        from rl_core.netbuilder_store import resolve_network_spec
+
+        resolved_spec = resolve_network_spec(config)
+        if is_composite_spec(resolved_spec):
+            from rl_core.inspect import inspect_gym
+
+            algorithm = config["algorithm"]
+            inspected = inspect_gym(
+                config["environment"]["id"],
+                config["environment"].get("wrappers", []),
+                algorithm["id"],
+                {**algorithm.get("hyperparams", {}), "network_spec": resolved_spec},
+            )
+            if inspected.get("error") or inspected.get("network") is None:
+                raise ValueError(inspected.get("error") or "Composite architecture is invalid")
+    except Exception as exc:  # noqa: BLE001 - malformed user architecture
+        raise HTTPException(status_code=400, detail=f"Некорректная архитектура сети: {exc}") from exc
+
+    rdir = run_dir(run_id)
     config_path = rdir / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
 
@@ -221,7 +243,92 @@ async def get_run_network(run_id: str):
     if not rdir.exists():
         raise HTTPException(status_code=404, detail="Run not found")
     snapshot = read_network_snapshot(rdir)
+    config_path = rdir / "config.json"
+    if config_path.is_file() and (snapshot is None or not snapshot.get("spec")):
+        try:
+            from rl_core.composite_netbuilder import COMPOSITE_FAMILIES, composite_spec_from_hyperparams
+
+            config = json.loads(config_path.read_text())
+            algorithm = config.get("algorithm", {})
+            family = (snapshot or {}).get("family") or algorithm.get("id")
+            if family in COMPOSITE_FAMILIES:
+                snapshot = {
+                    **(snapshot or {}),
+                    "family": family,
+                    "format": "composite_v1",
+                    "spec": composite_spec_from_hyperparams(family, algorithm.get("hyperparams", {})),
+                    "source": (snapshot or {}).get("source", "default"),
+                    "algorithm_id": family,
+                    "environment_id": config.get("environment", {}).get("id"),
+                }
+                (rdir / "network.json").write_text(json.dumps(snapshot, indent=2))
+        except Exception:
+            pass  # Legacy/broken run: preserve the historical snapshot.
     return snapshot or {"family": None, "spec": None, "source": "unknown"}
+
+
+@router.get("/runs/{run_id}/architecture")
+async def get_run_architecture(run_id: str):
+    """Full, runtime-introspected compound torch architecture.
+
+    Stored once in `architecture.json`; keeping it out of periodic metric
+    snapshots avoids duplicating a potentially large Transformer module
+    tree throughout `metrics_history.jsonl`.
+    """
+    rdir = RUNS_DIR / run_id
+    if not rdir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    path = rdir / "architecture.json"
+    if not path.is_file():
+        # Backfill runs created before architecture snapshots existed.
+        # Native model architecture is deterministic from config, so this
+        # yields the same component tree without loading checkpoint weights.
+        config_path = rdir / "config.json"
+        if not config_path.is_file():
+            return {"components": [], "total_params": None, "trainable_params": None}
+        try:
+            config = json.loads(config_path.read_text())
+            algorithm = config.get("algorithm", {})
+            inspect_hyperparams = dict(algorithm.get("hyperparams", {}))
+            network_snapshot = read_network_snapshot(rdir)
+            resolved_spec = (
+                (network_snapshot or {}).get("spec")
+                or algorithm.get("network_spec")
+            )
+            if resolved_spec:
+                inspect_hyperparams["network_spec"] = resolved_spec
+            if config.get("kind") == "alphazero":
+                from rl_core.inspect import inspect_alphazero
+
+                inspected = inspect_alphazero(
+                    config["environment"]["id"],
+                    algorithm.get("id", "alphazero"),
+                    inspect_hyperparams,
+                )
+            else:
+                from rl_core.inspect import inspect_gym
+
+                inspected = inspect_gym(
+                    config["environment"]["id"],
+                    config["environment"].get("wrappers", []),
+                    algorithm.get("id", "ppo"),
+                    inspect_hyperparams,
+                )
+            network = inspected.get("network") or {}
+            snapshot = {
+                "components": network.get("architecture_components", []),
+                "total_params": network.get("total_params"),
+                "trainable_params": network.get("trainable_params"),
+            }
+            if snapshot["components"]:
+                path.write_text(json.dumps(snapshot, indent=2))
+            return snapshot
+        except Exception:  # noqa: BLE001 - old/broken runs retain compact fallback
+            return {"components": [], "total_params": None, "trainable_params": None}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid architecture snapshot: {exc}") from exc
 
 
 @router.get("/runs/{run_id}/world_model")

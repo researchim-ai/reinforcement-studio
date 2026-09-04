@@ -12,11 +12,15 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from rl_core import netbuilder_store as store
+from rl_core.composite_netbuilder import COMPOSITE_FAMILIES, validate_composite_spec
 from rl_core.netbuilder import FAMILY_HEADS, preview_network
 
 router = APIRouter()
 
-NetworkFamily = Literal["actor_critic", "q_network", "dueling_q", "alphazero"]
+NetworkFamily = Literal[
+    "actor_critic", "q_network", "dueling_q", "alphazero",
+    "efficientzero", "unizero", "researchimzero",
+]
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -33,6 +37,7 @@ class PreviewRequest(BaseModel):
     environment_id: str | None = None
     wrappers: list[dict[str, Any]] = []
     game_id: str | None = None
+    hyperparams: dict[str, Any] = {}
 
 
 def _check_slug(slug: str) -> None:
@@ -45,7 +50,9 @@ def _check_slug(slug: str) -> None:
 
 @router.get("/families")
 async def list_families():
-    return {"families": [{"id": name, "required_heads": list(heads)} for name, heads in FAMILY_HEADS.items()]}
+    flat = [{"id": name, "required_heads": list(heads), "format": "trunk_heads_v1"} for name, heads in FAMILY_HEADS.items()]
+    composite = [{"id": name, "required_heads": [], "format": "composite_v1"} for name in COMPOSITE_FAMILIES]
+    return {"families": flat + composite}
 
 
 @router.get("")
@@ -64,7 +71,17 @@ async def get_network(slug: str):
 @router.put("/{slug}")
 async def save_network(slug: str, body: NetworkDoc):
     _check_slug(slug)
-    store.save(slug, body.model_dump())
+    doc = body.model_dump()
+    try:
+        if body.family in COMPOSITE_FAMILIES:
+            doc["spec"] = validate_composite_spec(body.spec, body.family)
+        elif body.spec.get("format") == "composite_v1":
+            raise HTTPException(status_code=400, detail="Composite-spec несовместим с flat network family")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - validation error is user input
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    store.save(slug, doc)
     return {"success": True}
 
 
@@ -114,6 +131,37 @@ async def preview(req: PreviewRequest):
     (missing Flatten, oversized Conv2d kernel, ...) come back as a plain
     message rather than a traceback."""
     try:
+        if req.family in COMPOSITE_FAMILIES:
+            if not req.environment_id:
+                raise HTTPException(status_code=400, detail="environment_id обязателен для composite-сети")
+            spec = validate_composite_spec(req.spec, req.family)
+            from rl_core.inspect import inspect_gym
+
+            inspected = inspect_gym(
+                req.environment_id,
+                req.wrappers,
+                req.family,
+                {**req.hyperparams, "network_spec": spec},
+            )
+            network = inspected.get("network")
+            if network is None:
+                return {
+                    "ok": False,
+                    "error": inspected.get("error") or "Не удалось собрать composite-архитектуру",
+                    "components": [],
+                    "total_params": None,
+                    "trainable_params": None,
+                }
+            return {
+                "ok": True,
+                "error": None,
+                "input_shape": network.get("input_shape"),
+                "output_shape": network.get("output_shape"),
+                "components": network.get("architecture_components", []),
+                "total_params": network.get("total_params"),
+                "trainable_params": network.get("trainable_params"),
+                "fixed_outputs": _composite_fixed_outputs(req.environment_id, req.wrappers, req.family, req.hyperparams),
+            }
         if req.family == "alphazero":
             if not req.game_id:
                 raise HTTPException(status_code=400, detail="game_id обязателен для family=alphazero")
@@ -136,3 +184,26 @@ async def preview(req: PreviewRequest):
         }
 
     return preview_network(req.spec, input_shape, req.family, head_out_features=head_out_features)
+
+
+def _composite_fixed_outputs(
+    environment_id: str, wrappers: list[dict[str, Any]], family: str, hyperparams: dict[str, Any],
+) -> dict[str, list[int | str]]:
+    import gymnasium as gym
+    import numpy as np
+
+    from rl_core.algorithms.sb3_runner import _make_env
+
+    env = _make_env(environment_id, wrappers)
+    try:
+        action_space = env.action_space
+        action_dim = int(action_space.n) if isinstance(action_space, gym.spaces.Discrete) else int(np.prod(action_space.shape))
+        support = max(1, int(hyperparams.get("value_support_size", 300 if family != "unizero" else 50)))
+        outputs = {"policy": [action_dim], "value": [2 * support + 1]}
+        if family == "efficientzero":
+            outputs.update({"value_prefix": [2 * support + 1], "next_latent": ["latent_dim"]})
+        else:
+            outputs.update({"reward": [2 * support + 1], "next_token": ["embed_dim"]})
+        return outputs
+    finally:
+        env.close()

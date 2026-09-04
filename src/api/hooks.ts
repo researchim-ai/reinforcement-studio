@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { api } from './client'
-import type { EnvKind, NetworkFamily, NetworkSpec, PluginKind, WrapperNode } from './types'
+import type { AnyNetworkSpec, EnvKind, NetworkFamily, PluginKind, WrapperNode } from './types'
 
 export function useEnvironments() {
   return useQuery({ queryKey: ['environments'], queryFn: api.listEnvironments })
@@ -40,6 +40,15 @@ export function useRunNetwork(runId: string | undefined) {
   return useQuery({
     queryKey: ['run-network', runId],
     queryFn: () => api.getRunNetwork(runId as string),
+    enabled: !!runId,
+  })
+}
+
+/** Full compound torch module tree captured once from the live algorithm. */
+export function useRunArchitecture(runId: string | undefined) {
+  return useQuery({
+    queryKey: ['run-architecture', runId],
+    queryFn: () => api.getRunArchitecture(runId as string),
     enabled: !!runId,
   })
 }
@@ -179,7 +188,7 @@ export function useInspectDesign(payload: {
     id: string
     hyperparams: Record<string, number>
     network_spec_id?: string | null
-    network_spec?: NetworkSpec | null
+    network_spec?: AnyNetworkSpec | null
   }
 } | null) {
   const debounced = useDebouncedValue(payload, 400)
@@ -198,7 +207,7 @@ export function useInspectDesign(payload: {
  * user edits the trunk or a head. */
 export function useNetworkPreview(payload: {
   family: NetworkFamily
-  spec: NetworkSpec
+  spec: AnyNetworkSpec
   environmentId?: string | null
   wrappers?: WrapperNode[]
   gameId?: string | null

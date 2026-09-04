@@ -48,6 +48,27 @@ from rl_core.algorithms.vec_env import (
 from rl_core.envs.pomdp import register_pomdp_envs
 
 
+class _OneStepVectorTestEnv(gym.Env):
+    """Deterministic one-step episodes for autoreset contract tests."""
+
+    observation_space = gym.spaces.Box(-1000, 1000, shape=(1,), dtype=np.float32)
+    action_space = gym.spaces.Discrete(2)
+
+    def __init__(self) -> None:
+        self.episode = 0
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.episode += 1
+        return np.array([10 * self.episode], dtype=np.float32), {"reset_episode": self.episode}
+
+    def step(self, action):
+        del action
+        return np.array([10 * self.episode + 1], dtype=np.float32), 1.0, True, False, {
+            "terminal_episode": self.episode,
+        }
+
+
 class VecEnvHelperTests(unittest.TestCase):
     def test_num_envs_1_stays_a_plain_env(self) -> None:
         env = make_env_or_vec(lambda: gym.make("CartPole-v1"), num_envs=1)
@@ -111,6 +132,29 @@ class VecEnvHelperTests(unittest.TestCase):
         else:
             self.fail("CartPole never terminated within 500 random steps")
         vec_step(env, [action_space(env).sample()])  # must not raise/warn
+        env.close()
+
+    def test_vector_env_same_step_autoreset_never_emits_dummy_transition(self) -> None:
+        env = make_env_or_vec(_OneStepVectorTestEnv, num_envs=2, parallel=False)
+        first = vec_reset(env)
+        self.assertTrue(all(float(obs[0]) == 10.0 for obs in first))
+
+        reset_obs, rewards, terminated, truncated, infos = vec_step(env, [0, 0])
+        self.assertTrue(terminated.all())
+        self.assertFalse(truncated.any())
+        self.assertTrue(np.allclose(rewards, 1.0))
+        self.assertTrue(all(float(obs[0]) == 20.0 for obs in reset_obs))
+        self.assertTrue(all(float(info["final_obs"][0]) == 11.0 for info in infos))
+        self.assertTrue(all(info["terminal_episode"] == 1 for info in infos))
+
+        # A second call must execute the first real action of episode 2.
+        # NEXT_STEP autoreset would instead ignore these actions and emit
+        # reward=0, done=False here.
+        next_reset_obs, rewards2, terminated2, _truncated2, infos2 = vec_step(env, [1, 1])
+        self.assertTrue(terminated2.all())
+        self.assertTrue(np.allclose(rewards2, 1.0))
+        self.assertTrue(all(float(info["final_obs"][0]) == 21.0 for info in infos2))
+        self.assertTrue(all(float(obs[0]) == 30.0 for obs in next_reset_obs))
         env.close()
 
     def test_vec_step_handles_nested_dict_info_from_monitor_wrapper(self) -> None:

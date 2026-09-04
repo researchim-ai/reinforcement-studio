@@ -1,5 +1,6 @@
 import type {
   AlgorithmSpec,
+  AnyNetworkSpec,
   ArenaState,
   ArenaOpponent,
   EnvKind,
@@ -15,10 +16,10 @@ import type {
   NetworkPreviewRequest,
   NetworkPreviewResult,
   NetworkSnapshot,
-  NetworkSpec,
   PluginKind,
   PluginScriptMeta,
   PluginTemplate,
+  RunArchitecture,
   RunSummary,
   SceneMeta,
   SceneSpec,
@@ -93,7 +94,7 @@ export const api = {
       id: string
       hyperparams: Record<string, number>
       network_spec_id?: string | null
-      network_spec?: NetworkSpec | null
+      network_spec?: AnyNetworkSpec | null
     }
   }) => request<InspectResult>('/environments/inspect', { method: 'POST', body: JSON.stringify(payload) }),
   resolveUrl: async (path: string) => {
@@ -114,6 +115,7 @@ export const api = {
   getMetricsHistory: (runId: string) =>
     request<{ history: import('./types').MetricsSnapshot[] }>(`/training/runs/${runId}/metrics_history`),
   getRunNetwork: (runId: string) => request<NetworkSnapshot>(`/training/runs/${runId}/network`),
+  getRunArchitecture: (runId: string) => request<RunArchitecture>(`/training/runs/${runId}/architecture`),
   getRunWorldModel: (runId: string) => request<WorldModelSnapshot>(`/training/runs/${runId}/world_model`),
   getRunConfig: (runId: string) => request<ExperimentConfig>(`/training/runs/${runId}/config`),
   listSelfPlayIterations: (runId: string) =>

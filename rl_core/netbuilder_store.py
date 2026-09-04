@@ -27,6 +27,9 @@ _ALGO_FAMILY: dict[str, str] = {
     "rainbow_dqn": "dueling_q",
     "ppo": "actor_critic",
     "a2c": "actor_critic",
+    "efficientzero": "efficientzero",
+    "unizero": "unizero",
+    "researchimzero": "researchimzero",
 }
 
 
@@ -65,6 +68,7 @@ def meta(slug: str) -> dict[str, Any]:
         "name": doc.get("name") or slug,
         "description": doc.get("description", ""),
         "family": doc.get("family", "actor_critic"),
+        "format": doc.get("spec", {}).get("format", "trunk_heads_v1"),
     }
 
 
@@ -129,12 +133,19 @@ def write_network_snapshot(run_dir: Path, config: dict[str, Any], network_spec: 
     algorithm_cfg = config.get("algorithm", {})
     algo_id = algorithm_cfg.get("id")
     family = family_for_algorithm(algo_id, config.get("kind", "gym"))
-    if network_spec is not None:
-        source = "catalog" if algorithm_cfg.get("network_spec_id") else "inline"
+    if algorithm_cfg.get("network_spec_id"):
+        source = "catalog"
+    elif algorithm_cfg.get("network_spec"):
+        source = "inline"
     else:
         source = "default"
     doc = {
         "family": family,
+        "format": (
+            network_spec.get("format", "trunk_heads_v1")
+            if network_spec is not None
+            else ("composite_v1" if family in {"efficientzero", "unizero", "researchimzero"} else "trunk_heads_v1")
+        ),
         "spec": network_spec,
         "source": source,
         "network_spec_id": algorithm_cfg.get("network_spec_id"),

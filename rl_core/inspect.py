@@ -62,6 +62,138 @@ def _describe_layers(module: nn.Module, max_layers: int = 24) -> list[str]:
     return out
 
 
+def _layer_detail(module: nn.Module) -> str:
+    """Compact dimensions/config for one leaf module."""
+    if isinstance(module, NoisyLinear):
+        return f"{module.in_features}\u2192{module.out_features}"
+    if isinstance(module, nn.Linear):
+        return f"{module.in_features}\u2192{module.out_features}"
+    if isinstance(module, nn.Conv2d):
+        kernel = "\u00d7".join(str(v) for v in module.kernel_size)
+        stride = "\u00d7".join(str(v) for v in module.stride)
+        return f"{module.in_channels}\u2192{module.out_channels}, k={kernel}, s={stride}"
+    if isinstance(module, nn.Embedding):
+        return f"{module.num_embeddings}\u00d7{module.embedding_dim}"
+    if isinstance(module, nn.LayerNorm):
+        return f"shape={tuple(module.normalized_shape)}"
+    if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+        return f"features={module.num_features}"
+    if isinstance(module, (nn.LSTM, nn.GRU)):
+        return f"in={module.input_size}, hidden={module.hidden_size}, layers={module.num_layers}"
+    if isinstance(module, nn.Dropout):
+        return f"p={module.p:g}"
+    if isinstance(module, nn.Flatten):
+        return f"dim {module.start_dim}\u2026{module.end_dim}"
+    return ""
+
+
+def _architecture_components(instance: Any) -> tuple[list[dict[str, Any]], int, int]:
+    """Describe every top-level torch component an algorithm owns.
+
+    Model-based algorithms are systems of several modules, so selecting
+    only `.net` (or the first module) is materially wrong for monitoring.
+    Components retain construction order and expose every leaf module,
+    including its qualified path, dimensions and own parameter count.
+    """
+    components: list[dict[str, Any]] = []
+    seen_modules: set[int] = set()
+    seen_parameters: set[int] = set()
+    total_params = 0
+    trainable_params = 0
+    optimizer_parameter_ids = {
+        id(parameter)
+        for value in vars(instance).values()
+        if hasattr(value, "param_groups")
+        for group in value.param_groups
+        for parameter in group.get("params", [])
+    }
+
+    def is_trainable(parameter: nn.Parameter) -> bool:
+        return parameter.requires_grad and (
+            not optimizer_parameter_ids or id(parameter) in optimizer_parameter_ids
+        )
+
+    for component_name, component in vars(instance).items():
+        if not isinstance(component, nn.Module) or id(component) in seen_modules:
+            continue
+        seen_modules.add(id(component))
+        component_total = sum(parameter.numel() for parameter in component.parameters())
+        component_trainable = sum(
+            parameter.numel() for parameter in component.parameters() if is_trainable(parameter)
+        )
+        layers: list[dict[str, Any]] = []
+        for path, layer in component.named_modules():
+            if path == "" or list(layer.children()):
+                continue
+            own_parameters = list(layer.parameters(recurse=False))
+            layers.append({
+                "path": path,
+                "type": layer.__class__.__name__,
+                "detail": _layer_detail(layer),
+                "params": sum(parameter.numel() for parameter in own_parameters),
+                "trainable_params": sum(
+                    parameter.numel() for parameter in own_parameters if is_trainable(parameter)
+                ),
+            })
+        components.append({
+            "name": component_name,
+            "type": component.__class__.__name__,
+            "params": component_total,
+            "trainable_params": component_trainable,
+            "role": "target" if component_name.startswith("target_") else "online",
+            "layers": layers,
+        })
+        for parameter in component.parameters():
+            if id(parameter) in seen_parameters:
+                continue
+            seen_parameters.add(id(parameter))
+            total_params += parameter.numel()
+            if is_trainable(parameter):
+                trainable_params += parameter.numel()
+
+    # A few algorithms own trainable scalar/vector parameters directly
+    # rather than through a module (e.g. adaptive loss log-variances).
+    direct_parameters = [
+        (name, value) for name, value in vars(instance).items()
+        if isinstance(value, nn.Parameter) and id(value) not in seen_parameters
+    ]
+    if direct_parameters:
+        direct_total = sum(parameter.numel() for _, parameter in direct_parameters)
+        direct_trainable = sum(
+            parameter.numel() for _, parameter in direct_parameters if is_trainable(parameter)
+        )
+        components.append({
+            "name": "direct_parameters",
+            "type": "Parameters",
+            "params": direct_total,
+            "trainable_params": direct_trainable,
+            "role": "online",
+            "layers": [
+                {
+                    "path": name,
+                    "type": "Parameter",
+                    "detail": f"shape={tuple(parameter.shape)}",
+                    "params": parameter.numel(),
+                    "trainable_params": parameter.numel() if is_trainable(parameter) else 0,
+                }
+                for name, parameter in direct_parameters
+            ],
+        })
+        total_params += direct_total
+        trainable_params += direct_trainable
+
+    return components, total_params, trainable_params
+
+
+def _algorithm_architecture_summary(instance: Any) -> dict[str, Any]:
+    components, total, trainable = _architecture_components(instance)
+    return {
+        "architecture_components": components,
+        "total_params": total,
+        "trainable_params": trainable,
+    }
+
+
 def _network_summary(module: nn.Module, policy: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     total, trainable = _count_params(module)
     return {
@@ -193,9 +325,37 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
                 "note": "Плагин не выставил атрибут net/q_net/policy/model \u2014 сеть не проанализирована",
                 **io,
             }
-        return {**_network_summary(module, "custom"), **io}
+        return {
+            **_network_summary(module, "custom"),
+            **_algorithm_architecture_summary(algo),
+            **io,
+        }
 
     algo_id = (algo_id or "ppo").lower()
+    if algo_id in ("efficientzero", "unizero", "researchimzero"):
+        if algo_id == "efficientzero":
+            from rl_core.algorithms.native.efficientzero import DEFAULT_HYPERPARAMS, NativeEfficientZero
+
+            algorithm_cls = NativeEfficientZero
+            label = "EfficientZero world model"
+        elif algo_id == "unizero":
+            from rl_core.algorithms.native.unizero import DEFAULT_HYPERPARAMS, NativeUniZero
+
+            algorithm_cls = NativeUniZero
+            label = "UniZero Transformer world model"
+        else:
+            from rl_core.algorithms.native.researchimzero import DEFAULT_HYPERPARAMS, NativeResearchImZero
+
+            algorithm_cls = NativeResearchImZero
+            label = "ResearchImZero Transformer world model"
+        algorithm = algorithm_cls(env, {**DEFAULT_HYPERPARAMS, **hyperparams}, 0, "cpu")
+        module = _find_torch_module(algorithm)
+        return {
+            **(_network_summary(module, label) if module is not None else {"policy": label, "layers": []}),
+            **_algorithm_architecture_summary(algorithm),
+            **io,
+        }
+
     # A hand-designed architecture (Network Builder page, or the Designer's
     # quick layer editor) — see `rl_core/algorithms/native/{ppo,a2c,dqn,
     # rainbow_dqn}.py`, which all check for this exact key and build the

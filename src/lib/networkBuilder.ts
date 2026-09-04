@@ -1,13 +1,27 @@
-import type { ActivationFn, NetworkFamily, NetworkHead, NetworkLayer, NetworkLayerType, NetworkSpec } from '@/api/types'
+import type {
+  ActivationFn,
+  CompositeMlpSpec,
+  CompositeNetworkFamily,
+  CompositeNetworkSpec,
+  FlatNetworkFamily,
+  NetworkFamily,
+  NetworkHead,
+  NetworkLayer,
+  NetworkLayerType,
+  NetworkSpec,
+} from '@/api/types'
 
 export const FAMILY_LABELS: Record<NetworkFamily, string> = {
   actor_critic: 'Actor-Critic (PPO / A2C)',
   q_network: 'Q-Network (DQN)',
   dueling_q: 'Dueling Q-Network (Rainbow DQN)',
   alphazero: 'AlphaZero (policy + value)',
+  efficientzero: 'EfficientZero (representation + dynamics + prediction)',
+  unizero: 'UniZero (tokenizer + Transformer + heads)',
+  researchimzero: 'ResearchImZero (Transformer + SimSiam)',
 }
 
-export const FAMILY_HEADS: Record<NetworkFamily, string[]> = {
+export const FAMILY_HEADS: Record<FlatNetworkFamily, string[]> = {
   actor_critic: ['action', 'value'],
   q_network: ['q'],
   dueling_q: ['advantage', 'value'],
@@ -65,7 +79,7 @@ function head(name: string): NetworkHead {
   return { name, layers: [{ type: 'linear', out_features: null }] }
 }
 
-export function defaultSpecForFamily(family: NetworkFamily): NetworkSpec {
+export function defaultSpecForFamily(family: FlatNetworkFamily): NetworkSpec {
   if (family === 'q_network') {
     return {
       trunk: [
@@ -113,7 +127,7 @@ export function defaultSpecForFamily(family: NetworkFamily): NetworkSpec {
 
 /** Re-shapes an existing spec's heads to match a newly picked family,
  * preserving the trunk and any head bodies whose name is still relevant. */
-export function reconcileHeadsForFamily(spec: NetworkSpec, family: NetworkFamily): NetworkSpec {
+export function reconcileHeadsForFamily(spec: NetworkSpec, family: FlatNetworkFamily): NetworkSpec {
   const byName = new Map(spec.heads.map((h) => [h.name, h]))
   return { trunk: spec.trunk, heads: FAMILY_HEADS[family].map((name) => byName.get(name) ?? head(name)) }
 }
@@ -159,7 +173,7 @@ export function shapeLabel(shape: number[] | undefined): string {
  * own quick architecture knobs (`channels`/`num_blocks` hyperparams), so
  * it's deliberately excluded here — the quick *layer* editor only applies
  * to the plain-MLP-trunk families. */
-export function requiredFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'): NetworkFamily | null {
+export function requiredFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'): FlatNetworkFamily | null {
   if (kind === 'alphazero') return null
   if (algorithmId === 'dqn') return 'q_network'
   if (algorithmId === 'rainbow_dqn') return 'dueling_q'
@@ -171,10 +185,11 @@ export function requiredFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'
  * picker (includes `alphazero`, unlike `requiredFamilyFor` above). */
 export function networkFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'): NetworkFamily | null {
   if (kind === 'alphazero') return algorithmId === 'alphazero' ? 'alphazero' : null
+  if (algorithmId === 'efficientzero' || algorithmId === 'unizero' || algorithmId === 'researchimzero') return algorithmId
   return requiredFamilyFor(algorithmId, kind)
 }
 
-export const FAMILY_DEFAULT_ACTIVATION: Record<NetworkFamily, ActivationFn> = {
+export const FAMILY_DEFAULT_ACTIVATION: Record<FlatNetworkFamily, ActivationFn> = {
   actor_critic: 'tanh',
   q_network: 'relu',
   dueling_q: 'relu',
@@ -185,7 +200,7 @@ export const FAMILY_DEFAULT_ACTIVATION: Record<NetworkFamily, ActivationFn> = {
  * anything — matches `defaultSpecForFamily`'s own trunk exactly, so
  * switching the quick editor's first field is a no-op until actually
  * edited. */
-export function defaultHiddenSizesForFamily(family: NetworkFamily): number[] {
+export function defaultHiddenSizesForFamily(family: FlatNetworkFamily): number[] {
   return defaultSpecForFamily(family)
     .trunk.filter((layer) => layer.type === 'linear')
     .map((layer) => layer.out_features ?? 128)
@@ -195,7 +210,7 @@ export function defaultHiddenSizesForFamily(family: NetworkFamily): number[] {
  * sizes — heads are always the family's defaults (a single auto-sized
  * Linear straight off the trunk, exactly like `defaultSpecForFamily`),
  * since the quick editor never lets you touch head shape. */
-export function quickSpecForFamily(family: NetworkFamily, hiddenSizes: number[]): NetworkSpec {
+export function quickSpecForFamily(family: FlatNetworkFamily, hiddenSizes: number[]): NetworkSpec {
   const activation = FAMILY_DEFAULT_ACTIVATION[family]
   const trunk: NetworkLayer[] = []
   for (const size of hiddenSizes) {
@@ -203,4 +218,55 @@ export function quickSpecForFamily(family: NetworkFamily, hiddenSizes: number[])
     trunk.push({ type: 'activation', fn: activation })
   }
   return { trunk, heads: FAMILY_HEADS[family].map(head) }
+}
+
+function compositeMlp(hiddenSizes: number[], batchNorm = false): CompositeMlpSpec {
+  return { hidden_sizes: hiddenSizes, activation: 'elu', dropout: 0, batch_norm: batchNorm }
+}
+
+export function isCompositeFamily(family: NetworkFamily): family is CompositeNetworkFamily {
+  return family === 'efficientzero' || family === 'unizero' || family === 'researchimzero'
+}
+
+export function isCompositeSpec(spec: unknown): spec is CompositeNetworkSpec {
+  return !!spec && typeof spec === 'object' && (spec as { format?: string }).format === 'composite_v1'
+}
+
+export function defaultCompositeSpec(family: CompositeNetworkFamily): CompositeNetworkSpec {
+  if (family === 'efficientzero') {
+    return {
+      format: 'composite_v1',
+      family,
+      dimensions: { latent_dim: 64, hidden_dim: 128, proj_dim: 64 },
+      encoder: { kind: 'auto', layers: [] },
+      components: {
+        representation: compositeMlp([128]),
+        dynamics: compositeMlp([]),
+        prediction: compositeMlp([]),
+        projector: compositeMlp([64], true),
+        predictor: compositeMlp([64], true),
+      },
+    }
+  }
+  return {
+    format: 'composite_v1',
+    family,
+    dimensions: {
+      embed_dim: 128,
+      num_layers: 2,
+      num_heads: family === 'unizero' ? 8 : 4,
+      ffn_multiplier: 4,
+      dropout: family === 'unizero' ? 0.1 : 0,
+      rotary_emb: 1,
+      ...(family === 'researchimzero' ? { proj_dim: 64 } : {}),
+    },
+    encoder: { kind: 'auto', layers: [] },
+    components: {
+      tokenizer: compositeMlp([256]),
+      heads: compositeMlp([]),
+      ...(family === 'researchimzero'
+        ? { projector: compositeMlp([64], true), predictor: compositeMlp([64], true) }
+        : {}),
+    },
+  }
 }

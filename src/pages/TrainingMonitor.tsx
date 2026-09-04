@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { useAlgorithms, useRuns, useRunNetwork, useRunWorldModel } from '@/api/hooks'
+import { useAlgorithms, useRuns, useRunArchitecture, useRunNetwork, useRunWorldModel } from '@/api/hooks'
 import { api, createMetricsWebSocket } from '@/api/client'
 import { AlgorithmDiagram, type AlgorithmDiagramNetwork } from '@/components/AlgorithmDiagram'
 import { SaveArchitectureDialog } from '@/components/networkbuilder/SaveArchitectureDialog'
@@ -19,7 +19,7 @@ import { CompareRunsPanel } from '@/components/monitor/CompareRunsPanel'
 import { RunFolderLink } from '@/components/monitor/RunFolderLink'
 import { EvaluateDialog } from '@/components/models/EvaluateDialog'
 import { Tooltip as HpTooltip } from '@/components/ui/tooltip'
-import type { HyperparamSpec, MetricsSnapshot, SpaceInfo } from '@/api/types'
+import type { HyperparamSpec, MetricsSnapshot, RunArchitecture, SpaceInfo } from '@/api/types'
 import { cn, formatDuration } from '@/lib/utils'
 import { spaceSize } from '@/lib/spaceInfo'
 import { WORLD_MODEL_TYPE_LABELS } from '@/lib/worldModels'
@@ -187,6 +187,7 @@ export function TrainingMonitor() {
 
   const selectedRun = runs.find((r) => r.run_id === selectedRunId)
   const { data: runNetwork } = useRunNetwork(selectedRunId)
+  const { data: runArchitecture } = useRunArchitecture(selectedRunId)
   const canSaveArchitecture = !!runNetwork?.family && !!runNetwork?.spec
   const { data: runWorldModel } = useRunWorldModel(selectedRunId)
   const { data: algosData } = useAlgorithms()
@@ -684,7 +685,7 @@ export function TrainingMonitor() {
                     algorithmId={selectedRun.algorithm_id}
                     kind={isAlphaZero ? 'alphazero' : 'gym'}
                     hyperparams={latest?.hyperparams}
-                    network={buildDiagramNetwork(latest)}
+                    network={buildDiagramNetwork(latest, runArchitecture)}
                   />
                 </CardContent>
               </Card>
@@ -906,13 +907,24 @@ function spaceToShape(space?: SpaceInfo): number[] | undefined {
  * `AlgorithmDiagram` understands — mirrors the InspectPanel's Designer-side
  * adapter for the exact same `InspectNetwork` data, just sourced from a live
  * run instead of a pre-run inspect call. */
-function buildDiagramNetwork(latest: MetricsSnapshot | undefined): AlgorithmDiagramNetwork | null {
+function buildDiagramNetwork(
+  latest: MetricsSnapshot | undefined,
+  architecture?: RunArchitecture,
+): AlgorithmDiagramNetwork | null {
   if (!latest) return null
-  if (latest.total_params == null && !latest.network && !latest.layers?.length) return null
+  if (
+    latest.total_params == null
+    && !latest.network
+    && !latest.layers?.length
+    && !latest.architecture_components?.length
+    && !architecture?.components.length
+  ) return null
   return {
     policy: latest.policy,
     layers: latest.layers,
-    totalParams: latest.total_params,
+    components: architecture?.components ?? latest.architecture_components,
+    totalParams: architecture?.total_params ?? latest.total_params,
+    trainableParams: architecture?.trainable_params ?? latest.trainable_params,
     inputShape: spaceToShape(latest.observation_space),
     outputShape: spaceToShape(latest.action_space),
     channels: latest.network?.channels,

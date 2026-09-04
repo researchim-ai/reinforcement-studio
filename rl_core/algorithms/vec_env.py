@@ -22,7 +22,7 @@ from typing import Any, Callable, Sequence
 
 import gymnasium as gym
 import numpy as np
-from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv, VectorEnv
+from gymnasium.vector import AsyncVectorEnv, AutoresetMode, SyncVectorEnv, VectorEnv
 
 
 def _vector_env_context() -> str:
@@ -105,8 +105,10 @@ def make_env_or_vec(
         return env_factory()
     env_fns = [env_factory for _ in range(num_envs)]
     if parallel:
-        return AsyncVectorEnv(env_fns, context=_vector_env_context())
-    return SyncVectorEnv(env_fns)
+        return AsyncVectorEnv(
+            env_fns, context=_vector_env_context(), autoreset_mode=AutoresetMode.SAME_STEP,
+        )
+    return SyncVectorEnv(env_fns, autoreset_mode=AutoresetMode.SAME_STEP)
 
 
 def is_vector_env(env: Any) -> bool:
@@ -183,24 +185,29 @@ def vec_step(
     `VectorEnv`'s own dict-of-arrays shape, so callers never need to
     branch on vector-vs-not to read a lane's info).
 
-    Uses the vector env's default autoreset mode (`NEXT_STEP`) for
-    `num_envs>1`: the step where a lane's episode ends returns that lane's
-    real terminal `(obs, reward, terminated/truncated)`, and it's only the
-    *following* call that silently resets that lane (ignoring whatever
-    action was passed for it) and returns the fresh episode's first
-    observation with `reward=0`. For `num_envs=1` (a plain env — no
-    vector-env autoreset machinery available), the reset instead happens
-    immediately, within this same call, exactly like this app's original
-    single-env loops (`if done: env.reset()` right before sampling the
-    *next* action) — the two differ in exactly when the reset happens, but
-    both mean "the caller's very next `vec_reset`less obs is always a
-    fresh episode's first observation", so every collection loop above
-    this function behaves identically either way.
+    Vector envs are constructed with `SAME_STEP` autoreset: a terminal
+    call returns the freshly reset observation for the next policy call,
+    while the real terminal observation/info are preserved as
+    `info["final_obs"]`/`info["final_info"]`. This avoids NEXT_STEP's
+    otherwise unavoidable dummy iteration where the supplied action is
+    ignored and callers accidentally record `terminal -> reset` as a
+    zero-reward transition. Plain envs are normalized to the same
+    contract below.
     """
     if is_vector_env(env):
         obs, rewards, terminated, truncated, infos = env.step(np.asarray(actions))
         num_envs = env.num_envs
         per_lane_infos = _split_vector_infos(infos, num_envs)
+        # SAME_STEP nests the terminal env's info under `final_info` and
+        # uses the top level for reset info. Preserve the explicit nested
+        # field, but also expose terminal keys at the top level to retain
+        # vec_step's historical per-lane info contract (notably Monitor's
+        # `episode` entry).
+        for lane_info in per_lane_infos:
+            final_info = lane_info.get("final_info")
+            if isinstance(final_info, dict):
+                for key, value in final_info.items():
+                    lane_info.setdefault(key, value)
         return (
             list(obs),
             np.asarray(rewards, dtype=np.float32),
@@ -210,7 +217,9 @@ def vec_step(
         )
     obs, reward, terminated, truncated, info = env.step(actions[0])
     if terminated or truncated:
-        obs, _reset_info = env.reset()
+        final_obs, final_info = obs, info
+        obs, reset_info = env.reset()
+        info = {**reset_info, **final_info, "final_obs": final_obs, "final_info": final_info}
     return (
         [obs],
         np.array([reward], dtype=np.float32),

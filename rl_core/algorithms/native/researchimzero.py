@@ -90,8 +90,8 @@ dynamics", ported wholesale from `efficientzero.py`'s `_EfficientZeroBuffer`
 extra `context_obs`/`context_action`/`context_valid` slicing every
 Transformer training window needs - see that class's own docstring).
 
-**`learning_starts=500`, not `0`.** `train_freq=1` already means one
-gradient step per real env-step collected (`learn()`'s own
+**`learning_starts=500`, not `0`.** `train_freq=1` means one
+gradient-update group per vector iteration (`learn()`'s own
 `boundaries_crossed` comment) - training from the very first few
 transitions, before the buffer has any behavioral diversity, is a real,
 observed failure mode: a from-scratch model + a tiny buffer + this much
@@ -223,21 +223,27 @@ is most exposed in.
   reward is actually being optimized, not just how training gets there;
   worth turning on for the sparse/hard-exploration environments (the
   NetHack-family runs) this file was originally tuned against.
-- **`adaptive_loss_weights`** (default on): Kendall et al. (2018)
+- **`adaptive_loss_weights`** (default off): Kendall et al. (2018)
   homoscedastic-uncertainty weighting - a learnable `log_var` per task
-  loss (reward/value/policy/consistency; the entropy bonus is excluded,
-  it isn't a task loss) replaces this file's original static `*_loss_coef`
-  ratios (`value_loss_coef=0.25` vs `consistency_loss_coef=2.0` was one
-  never-revisited guess) with weights that adapt to each task's own loss
-  scale during training; the `*_loss_coef` values still matter as each
-  task's prior multiplier, not as the final weight.
-- **`auto_scale_replay_ratio`** (default on): `train_steps_per_iter`
-  scales with `num_envs // 4` - `train_freq`/`train_steps_per_iter` count
-  real steps summed across every lane, so more parallel envs otherwise
-  means strictly fewer gradient steps per transition collected, with no
-  corresponding increase in how much training happens on the extra data.
-  A no-op for `num_envs<=4`, so any existing single-env run/config is
-  completely unaffected.
+  loss (reward/value/policy only, clamped to `[-5, 5]`; see below for why
+  `consistency` and the entropy bonus are both excluded) replaces this
+  file's original static `*_loss_coef` ratios (`value_loss_coef=0.25` vs
+  `policy_loss_coef=1.0` was one never-revisited guess) with weights that
+  adapt to each task's own loss scale during training; the `*_loss_coef`
+  values still matter as each task's prior multiplier, not as the final
+  weight. `consistency_loss` (SimSiam) deliberately keeps its plain
+  static `consistency_loss_coef` - it has no genuine noise floor the way
+  reward/value/policy do (nothing stops the stop-grad predictor from
+  driving it arbitrarily close to `0`), so folding it into this scheme
+  let its own learned weight climb straight to the `[-5, 5]` clamp
+  ceiling (~148x) and stay pinned there for the rest of training,
+  ~200x `policy`'s concurrent weight - a real run measured exactly this
+  and stalled well below what static coefficients alone used to reach.
+- **`auto_scale_replay_ratio`** (default off): optional additional learner
+  pressure, scaling updates per vector iteration by `num_envs // 4`.
+  It is deliberately not combined with the number of aggregate timestep
+  boundaries crossed: that old double scaling produced 144 optimizer
+  steps per 24 collected transitions and dominated wall-clock training.
 """
 from __future__ import annotations
 
@@ -261,6 +267,12 @@ from rl_core.algorithms.vec_env import (
     obs_space as venv_obs_space,
     vec_reset,
     vec_step,
+)
+from rl_core.composite_netbuilder import (
+    build_component_mlp,
+    build_composite_encoder,
+    dimensions_from_spec,
+    validate_composite_spec,
 )
 from rl_core.world_models.nets import ObsEncoder
 
@@ -340,22 +352,37 @@ DEFAULT_HYPERPARAMS = {
     "consistency_loss_coef": 2.0,
     # Kendall et al. (2018) homoscedastic-uncertainty multi-task
     # weighting - `1` (default): each of the four task losses (reward,
-    # value, policy, consistency; the entropy *bonus* is excluded, it
-    # isn't a task loss) gets its own learnable `log_var` alongside the
-    # network's own parameters (`self.loss_log_vars`, optimized by the
-    # exact same `self.optimizer`), and the loss actually backpropped is
+    # value, policy; `consistency` is deliberately excluded, see
+    # `__init__`'s own `self.loss_log_vars` comment) gets its own
+    # learnable `log_var` alongside the network's own parameters
+    # (`self.loss_log_vars`, optimized by the exact same
+    # `self.optimizer`), and the loss actually backpropped is
     # `sum_i(coef_i * exp(-log_var_i) * loss_i + log_var_i)` instead of
-    # `sum_i(coef_i * loss_i)` directly - a task whose loss is
-    # consistently *larger* than the others' (this file's own
-    # `value_loss_coef=0.25` vs `consistency_loss_coef=2.0` gap was one
-    # symptom: a static ratio guessed once, never revisited) automatically
-    # gets down-weighted relative to one that's already small, rather
-    # than every task's relative weight being whatever this file's own
-    # `*_loss_coef` defaults happened to guess. The `*_loss_coef` values
-    # above still matter here too - as each task's *prior* multiplier
-    # before its own learned precision is applied, not as the final
-    # weight. `0`: exactly the old, static-`*_loss_coef`-only behavior.
-    "adaptive_loss_weights": 1,
+    # `sum_i(coef_i * loss_i)` directly for those three - in theory, a
+    # task whose loss is consistently *larger* than the others'
+    # automatically gets down-weighted relative to one that's already
+    # small, rather than every task's relative weight being whatever this
+    # file's own `*_loss_coef` defaults happened to guess.
+    #
+    # Default is `0` (off), not `1`, on real evidence, not theory: on a
+    # real NetHack run, `reward_loss` (mostly-zero reward, trivial to
+    # predict most steps) sat an order of magnitude below `policy_loss`
+    # (search-target distillation, inherently noisier) for the *entire*
+    # run - measured `loss_weight_reward` tracking `1/reward_loss`
+    # exactly (this scheme's own, correct equilibrium, not a bug) and
+    # settling at `~70-90x` for the whole run, while `loss_weight_policy`
+    # sat flat at `~0.9-1.1` throughout, `value` in between at `~15-20x`.
+    # "Easy to minimize" isn't "unimportant" here - reward-prediction
+    # being trivial doesn't mean it should get 75x more of the trunk's
+    # gradient than the one task (policy) that actually determines
+    # in-game behavior. Kendall et al.'s own multi-task setup (depth/
+    # segmentation/instance losses, all sharing comparable pixel-level
+    # aleatoric noise) doesn't have this problem; this file's task mix
+    # does. `1`: opt-in for environments where reward/value/policy
+    # happen to have more comparable achievable loss floors - the
+    # `*_loss_coef` values above still matter as each task's *prior*
+    # multiplier either way, not as the final weight.
+    "adaptive_loss_weights": 0,
     # SimSiam projector/predictor hidden+output dim (`_Projector`/
     # `_Predictor`) - `efficientzero.py`'s own default.
     "proj_dim": 64,
@@ -365,10 +392,12 @@ DEFAULT_HYPERPARAMS = {
     "continuous_prior_scale": 2.5,
     "train_freq": 1,
     "train_steps_per_iter": 1,
-    # See `__init__`'s own `self._replay_ratio_scale` comment - `1`
-    # (default): keep replay ratio roughly constant as `num_envs` grows
-    # instead of letting it silently fall. No-op for `num_envs<=4`.
-    "auto_scale_replay_ratio": 1,
+    # Opt-in extra learner pressure for large vector envs. Off by default:
+    # `learn()` already notices boundaries crossed by the aggregate
+    # timestep counter, and the historical fast/successful native runs
+    # performed one optimizer update per vector iteration, not one per
+    # transition. Enabling this scales that one update by `num_envs // 4`.
+    "auto_scale_replay_ratio": 0,
     # `efficientzero.py`'s own default, and this file's own earlier
     # (pre-reference-matching) good-runs' choice - not `0` (module
     # docstring's own "learning_starts=500, not 0" section explains why
@@ -465,10 +494,17 @@ class _Tokenizer(nn.Module):
     auto-detecting feature extractor every world model family in this app
     shares (`rl_core/world_models/nets.py::ObsEncoder`)."""
 
-    def __init__(self, observation_space: gym.Space, embed_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self, observation_space: gym.Space, embed_dim: int, hidden_dim: int,
+        encoder: nn.Module | None = None, component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.encoder = ObsEncoder(observation_space)
-        self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, embed_dim))
+        self.encoder = encoder or ObsEncoder(observation_space)
+        self.head = (
+            build_component_mlp(self.encoder.out_dim, embed_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(nn.Linear(self.encoder.out_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, embed_dim))
+        )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.head(self.encoder(obs)))
@@ -836,13 +872,17 @@ class _CausalSelfAttention(nn.Module):
 
 
 class _TransformerBlock(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float, rotary_emb: bool = True) -> None:
+    def __init__(
+        self, embed_dim: int, num_heads: int, dropout: float, rotary_emb: bool = True,
+        ffn_multiplier: int = 4,
+    ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.attn = _CausalSelfAttention(embed_dim, num_heads, dropout, rotary_emb)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Linear(4 * embed_dim, embed_dim), nn.Dropout(dropout),
+            nn.Linear(embed_dim, ffn_multiplier * embed_dim), nn.GELU(),
+            nn.Linear(ffn_multiplier * embed_dim, embed_dim), nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor, attend_mask: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -890,7 +930,7 @@ def _build_attend_mask(pad_mask: torch.Tensor) -> torch.Tensor:
 class _CausalTransformer(nn.Module):
     def __init__(
         self, embed_dim: int, num_layers: int, num_heads: int, dropout: float,
-        rotary_emb: bool = True, max_positions: int = 4096,
+        rotary_emb: bool = True, max_positions: int = 4096, ffn_multiplier: int = 4,
     ) -> None:
         super().__init__()
         head_dim = embed_dim // num_heads
@@ -901,7 +941,10 @@ class _CausalTransformer(nn.Module):
         self.max_positions = max_positions
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [_TransformerBlock(embed_dim, num_heads, dropout, rotary_emb) for _ in range(num_layers)],
+            [
+                _TransformerBlock(embed_dim, num_heads, dropout, rotary_emb, ffn_multiplier)
+                for _ in range(num_layers)
+            ],
         )
         self.ln_out = nn.LayerNorm(embed_dim)
         # Learned absolute position embedding - only built/used when RoPE
@@ -974,6 +1017,12 @@ class _CausalTransformer(nn.Module):
             x, new_layer_caches = block.forward_incremental_batch(x, positions, layer_caches_by_layer[i])
             new_layer_caches_by_layer.append(new_layer_caches)
         hidden = self.ln_out(x)
+        # One device synchronization for the whole batch, not one
+        # `positions[lane].item()` synchronization per lane. This method
+        # is called 67 times per collect iteration at the default search
+        # budget, so the previous scalar loop caused 1600+ avoidable
+        # GPU->CPU sync points at `num_envs=24`.
+        position_values = positions.detach().cpu().tolist()
         new_caches: list[_TransformerCache] = []
         for lane in range(b):
             cache = _TransformerCache(num_layers)
@@ -983,7 +1032,7 @@ class _CausalTransformer(nn.Module):
             # `parent.next_pos`, is authoritative - a caller may pass a
             # position that doesn't equal the parent's own `next_pos`
             # (see `_replay_context_to_cache`'s per-round `active` lanes).
-            cache.next_pos = int(positions[lane].item()) + 1
+            cache.next_pos = int(position_values[lane]) + 1
             # `pos_origin` simply carries over unchanged - only
             # `evict_front` ever bumps it (module docstring's "Positional
             # encoding toggle" section); a plain incremental append never
@@ -1000,11 +1049,18 @@ class _CausalTransformer(nn.Module):
 # docstring's "Head placement" bullet).
 # ----------------------------------------------------------------------
 class _Heads(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, action_space: gym.Space, support_size: int) -> None:
+    def __init__(
+        self, embed_dim: int, hidden_dim: int, action_space: gym.Space, support_size: int,
+        component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.discrete = isinstance(action_space, gym.spaces.Discrete)
         self.support_size = support_size
-        self.trunk = nn.Sequential(nn.Linear(embed_dim, hidden_dim), nn.ELU())
+        self.trunk = (
+            build_component_mlp(embed_dim, hidden_dim, component_config, final_activation=nn.ELU())
+            if component_config is not None
+            else nn.Sequential(nn.Linear(embed_dim, hidden_dim), nn.ELU())
+        )
         self.value_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         self.reward_head = nn.Linear(hidden_dim, 2 * support_size + 1)
         # Predicted *raw* next-token embedding - fed straight back in as
@@ -1062,10 +1118,16 @@ class _Projector(nn.Module):
     spread out (zero mean, unit variance *per feature, across the batch*)
     instead of letting the optimizer collapse them all together."""
 
-    def __init__(self, embed_dim: int, proj_dim: int) -> None:
+    def __init__(
+        self, embed_dim: int, proj_dim: int, component_config: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        self.net = (
+            build_component_mlp(embed_dim, proj_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(
+                nn.Linear(embed_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+            )
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -1079,10 +1141,14 @@ class _Predictor(nn.Module):
     on its hidden layer - see that class's docstring. `efficientzero.py`'s
     own class, ported verbatim."""
 
-    def __init__(self, proj_dim: int) -> None:
+    def __init__(self, proj_dim: int, component_config: dict[str, Any] | None = None) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+        self.net = (
+            build_component_mlp(proj_dim, proj_dim, component_config)
+            if component_config is not None
+            else nn.Sequential(
+                nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ELU(), nn.Linear(proj_dim, proj_dim),
+            )
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -1424,6 +1490,17 @@ class _ResearchImZeroBuffer:
         return len(self.episodes)
 
     @property
+    def num_replay_transitions(self) -> int:
+        """Transitions in finalized episodes that `sample()` can read.
+
+        `__len__` also includes live per-lane trajectories, but those are
+        intentionally not sampled until their return/terminal status is
+        known. Training readiness must therefore use this property rather
+        than merely checking that one (possibly very short) episode ended.
+        """
+        return sum(len(ep["reward"]) for ep in self.episodes)
+
+    @property
     def reanalyze_generation(self) -> int:
         """Current `_reanalyze_generation` counter - `_train_step`'s own
         freshness gate on `search_value` reads this to compute how many
@@ -1627,10 +1704,28 @@ class NativeResearchImZero(CustomAlgorithm):
         self.n_actions = int(self._action_space.n) if self.discrete else None
         self.action_dim = obs_flat_dim(self._action_space)
 
-        self.embed_dim = int(hyperparams.get("embed_dim", 128))
-        num_layers = max(1, int(hyperparams.get("num_layers", 2)))
-        num_heads = max(1, int(hyperparams.get("num_heads", 4)))
-        dropout = float(hyperparams.get("dropout", 0.0))
+        network_spec = hyperparams.get("network_spec")
+        if network_spec is not None:
+            network_spec = validate_composite_spec(network_spec, "researchimzero")
+            self.hyperparams["network_spec"] = network_spec
+        dimensions = dimensions_from_spec(
+            network_spec,
+            "researchimzero",
+            {
+                "embed_dim": int(hyperparams.get("embed_dim", 128)),
+                "num_layers": max(1, int(hyperparams.get("num_layers", 2))),
+                "num_heads": max(1, int(hyperparams.get("num_heads", 4))),
+                "ffn_multiplier": 4,
+                "dropout": float(hyperparams.get("dropout", 0.0)),
+                "rotary_emb": int(hyperparams.get("rotary_emb", 1)),
+                "proj_dim": int(hyperparams.get("proj_dim", 64)),
+            },
+        )
+        self.embed_dim = int(dimensions["embed_dim"])
+        num_layers = int(dimensions["num_layers"])
+        num_heads = int(dimensions["num_heads"])
+        ffn_multiplier = int(dimensions["ffn_multiplier"])
+        dropout = float(dimensions["dropout"])
         self.context_length = max(0, int(hyperparams.get("context_length", 6)))
         self.unroll_steps = max(1, int(hyperparams.get("unroll_steps", 5)))
         self.support_size = max(1, int(hyperparams.get("value_support_size", 300)))
@@ -1643,14 +1738,22 @@ class NativeResearchImZero(CustomAlgorithm):
         # `1` (default): RoPE. `0`: learned absolute embedding - module
         # docstring's "everything else" section (reused from `unizero.py`
         # as-is).
-        self.rotary_emb = bool(int(hyperparams.get("rotary_emb", 1)))
+        self.rotary_emb = bool(int(dimensions["rotary_emb"]))
 
-        self.tokenizer = _Tokenizer(self._obs_space, self.embed_dim, 2 * self.embed_dim).to(device)
+        components = network_spec["components"] if network_spec is not None else {}
+        encoder = build_composite_encoder(self._obs_space, network_spec) if network_spec is not None else None
+        self.tokenizer = _Tokenizer(
+            self._obs_space, self.embed_dim, 2 * self.embed_dim, encoder, components.get("tokenizer"),
+        ).to(device)
         self.action_embed = _ActionEmbed(self.action_dim, self.embed_dim, self.discrete).to(device)
         self.transformer = _CausalTransformer(
-            self.embed_dim, num_layers, num_heads, dropout, rotary_emb=self.rotary_emb,
+            self.embed_dim, num_layers, num_heads, dropout,
+            rotary_emb=self.rotary_emb, ffn_multiplier=ffn_multiplier,
         ).to(device)
-        self.heads = _Heads(self.embed_dim, 2 * self.embed_dim, self._action_space, self.support_size).to(device)
+        self.heads = _Heads(
+            self.embed_dim, 2 * self.embed_dim, self._action_space,
+            self.support_size, components.get("heads"),
+        ).to(device)
         # EMA/Polyak target copy, bootstrap-value-only (module docstring's
         # "Schedules, not fixed constants" section) - never trained
         # directly (no `requires_grad_(False)` needed since nothing ever
@@ -1674,16 +1777,37 @@ class NativeResearchImZero(CustomAlgorithm):
         # predicted-next-embedding, both already in that same space)
         # rather than `efficientzero.py`'s own fixed-size representation
         # latent - same role either way.
-        proj_dim = int(hyperparams.get("proj_dim", 64))
-        self.projector = _Projector(self.embed_dim, proj_dim).to(device)
-        self.predictor = _Predictor(proj_dim).to(device)
-        self.adaptive_loss_weights = bool(int(hyperparams.get("adaptive_loss_weights", 1)))
-        # Order: [reward, value, policy, consistency] - `0.0` initial
-        # `log_var` for every task means `exp(-log_var)=1`, i.e. training
+        proj_dim = int(dimensions["proj_dim"])
+        self.projector = _Projector(self.embed_dim, proj_dim, components.get("projector")).to(device)
+        self.predictor = _Predictor(proj_dim, components.get("predictor")).to(device)
+        self.adaptive_loss_weights = bool(int(hyperparams.get("adaptive_loss_weights", 0)))
+        # Order: [reward, value, policy] - deliberately *not* 4. Kendall
+        # et al.'s `precision*loss + log_var` implicitly assumes every
+        # task loss has a genuine, environment/label-driven noise floor
+        # it asymptotes towards (their own multi-task setup: depth/
+        # segmentation/instance losses never hit exactly `0`) - reward/
+        # value/policy all qualify (n-step TD noise, env stochasticity,
+        # search-target noise). `consistency_loss` (SimSiam, stop-grad)
+        # doesn't: nothing stops the predictor from driving it arbitrarily
+        # close to `0` once the projector/predictor pair aligns well, and
+        # once a task's own loss keeps shrinking towards `0`, this scheme
+        # has no floor on how high *that* task's own `precision` climbs
+        # to compensate - a real run measured `loss_weight_consistency`
+        # pinned at this file's own `exp(5)` clamp ceiling (~148x) for the
+        # entire back half of training, ~200x `loss_weight_policy`'s
+        # concurrent ~0.6-0.7, while `episode_reward_mean` stalled well
+        # below runs that predate `adaptive_loss_weights` entirely (which
+        # just used the static `consistency_loss_coef` below, unweighted-
+        # further) - the trunk's gradient was overwhelmingly "get this
+        # already-easy task a little easier still", not reward/value/
+        # policy. `consistency_loss` keeps its own fixed `consistency_
+        # loss_coef` for exactly this reason; only the three tasks with
+        # an actual noise floor get adaptively weighted. `0.0` initial
+        # `log_var` for those three means `exp(-log_var)=1`, i.e. training
         # starts out exactly equivalent to the static-`*_loss_coef`-only
         # behavior and only diverges from it as these get learned (see
         # `DEFAULT_HYPERPARAMS["adaptive_loss_weights"]`'s own docstring).
-        self.loss_log_vars = nn.Parameter(torch.zeros(4, device=device))
+        self.loss_log_vars = nn.Parameter(torch.zeros(3, device=device))
         self._params = (
             list(self.tokenizer.parameters()) + list(self.action_embed.parameters())
             + list(self.transformer.parameters()) + list(self.heads.parameters())
@@ -1756,21 +1880,19 @@ class NativeResearchImZero(CustomAlgorithm):
         self.continuous_prior_scale = float(hyperparams.get("continuous_prior_scale", 2.5))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
         _train_steps_per_iter_base = max(1, int(hyperparams.get("train_steps_per_iter", 1)))
-        # Replay ratio (gradient steps per real transition collected) was
-        # otherwise silently *falling* as `num_envs` rises: `train_freq`/
-        # `train_steps_per_iter` count real steps *summed across every
-        # lane*, so going from 1 to 16 parallel envs means 16x more
-        # transitions land in the buffer between two gradient steps, with
-        # no corresponding increase in how much training happens on them.
-        # `auto_scale_replay_ratio` (default on) restores a roughly
-        # constant replay ratio by scaling `train_steps_per_iter` with
-        # `num_envs // 4` - `1` at `num_envs<=4` (a no-op there, so every
-        # existing single-env run/test/saved config keeps behaving
-        # exactly as before), growing from there. Purely a training-
-        # throughput knob - toggle off to keep the raw
-        # `train_steps_per_iter` value exactly as configured.
+        # `learn()` executes this many updates once a vector iteration
+        # crosses a train-frequency boundary. Do not multiply by the
+        # number of aggregate boundaries again there: with 24 envs that
+        # old combination produced `(24 boundaries) * (24//4) = 144`
+        # optimizer steps after every vector step, versus one in the
+        # historical fast/successful EfficientZero runs. Besides reducing
+        # throughput from ~100 to ~5 aggregate steps/s, it repeatedly fit
+        # the first short completed episode before ongoing lanes became
+        # replayable. Auto-scaling remains an explicit opt-in and means
+        # exactly `num_envs//4` updates per vector iteration, not per
+        # transition.
         self._replay_ratio_scale = (
-            max(1, num_envs_of(env) // 4) if bool(int(hyperparams.get("auto_scale_replay_ratio", 1))) else 1
+            max(1, num_envs_of(env) // 4) if bool(int(hyperparams.get("auto_scale_replay_ratio", 0))) else 1
         )
         self.train_steps_per_iter = _train_steps_per_iter_base * self._replay_ratio_scale
         self.learning_starts = int(hyperparams.get("learning_starts", 500))
@@ -2404,6 +2526,24 @@ class NativeResearchImZero(CustomAlgorithm):
                 pad_mask[i, base_i:end_i] = True
 
             hidden = self.transformer(tokens, pad_mask)
+            # All K bootstrap observations are independent one-token
+            # contexts, so evaluate them as one `(B*K, 1)` batch. The old
+            # loop below launched tokenizer+Transformer+head K separate
+            # times per optimizer step; with `unroll_steps=5` that was
+            # pure launch/dispatch overhead and prevented the GPU from
+            # seeing the largest available batch.
+            with torch.no_grad():
+                bootstrap_tokenizer = self.target_tokenizer if self.use_target_for_bootstrap else self.tokenizer
+                bootstrap_transformer = self.target_transformer if self.use_target_for_bootstrap else self.transformer
+                bootstrap_heads = self.target_heads if self.use_target_for_bootstrap else self.heads
+                td_obs_flat = torch.as_tensor(
+                    batch["td_obs"], dtype=torch.float32, device=device,
+                ).view(b * k_steps, *self._obs_shape)
+                td_obs_emb = bootstrap_tokenizer(td_obs_flat)
+                td_pad = torch.ones(b * k_steps, 1, dtype=torch.bool, device=device)
+                td_hidden = bootstrap_transformer(td_obs_emb.unsqueeze(1), td_pad)[:, 0, :]
+                bootstrap_values = bootstrap_heads.value(td_hidden).view(b, k_steps)
+                bootstrap_values = bootstrap_values * td_bootstrap_mask
             # `obs0_pos[i]` = lane `i`'s own obs0 token position (its context's
             # last real slot) - differs per lane now, so every hidden-state
             # read below gathers by index instead of slicing a shared offset.
@@ -2444,22 +2584,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 # a fresher root-value estimate than a plain online-net
                 # bootstrap that's chasing its own recent update.
                 with torch.no_grad():
-                    # `use_target_for_bootstrap` (default on): the slow-
-                    # moving EMA copy, not the online net, so the value
-                    # head isn't training partly towards a target it
-                    # itself produced moments ago (module docstring's
-                    # "Schedules, not fixed constants" section). Off:
-                    # exactly this file's original online-net bootstrap.
-                    bootstrap_tokenizer = self.target_tokenizer if self.use_target_for_bootstrap else self.tokenizer
-                    bootstrap_transformer = self.target_transformer if self.use_target_for_bootstrap else self.transformer
-                    bootstrap_heads = self.target_heads if self.use_target_for_bootstrap else self.heads
-                    td_obs_emb = bootstrap_tokenizer(
-                        torch.as_tensor(batch["td_obs"][:, k], dtype=torch.float32, device=device),
-                    )
-                    td_pad = torch.ones(b, 1, dtype=torch.bool, device=device)
-                    td_hidden = bootstrap_transformer(td_obs_emb.unsqueeze(1), td_pad)[:, -1, :]
-                    bootstrap_value = bootstrap_heads.value(td_hidden) * td_bootstrap_mask[:, k]
-                    td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_value
+                    td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_values[:, k]
                     value_target = torch.maximum(td_target, search_value[:, k])
                 value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
                 v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
@@ -2526,7 +2651,26 @@ class NativeResearchImZero(CustomAlgorithm):
                 p_true = F.normalize(self.projector(true_next_emb), dim=-1).detach()
                 z_pred = self.heads.latent(h_act_k)
                 p_pred = F.normalize(self.predictor(self.projector(z_pred)), dim=-1)
-                c_loss = -(p_true * p_pred).sum(-1)
+                # `1 - cos_sim`, not the more common `-cos_sim` - both have
+                # the *exact same gradient* (a constant `+1` shift), but
+                # `-cos_sim` can go negative (cos_sim in `[-1, 1]`), which
+                # silently breaks `adaptive_loss_weights`'s own Kendall-
+                # style `precision * loss + log_var` term below: that
+                # formula's stability derivation assumes `loss >= 0` (an
+                # interior minimum only exists there) - handed a
+                # *negative* loss, minimizing it has no interior minimum
+                # at all, so `precision = exp(-log_var)` runs away to
+                # `+inf` instead of converging (this file's own postmortem:
+                # `loss_weight_consistency` measured climbing 2 -> 9896 in
+                # under 7k steps on a real NetHack run, dragging
+                # `total_loss` to `-13486` and swamping every other task's
+                # gradient in the process - training never recovered).
+                # `1 - cos_sim` (`[0, 2]`, floored at exactly `0`) is the
+                # same fix in spirit as most public SimSiam
+                # implementations' own `2 - 2*cos_sim` convention - not a
+                # tuning choice, a correctness fix for `adaptive_loss_
+                # weights` specifically.
+                c_loss = 1.0 - (p_true * p_pred).sum(-1)
                 consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
             n = float(k_steps)
@@ -2547,12 +2691,33 @@ class NativeResearchImZero(CustomAlgorithm):
                         torch.as_tensor(self.reward_loss_coef, device=device),
                         torch.as_tensor(self.value_loss_coef, device=device),
                         torch.as_tensor(self.policy_loss_coef, device=device),
-                        torch.as_tensor(self.consistency_loss_coef, device=device),
                     ],
                 )
-                task_losses = torch.stack([reward_loss, value_loss, policy_loss, consistency_loss])
-                precision = torch.exp(-self.loss_log_vars)
-                total_loss = (static_coefs * precision * task_losses + self.loss_log_vars).sum()
+                # `consistency_loss` is *not* in here - see `__init__`'s
+                # own `self.loss_log_vars` comment for why (no genuine
+                # noise floor -> unbounded weight growth even after the
+                # `1 - cos_sim` sign fix, just capped at the clamp ceiling
+                # instead of at `+inf`). It keeps its plain static
+                # `consistency_loss_coef` term, added on unweighted-
+                # further, same as the `else` branch right below.
+                task_losses = torch.stack([reward_loss, value_loss, policy_loss])
+                # Defense-in-depth, on top of the `1 - cos_sim` fix above:
+                # clamps `precision` to `[~0.007, ~148]` (`log_var` to
+                # `[-5, 5]`) no matter which task loss it's attached to -
+                # even a strictly non-negative loss that keeps shrinking
+                # towards (but never quite reaching) `0` late in training
+                # would otherwise let its own `precision` climb without a
+                # real ceiling (this file's own postmortem saw `loss_
+                # weight_reward` climbing monotonically the entire run,
+                # never plateauing, off an already-tiny `reward_loss`).
+                # Bounded, not clamped to a single fixed value - each
+                # task's weight still adapts freely *within* this range.
+                log_var = self.loss_log_vars.clamp(-5.0, 5.0)
+                precision = torch.exp(-log_var)
+                total_loss = (
+                    (static_coefs * precision * task_losses + log_var).sum()
+                    + self.consistency_loss_coef * consistency_loss
+                )
             else:
                 total_loss = (
                     self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
@@ -2576,6 +2741,17 @@ class NativeResearchImZero(CustomAlgorithm):
         torch.nn.utils.clip_grad_norm_(self._params, self.max_grad_norm)
         self._grad_scaler.step(self.optimizer)
         self._grad_scaler.update()
+        if self.adaptive_loss_weights:
+            # In-place, post-step - `total_loss`'s own `.clamp(-5.0, 5.0)`
+            # (forward-pass-only) keeps a saturated `log_var` from making
+            # things *worse* (zero gradient once clamped), but doesn't
+            # stop Adam's own momentum from still carrying the raw
+            # parameter further out on a run long enough for it to
+            # matter - this keeps the actual stored parameter itself
+            # inside the same bounds the loss was computed with, so the
+            # reported `loss_weight_*` metrics below always match what
+            # `_train_step` actually used.
+            self.loss_log_vars.data.clamp_(-5.0, 5.0)
         if self.use_target_for_bootstrap:
             self._update_target_network()
 
@@ -2620,7 +2796,10 @@ class NativeResearchImZero(CustomAlgorithm):
                     "loss_weight_reward": float(torch.exp(-self.loss_log_vars[0]).item()),
                     "loss_weight_value": float(torch.exp(-self.loss_log_vars[1]).item()),
                     "loss_weight_policy": float(torch.exp(-self.loss_log_vars[2]).item()),
-                    "loss_weight_consistency": float(torch.exp(-self.loss_log_vars[3]).item()),
+                    # No `loss_weight_consistency` here anymore - see
+                    # `__init__`'s own `self.loss_log_vars` comment: it
+                    # keeps a fixed `consistency_loss_coef` weight, not an
+                    # adaptive one, so there's no per-step value to report.
                 }
                 if self.adaptive_loss_weights
                 else {}
@@ -2690,9 +2869,21 @@ class NativeResearchImZero(CustomAlgorithm):
                     action_flats.append(obs_to_array(env_action, self._action_space))
                     policy_targets.append(result["policy_target"])
 
-            next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, env_actions)
+            next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
             dones = terminated | truncated
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            # `vec_step` uses SAME_STEP autoreset: `next_obs_arr` is the
+            # fresh reset observation for a done lane (the state the next
+            # policy call must see), while `final_obs` is the true next
+            # observation of the terminal transition. Keep these roles
+            # separate so replay/consistency never learn a cross-episode
+            # `terminal -> reset` transition and the persistent cache
+            # starts the new episode from a genuinely empty history.
+            transition_next_obs_arr = next_obs_arr.copy()
+            for lane in np.flatnonzero(dones):
+                final_obs = infos[int(lane)].get("final_obs")
+                if final_obs is not None:
+                    transition_next_obs_arr[int(lane)] = obs_to_array(final_obs, self._obs_space)
             # RND intrinsic reward (`intrinsic_exploration`, off by
             # default - see `DEFAULT_HYPERPARAMS["intrinsic_exploration"]`'s
             # own docstring): `dqn.py`'s own per-lane convention, one
@@ -2705,20 +2896,30 @@ class NativeResearchImZero(CustomAlgorithm):
             # episode ends.
             extrinsic_reward = rewards.astype(np.float64)
             intrinsic_reward = (
-                np.array([self.rnd_bonus_coef * self.rnd.bonus(next_obs_arr[lane]) for lane in range(n_envs)])
+                np.array(
+                    [self.rnd_bonus_coef * self.rnd.bonus(transition_next_obs_arr[lane]) for lane in range(n_envs)],
+                )
                 if self.rnd
                 else np.zeros(n_envs)
             )
             total_reward = extrinsic_reward + intrinsic_reward
             for lane in range(n_envs):
                 self.buffer.add(
-                    obs_arr[lane], action_flats[lane], float(total_reward[lane]), next_obs_arr[lane],
+                    obs_arr[lane], action_flats[lane], float(total_reward[lane]), transition_next_obs_arr[lane],
                     policy_targets[lane], bool(dones[lane]), lane=lane,
                 )
             if num_timesteps >= self.learning_starts:
-                new_caches = self._advance_lane_caches(self._lane_cache, obs_arr, np.stack(action_flats))
-                for lane in range(n_envs):
-                    self._lane_cache[lane] = None if dones[lane] else new_caches[lane]
+                done_lanes = np.flatnonzero(dones)
+                for lane in done_lanes:
+                    self._lane_cache[int(lane)] = None
+                active_lanes = np.flatnonzero(~dones)
+                if active_lanes.size:
+                    active_caches = [self._lane_cache[int(lane)] for lane in active_lanes]
+                    active_obs = obs_arr[active_lanes]
+                    active_actions = np.stack([action_flats[int(lane)] for lane in active_lanes])
+                    advanced = self._advance_lane_caches(active_caches, active_obs, active_actions)
+                    for lane, cache in zip(active_lanes, advanced):
+                        self._lane_cache[int(lane)] = cache
             obs_arr = next_obs_arr
             ep_reward += total_reward
             ep_extrinsic += extrinsic_reward
@@ -2728,11 +2929,21 @@ class NativeResearchImZero(CustomAlgorithm):
             num_timesteps += n_envs
             self._num_timesteps = num_timesteps
 
-            if self.buffer.num_episodes >= 1 and num_timesteps >= self.learning_starts:
+            if (
+                num_timesteps >= self.learning_starts
+                and self.buffer.num_replay_transitions >= max(1, self.learning_starts)
+            ):
                 effective_prev = max(prev_num_timesteps, self.learning_starts)
                 boundaries_crossed = num_timesteps // self.train_freq - effective_prev // self.train_freq
-                for _ in range(self.train_steps_per_iter * boundaries_crossed):
-                    self._last_metrics = self._train_step()
+                if boundaries_crossed > 0:
+                    # One update group per vector iteration, matching the
+                    # native algorithms' historical semantics. The jump
+                    # by `n_envs` only decides whether a boundary was
+                    # crossed; multiplying by its count here and scaling
+                    # again in `__init__` was the 144-updates/iteration
+                    # regression diagnosed on the real NetHack runs.
+                    for _ in range(self.train_steps_per_iter):
+                        self._last_metrics = self._train_step()
 
                 reanalyze_boundaries = num_timesteps // self.reanalyze_freq - effective_prev // self.reanalyze_freq
                 if reanalyze_boundaries > 0:
@@ -2815,6 +3026,13 @@ class NativeResearchImZero(CustomAlgorithm):
         if algo.rnd and payload.get("rnd_state"):
             algo.rnd.load_checkpoint_state(payload["rnd_state"])
         if "loss_log_vars" in payload:
-            with torch.no_grad():
-                algo.loss_log_vars.copy_(payload["loss_log_vars"].to(device))
+            saved = payload["loss_log_vars"]
+            if saved.shape == algo.loss_log_vars.shape:
+                with torch.no_grad():
+                    algo.loss_log_vars.copy_(saved.to(device))
+            # else: shape changed (old checkpoints saved 4 - [reward,
+            # value, policy, consistency] - this file now only adaptively
+            # weights 3, see `__init__`'s own comment) - starting the 3
+            # kept entries back at `0.0` (this file's own "equivalent to
+            # static coefs" starting point) rather than crashing on load.
         return algo

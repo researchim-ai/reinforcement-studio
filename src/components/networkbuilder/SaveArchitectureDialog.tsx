@@ -5,7 +5,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { api } from '@/api/client'
-import type { NetworkFamily, NetworkSpec } from '@/api/types'
+import type { AnyNetworkSpec, NetworkFamily } from '@/api/types'
 
 function slugify(name: string): string {
   const slug = name
@@ -21,7 +21,7 @@ export interface SaveArchitectureDialogProps {
   open: boolean
   onClose: () => void
   family: NetworkFamily
-  spec: NetworkSpec
+  spec: AnyNetworkSpec
   defaultName?: string
   onSaved?: (slug: string) => void
 }
