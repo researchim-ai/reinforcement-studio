@@ -19,8 +19,8 @@ see `unizero.py`'s own module docstring for why each of these matters,
 **`efficientzero.py`'s own proven training recipe** everywhere that
 recipe, empirically, is what actually made the earlier good runs learn
 fast: Gumbel search instead of PUCT, SimSiam consistency instead of an
-EMA target network, `max(td_target, search_value)` value targets instead
-of a plain TD target, plain `Adam` instead of `AdamW`, PER + reanalyze +
+MSE latent target, context-aware EMA TD targets convexly blended with
+fresh reanalysis values, plain `Adam` instead of `AdamW`, PER + reanalyze +
 `learning_starts=500` on by default instead of off. Nothing here is
 claimed to be "more correct" relative to any paper - the entire point of
 this file existing separately from `unizero.py` is to be the one we keep
@@ -51,14 +51,11 @@ weighted density fit (`unizero.py`'s own Sampled-UniZero continuous
 policy loss) - both swapped back for simplicity/proven-in-practice
 reasons, not because either alternative is wrong.
 
-**No target network.** Both places `unizero.py` needs one -
-(1) the latent-consistency loss's target embedding and (2) the n-step TD
-target's bootstrap value - use the *online* network directly here, under
-`torch.no_grad()`/`.detach()` stop-gradient, exactly like
-`efficientzero.py` itself does (`self.representation(...)` under
-    60|`no_grad`, never a separate copied model). Two different anti-collapse
-mechanisms replace what a slow-moving EMA target would otherwise be
-guarding against:
+**EMA bootstrap target + SimSiam latent target.** The n-step TD bootstrap
+uses a slow-moving copy of tokenizer/action embedding/Transformer/heads
+and receives the same real historical context as the online value head.
+The latent-consistency branch deliberately remains SimSiam against the
+stop-gradiented online tokenizer:
 - **Consistency loss is SimSiam, not MSE-to-target.** `_Projector`/
   `_Predictor` (ported verbatim from `efficientzero.py`) add a
   `BatchNorm1d`-equipped projector head + an asymmetric predictor on the
@@ -71,8 +68,8 @@ guarding against:
   every-observation-embeds-to-the-same-point degenerate solution, not the
   stop-gradient asymmetry by itself.
 - **Value target additionally blends in a periodically-refreshed search
-  value** (`value_target = max(td_target, search_value)`,
-  `efficientzero.py`'s own `value_target: 'max'` mode, ported as-is) -
+  value** via bounded `reanalyze_value_mix`, not a one-sided `max` that
+  systematically selects optimistic MCTS errors -
   `_reanalyze()` (also ported as-is, `reanalyze_batch_size=64`/
   `reanalyze_freq=200` on by default here, unlike `unizero.py`'s `0`)
   periodically refreshes `search_value` with the network's *current*-
@@ -89,9 +86,19 @@ dynamics", ported wholesale from `efficientzero.py`'s `_EfficientZeroBuffer`
    90|(this file's own `_ResearchImZeroBuffer` only differs from it by the
 extra `context_obs`/`context_action`/`context_valid` slicing every
 Transformer training window needs - see that class's own docstring).
+Active per-lane trajectories are sampled as soon as their next
+observations exist, so long episodes no longer starve training until
+their first terminal transition.
+
+**Closed-loop latent overshooting.** Alongside stable teacher forcing, a
+small sub-batch is recursively rolled through `_step_imagine`: each next
+step consumes the model's own predicted latent exactly as tree search
+does. Multi-step reward/value/latent losses therefore train the world
+model in its deployment mode instead of only on real next-observation
+tokens.
 
 **`learning_starts=500`, not `0`.** `train_freq=1` means one
-gradient-update group per vector iteration (`learn()`'s own
+gradient-update group (two updates by default) per vector iteration (`learn()`'s own
 `boundaries_crossed` comment) - training from the very first few
 transitions, before the buffer has any behavioral diversity, is a real,
 observed failure mode: a from-scratch model + a tiny buffer + this much
@@ -106,7 +113,7 @@ default - choice) gives the buffer a little real behavioral diversity to
 train against before training starts at all.
 
 **Lighter default hyperparameters** (`num_heads=4`, `batch_size=64`,
- 110|`unroll_steps=5`, `num_simulations=32`, `gamma=0.99`,
+ 110|`unroll_steps=5`, adaptive `num_simulations=8→32`, `gamma=0.99`,
 `consistency_loss_coef=2.0`, `value_support_size=300`) - not this file's
 earlier attempt at matching the reference UniZero's own *policy-level*
 defaults (`num_heads=8`, `batch_size=256`, `unroll_steps=10`,
@@ -176,26 +183,22 @@ not part of the original UniZero/EfficientZero synergy above): a
 constant learning rate, `priority_beta`, and search-exploration
 temperature for an entire run turned out to individually leave
 performance on the table once a run went on long enough to reach the
-late-training regime PER + no-target-network self-referential bootstrap
-is most exposed in.
+late-training regime where PER and bootstrapped targets are most exposed.
 - **`lr_schedule`** (default on): cosine-decays `learning_rate` down to
   `learning_rate * lr_min_fraction` from `learning_starts` onward
   (`_update_learning_rate`) - damps the value-loss oscillation a
   constantly-high LR otherwise feeds once PER has sharpened in on a few
   high-priority transitions late in training.
 - **`use_target_for_bootstrap`** (default on): a slow-moving EMA/Polyak
-  copy of tokenizer+transformer+heads (`target_update_theta` per step,
+  copy of tokenizer+action embedding+transformer+heads (`target_update_theta` per step,
   `_update_target_network`) provides the n-step TD bootstrap value
-  instead of the online net - this file's original "no target network"
-  design (above) leaned entirely on SimSiam + `max(td_target,
-  search_value)` to paper over the classic bootstrapped-TD moving-target
-  problem; this restores a real fix for it, for just that one use (never
+  instead of the online net, with real context at every landing state.
+  This fixes the classic moving-target and memoryless-bootstrap problems
+  for just that one use (never
   for the consistency loss's own target - that's still always the online
   tokenizer, deliberately, per that section above). Paired with
-  **`search_value_max_staleness`**: `value_target`'s `max()` only lets a
-  reanalyzed `search_value` win if it was refreshed within that many
-  `_reanalyze()` generations - an indefinitely-stale-but-still-large
-  `search_value` no longer wins forever just because it once was.
+  **`search_value_max_staleness`** and **`reanalyze_value_mix`**: only a
+  fresh reanalyzed value participates in a bounded convex blend with TD.
 - **`priority_beta_start` → `priority_beta`** (default `0.4` → `1.0`):
   the PER importance-sampling correction anneals up across training
   (`_update_priority_beta`) instead of applying full-strength IS
@@ -311,6 +314,11 @@ DEFAULT_HYPERPARAMS = {
     "td_steps": 5,
     "num_sampled_actions": 8,
     "num_simulations": 32,
+    "num_simulations_initial": 8,
+    "search_ramp_steps": 100_000,
+    "search_model_error_low": 0.02,
+    "search_model_error_high": 0.30,
+    "search_model_error_ema_decay": 0.99,
     # Gumbel-Top-k + Sequential Halving (`_HalvingSchedule`/
     # `_sequential_halving`) - `efficientzero.py`'s own defaults, not
     # PUCT's `pb_c_base`/`pb_c_init`/Dirichlet noise (`unizero.py`'s own
@@ -330,6 +338,7 @@ DEFAULT_HYPERPARAMS = {
     # `1.0` here disables the schedule entirely (flat scale of `1.0` the
     # whole run, exactly as before this existed).
     "temperature_anneal_start_scale": 1.5,
+    "temperature_anneal_steps": 100_000,
     "value_minmax_delta": 0.01,
     # `efficientzero.py`'s own, much wider default - not `unizero.py`'s
     # narrower `50` (module docstring's "Lighter default hyperparameters"
@@ -350,6 +359,12 @@ DEFAULT_HYPERPARAMS = {
     # good NetHack runs, between `efficientzero.py`'s policy-level `5.0`
     # and this file's UniZero-parent's reference-matching `10.0`).
     "consistency_loss_coef": 2.0,
+    # Autoregressive training in the exact predicted-latent mode used by
+    # MCTS. Kept on a subset/horizon budget so it adds signal without
+    # multiplying full teacher-forced training cost.
+    "closed_loop_loss_coef": 0.5,
+    "closed_loop_horizon": 3,
+    "closed_loop_batch_fraction": 0.25,
     # Kendall et al. (2018) homoscedastic-uncertainty multi-task
     # weighting - `1` (default): each of the four task losses (reward,
     # value, policy; `consistency` is deliberately excluded, see
@@ -391,7 +406,7 @@ DEFAULT_HYPERPARAMS = {
     "policy_entropy_coef": 5e-3,
     "continuous_prior_scale": 2.5,
     "train_freq": 1,
-    "train_steps_per_iter": 1,
+    "train_steps_per_iter": 2,
     # Opt-in extra learner pressure for large vector envs. Off by default:
     # `learn()` already notices boundaries crossed by the aggregate
     # timestep counter, and the historical fast/successful native runs
@@ -427,31 +442,26 @@ DEFAULT_HYPERPARAMS = {
     # value-error-only priority exactly.
     "priority_policy_weight": 0.1,
     "min_priority": 1e-6,
+    "replay_recent_fraction": 0.5,
+    "replay_recent_window": 512,
     "reanalyze_freq": 200,
     "reanalyze_batch_size": 64,
-    # `1` (default): a slow-moving EMA/Polyak copy of tokenizer+
-    # transformer+heads (`target_update_theta` per `_train_step` call)
-    # provides the n-step TD bootstrap value in place of the online net
-    # (module docstring's "Schedules, not fixed constants" section) -
-    # breaks the classic bootstrapped-TD moving-target problem (the
-    # online value head training partly towards a target it itself just
-    # produced) that this file's original "no target network at all"
-    # design otherwise leaned entirely on SimSiam + `max(td_target,
-    # search_value)` to paper over. `0`: bootstrap straight off the
-    # online net, exactly as before this option existed (never for the
-    # consistency loss's own target either way - that's still always the
-    # online tokenizer, deliberately; see the module docstring).
+    # `1` (default): a context-aware slow-moving EMA/Polyak copy provides
+    # the n-step TD bootstrap and breaks the moving-target problem.
+    # `0`: bootstrap with the online network; consistency always retains
+    # its separate stop-gradient SimSiam target.
     "use_target_for_bootstrap": 1,
     "target_update_theta": 0.02,
     # How many `_reanalyze()` "generations" (module docstring's
     # "Schedules, not fixed constants" section) a transition's own
     # `search_value` may be behind the buffer's current one and still be
-    # allowed to participate in `value_target = max(td_target,
-    # search_value)` - past this, it's treated the same as never having
-    # been reanalyzed at all (`td_target` alone), instead of an
-    # indefinitely-stale-but-still-winning `max()` term. `search_value`
-    # itself is never *lowered* here - only how much it's *trusted*.
+    # allowed to participate in the convex reanalysis/TD blend. Past
+    # this, it is treated the same as never reanalyzed (`td_target` only).
     "search_value_max_staleness": 5,
+    # Convex weight of a fresh reanalyzed root value in the TD target.
+    # Unlike the old hard max, this cannot turn every positive search
+    # error into systematic value overestimation.
+    "reanalyze_value_mix": 0.25,
     # Automatic mixed precision for `_train_step`'s forward/backward pass
     # (module docstring's "Performance, not architecture" section) -
     # `1` (default): on, whenever running on CUDA (always off on CPU,
@@ -1384,7 +1394,7 @@ class _ResearchImZeroBuffer:
     def __init__(
         self, capacity_episodes: int, obs_shape: tuple[int, ...], action_dim: int, policy_target_dim: int,
         context_length: int, num_lanes: int = 1, priority_alpha: float = 1.0, priority_beta: float = 1.0,
-        min_priority: float = 1e-6,
+        min_priority: float = 1e-6, recent_fraction: float = 0.5, recent_window: int = 512,
     ) -> None:
         self.capacity = max(1, capacity_episodes)
         self.obs_shape = obs_shape
@@ -1394,6 +1404,8 @@ class _ResearchImZeroBuffer:
         self.priority_alpha = max(0.0, priority_alpha)
         self.priority_beta = max(0.0, priority_beta)
         self.min_priority = max(1e-8, min_priority)
+        self.recent_fraction = min(1.0, max(0.0, recent_fraction))
+        self.recent_window = max(1, recent_window)
         self.episodes: list[dict[str, np.ndarray]] = []
         self._episode_alpha_sum: list[float] = []
         # `sample_for_reanalyze`'s own bookkeeping (module docstring's
@@ -1413,7 +1425,10 @@ class _ResearchImZeroBuffer:
 
     @staticmethod
     def _new_episode() -> dict[str, list[Any]]:
-        return {"obs": [], "action": [], "reward": [], "next_obs": [], "policy_target": []}
+        return {
+            "obs": [], "action": [], "reward": [], "next_obs": [], "policy_target": [],
+            "priority": [], "search_value": [], "reanalyzed_gen": [],
+        }
 
     def _pad_one(self, obs_hist: list[np.ndarray], action_hist: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Right-pads (valid transitions packed at the *front*, in
@@ -1452,6 +1467,9 @@ class _ResearchImZeroBuffer:
         cur["reward"].append(float(reward))
         cur["next_obs"].append(np.asarray(next_obs, dtype=np.float32))
         cur["policy_target"].append(np.asarray(policy_target, dtype=np.float32))
+        cur["priority"].append(self._max_priority)
+        cur["search_value"].append(self._NO_SEARCH_VALUE)
+        cur["reanalyzed_gen"].append(-1)
         if done:
             self._flush_episode(lane)
 
@@ -1466,12 +1484,12 @@ class _ResearchImZeroBuffer:
             "reward": np.asarray(cur["reward"], dtype=np.float32),
             "next_obs": np.stack(cur["next_obs"]),
             "policy_target": np.stack(cur["policy_target"]),
-            "priority": np.full(ep_len, self._max_priority, dtype=np.float64),
-            "search_value": np.full(ep_len, self._NO_SEARCH_VALUE, dtype=np.float32),
+            "priority": np.asarray(cur["priority"], dtype=np.float64),
+            "search_value": np.asarray(cur["search_value"], dtype=np.float32),
             # `-1`: never reanalyzed - `sample_for_reanalyze`'s own
             # per-transition staleness tracking (see `__init__`'s own
             # comment on `_episode_last_reanalyzed_gen`).
-            "reanalyzed_gen": np.full(ep_len, -1, dtype=np.int64),
+            "reanalyzed_gen": np.asarray(cur["reanalyzed_gen"], dtype=np.int64),
         }
         self.episodes.append(episode)
         self._episode_alpha_sum.append(float(np.sum(episode["priority"] ** self.priority_alpha)))
@@ -1491,14 +1509,15 @@ class _ResearchImZeroBuffer:
 
     @property
     def num_replay_transitions(self) -> int:
-        """Transitions in finalized episodes that `sample()` can read.
+        """Every transition whose next observation is already available.
 
-        `__len__` also includes live per-lane trajectories, but those are
-        intentionally not sampled until their return/terminal status is
-        known. Training readiness must therefore use this property rather
-        than merely checking that one (possibly very short) episode ended.
+        N-step TD does not need to wait for an episode to end: the newest
+        available transition in a live lane can bootstrap from its known
+        ``next_obs``.  Exposing active lanes here removes the long-horizon
+        starvation where NetHack collected tens of thousands of useful
+        transitions before the first few ``done`` signals.
         """
-        return sum(len(ep["reward"]) for ep in self.episodes)
+        return len(self)
 
     @property
     def reanalyze_generation(self) -> int:
@@ -1529,7 +1548,14 @@ class _ResearchImZeroBuffer:
         mask = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_reward = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_obs = np.zeros((batch_size, unroll_steps, *self.obs_shape), dtype=np.float32)
+        bootstrap_steps = unroll_steps + td_steps
+        bootstrap_action = np.zeros((batch_size, bootstrap_steps, self.action_dim), dtype=np.float32)
+        bootstrap_next_obs = np.zeros(
+            (batch_size, bootstrap_steps, *self.obs_shape), dtype=np.float32,
+        )
+        bootstrap_mask = np.zeros((batch_size, bootstrap_steps), dtype=bool)
         td_discount = np.zeros((batch_size, unroll_steps), dtype=np.float32)
+        td_horizon = np.zeros((batch_size, unroll_steps), dtype=np.int64)
         td_bootstrap_mask = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         search_value = np.full((batch_size, unroll_steps), self._NO_SEARCH_VALUE, dtype=np.float32)
         # `-1`: never reanalyzed - `_train_step`'s own freshness gate on
@@ -1540,36 +1566,97 @@ class _ResearchImZeroBuffer:
         episode_idx = np.zeros(batch_size, dtype=np.int64)
         timestep = np.zeros(batch_size, dtype=np.int64)
         sample_prob = np.zeros(batch_size, dtype=np.float64)
+        sampled_active = np.zeros(batch_size, dtype=bool)
+        sampled_recent = np.zeros(batch_size, dtype=bool)
 
-        n_episodes = len(self.episodes)
-        alpha_sums = np.asarray(self._episode_alpha_sum, dtype=np.float64)
-        total_alpha_sum = float(alpha_sums.sum())
-        if total_alpha_sum > 0:
-            ep_probs = alpha_sums / total_alpha_sum
-        else:
-            ep_probs = np.full(n_episodes, 1.0 / n_episodes)
-        ep_choices = np.random.choice(n_episodes, size=batch_size, p=ep_probs)
-        n_total_transitions = max(1, len(self))
+        # Every source, including active lanes, owns durable per-transition
+        # priorities. Sampling is an exact mixture of global PER and a
+        # uniform recent tail from active lanes; ``sample_prob`` below is
+        # the probability under that same mixture, so IS correction remains
+        # valid instead of oscillating between two unaccounted samplers.
+        sources: list[tuple[bool, int]] = [(False, i) for i in range(len(self.episodes))]
+        source_mass = list(self._episode_alpha_sum)
+        recent_ranges: dict[int, tuple[int, int]] = {}
+        total_recent = 0
+        for lane, cur in enumerate(self._cur):
+            if cur["reward"]:
+                sources.append((True, lane))
+                active_priority = np.asarray(cur["priority"], dtype=np.float64)
+                source_mass.append(float(np.sum(active_priority ** self.priority_alpha)))
+                recent_start = max(0, len(cur["reward"]) - self.recent_window)
+                recent_ranges[lane] = (recent_start, len(cur["reward"]))
+                total_recent += len(cur["reward"]) - recent_start
+        if not sources:
+            raise RuntimeError("Cannot sample an empty ResearchImZero replay buffer")
+        source_mass_arr = np.asarray(source_mass, dtype=np.float64)
+        total_alpha_sum = float(source_mass_arr.sum())
+        source_probs = (
+            source_mass_arr / total_alpha_sum
+            if total_alpha_sum > 0
+            else np.full(len(sources), 1.0 / len(sources))
+        )
+        effective_recent_fraction = self.recent_fraction if total_recent > 0 else 0.0
+        n_total_transitions = max(1, self.num_replay_transitions)
 
         for b in range(batch_size):
-            ep_i = int(ep_choices[b])
-            ep = self.episodes[ep_i]
-            t_len = len(ep["reward"])
-            local_weight = ep["priority"] ** self.priority_alpha
-            local_sum = float(local_weight.sum())
-            if local_sum > 0:
-                local_probs = local_weight / local_sum
-                start = int(np.random.choice(t_len, p=local_probs))
-                local_prob = float(local_probs[start])
+            choose_recent = np.random.random() < effective_recent_fraction
+            if choose_recent:
+                recent_offset = int(np.random.randint(total_recent))
+                source_i = -1
+                for candidate_i, (candidate_active, candidate_index) in enumerate(sources):
+                    if not candidate_active:
+                        continue
+                    recent_start, recent_end = recent_ranges[candidate_index]
+                    recent_len = recent_end - recent_start
+                    if recent_offset < recent_len:
+                        source_i = candidate_i
+                        start = recent_start + recent_offset
+                        break
+                    recent_offset -= recent_len
+                if source_i < 0:
+                    raise RuntimeError("Recent replay source accounting became inconsistent")
             else:
-                start = int(np.random.randint(t_len))
-                local_prob = 1.0 / t_len
-            episode_idx[b] = ep_i
+                source_i = int(np.random.choice(len(sources), p=source_probs))
+            is_active, source_index = sources[source_i]
+            sampled_active[b] = is_active
+            sampled_recent[b] = choose_recent
+            ep = self._cur[source_index] if is_active else self.episodes[source_index]
+            t_len = len(ep["reward"])
+            priority = np.asarray(ep["priority"], dtype=np.float64)
+            local_weight = priority ** self.priority_alpha
+            local_sum = float(local_weight.sum())
+            if not choose_recent:
+                if local_sum > 0:
+                    local_probs = local_weight / local_sum
+                    start = int(np.random.choice(t_len, p=local_probs))
+                else:
+                    start = int(np.random.randint(t_len))
+            episode_idx[b] = -source_index - 1 if is_active else source_index
             timestep[b] = start
-            sample_prob[b] = max(ep_probs[ep_i] * local_prob, 1e-12)
+            per_probability = (
+                source_probs[source_i] * float(local_weight[start] / local_sum)
+                if local_sum > 0 else source_probs[source_i] / t_len
+            )
+            recent_probability = 0.0
+            if is_active:
+                recent_start, recent_end = recent_ranges[source_index]
+                if recent_start <= start < recent_end:
+                    recent_probability = 1.0 / total_recent
+            sample_prob[b] = max(
+                (1.0 - effective_recent_fraction) * per_probability
+                + effective_recent_fraction * recent_probability,
+                1e-12,
+            )
 
             ctx_obs[b], ctx_action[b], ctx_valid[b] = self._context_for(ep, start)
             obs0[b] = ep["obs"][start]
+            for j in range(bootstrap_steps):
+                idx = start + j
+                if idx >= t_len:
+                    break
+                bootstrap_action[b, j] = ep["action"][idx]
+                bootstrap_next_obs[b, j] = ep["next_obs"][idx]
+                bootstrap_mask[b, j] = True
             for k in range(unroll_steps):
                 idx = start + k
                 if idx >= t_len:
@@ -1589,9 +1676,12 @@ class _ResearchImZeroBuffer:
                     discount *= gamma
                 td_reward[b, k] = td_sum
                 td_discount[b, k] = discount
+                td_horizon[b, k] = n
                 landing_idx = idx + n - 1
                 td_obs[b, k] = ep["next_obs"][landing_idx]
-                td_bootstrap_mask[b, k] = 0.0 if landing_idx == t_len - 1 else 1.0
+                td_bootstrap_mask[b, k] = (
+                    1.0 if is_active else (0.0 if landing_idx == t_len - 1 else 1.0)
+                )
 
         is_weight = (1.0 / (n_total_transitions * sample_prob)) ** self.priority_beta
         is_weight = is_weight / max(float(is_weight.max()), 1e-12)
@@ -1600,17 +1690,29 @@ class _ResearchImZeroBuffer:
             "context_obs": ctx_obs, "context_action": ctx_action, "context_valid": ctx_valid,
             "obs0": obs0, "action": action, "reward": reward, "next_obs": next_obs,
             "policy_target": policy_target, "mask": mask, "td_reward": td_reward,
-            "td_obs": td_obs, "td_discount": td_discount, "td_bootstrap_mask": td_bootstrap_mask,
+            "td_obs": td_obs,
+            "bootstrap_action": bootstrap_action,
+            "bootstrap_next_obs": bootstrap_next_obs,
+            "bootstrap_mask": bootstrap_mask,
+            "td_discount": td_discount, "td_horizon": td_horizon,
+            "td_bootstrap_mask": td_bootstrap_mask,
             "search_value": search_value, "search_value_gen": search_value_gen,
             "episode_idx": episode_idx, "timestep": timestep,
             "is_weight": is_weight.astype(np.float32),
+            "active_sample_fraction": np.asarray(sampled_active.mean(), dtype=np.float32),
+            "recent_sample_fraction": np.asarray(sampled_recent.mean(), dtype=np.float32),
         }
 
     def update_priorities(self, episode_idx: np.ndarray, timestep: np.ndarray, values: np.ndarray) -> None:
         values = np.maximum(np.asarray(values, dtype=np.float64), self.min_priority)
         touched = set()
         for ep_i, t, v in zip(episode_idx.tolist(), timestep.tolist(), values.tolist()):
-            if not (0 <= ep_i < len(self.episodes)):
+            if ep_i < 0:
+                lane = -ep_i - 1
+                if 0 <= lane < len(self._cur) and t < len(self._cur[lane]["priority"]):
+                    self._cur[lane]["priority"][t] = v
+                continue
+            if ep_i >= len(self.episodes):
                 continue
             self.episodes[ep_i]["priority"][t] = v
             touched.add(ep_i)
@@ -1622,54 +1724,53 @@ class _ResearchImZeroBuffer:
     def sample_for_reanalyze(
         self, n: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        n_episodes = len(self.episodes)
-        n = min(n, sum(len(ep["reward"]) for ep in self.episodes))
+        sources: list[tuple[bool, int]] = [(False, i) for i in range(len(self.episodes))]
+        sources.extend((True, lane) for lane, cur in enumerate(self._cur) if cur["reward"])
+        n = min(n, self.num_replay_transitions)
         length = self.context_length
-        if n <= 0:
+        if n <= 0 or not sources:
             empty_obs = np.zeros((0, *self.obs_shape), dtype=np.float32)
             return (
                 np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), empty_obs,
                 np.zeros((0, length, *self.obs_shape), dtype=np.float32), np.zeros((0, length, self.action_dim), dtype=np.float32),
                 np.zeros((0, length), dtype=bool),
             )
-        # Episode-level pick: `_episode_alpha_sum[i]` (same PER weight
-        # `sample()`'s own episode selection uses) times a staleness
-        # multiplier - `gen - last_reanalyzed_gen[i] + 1` generations
-        # since anything in episode `i` was last refreshed (`+1` so a
-        # just-touched episode still has *some* chance, not zero), or
-        # `gen + 1` for a never-reanalyzed episode (at least as eager as
-        # the stalest possible existing one, so brand-new episodes don't
-        # starve forever behind old high-priority ones) - not the old
-        # "weighted by length only" scheme, which was blind to both
-        # priority and staleness entirely.
+        # One priority*staleness distribution over both finalized and live
+        # transitions. Reanalyzing live targets is essential when early
+        # low-budget MCTS policy labels would otherwise remain frozen until
+        # a multi-thousand-step NetHack episode eventually terminates.
         gen = float(self._reanalyze_generation)
-        last_gen = np.asarray(self._episode_last_reanalyzed_gen, dtype=np.float64)
-        ep_staleness = np.where(last_gen < 0, gen + 1.0, np.maximum(1.0, gen - last_gen + 1.0))
-        alpha_sums = np.asarray(self._episode_alpha_sum, dtype=np.float64)
-        ep_scores = alpha_sums * ep_staleness
-        total_score = float(ep_scores.sum())
-        ep_probs = ep_scores / total_score if total_score > 0 else np.full(n_episodes, 1.0 / n_episodes)
-        ep_choices = np.random.choice(n_episodes, size=n, p=ep_probs)
+        transition_scores: list[np.ndarray] = []
+        source_scores = np.zeros(len(sources), dtype=np.float64)
+        for source_i, (is_active, source_index) in enumerate(sources):
+            ep = self._cur[source_index] if is_active else self.episodes[source_index]
+            priorities = np.asarray(ep["priority"], dtype=np.float64)
+            rgen = np.asarray(ep["reanalyzed_gen"], dtype=np.float64)
+            staleness = np.where(rgen < 0, gen + 1.0, np.maximum(1.0, gen - rgen + 1.0))
+            scores = (priorities ** self.priority_alpha) * staleness
+            transition_scores.append(scores)
+            source_scores[source_i] = float(scores.sum())
+        total_score = float(source_scores.sum())
+        source_probs = (
+            source_scores / total_score
+            if total_score > 0
+            else np.full(len(sources), 1.0 / len(sources))
+        )
+        source_choices = np.random.choice(len(sources), size=n, p=source_probs)
         episode_idx = np.zeros(n, dtype=np.int64)
         timestep = np.zeros(n, dtype=np.int64)
         obs_out = np.zeros((n, *self.obs_shape), dtype=np.float32)
         ctx_obs = np.zeros((n, length, *self.obs_shape), dtype=np.float32)
         ctx_action = np.zeros((n, length, self.action_dim), dtype=np.float32)
         ctx_valid = np.zeros((n, length), dtype=bool)
-        for i, ep_i in enumerate(ep_choices.tolist()):
-            ep = self.episodes[ep_i]
+        for i, source_i in enumerate(source_choices.tolist()):
+            is_active, source_index = sources[source_i]
+            ep = self._cur[source_index] if is_active else self.episodes[source_index]
             t_len = len(ep["reward"])
-            # Same idea, one level down: within the chosen episode, favor
-            # whichever transitions are themselves both high-priority and
-            # individually stale, not just "this episode as a whole is
-            # overdue" - two episodes tied on the episode-level score
-            # above can still have very different per-transition needs.
-            rgen = ep["reanalyzed_gen"].astype(np.float64)
-            t_staleness = np.where(rgen < 0, gen + 1.0, np.maximum(1.0, gen - rgen + 1.0))
-            weight = (ep["priority"] ** self.priority_alpha) * t_staleness
+            weight = transition_scores[source_i]
             weight_sum = float(weight.sum())
             t = int(np.random.choice(t_len, p=weight / weight_sum)) if weight_sum > 0 else int(np.random.randint(t_len))
-            episode_idx[i] = ep_i
+            episode_idx[i] = -source_index - 1 if is_active else source_index
             timestep[i] = t
             obs_out[i] = ep["obs"][t]
             ctx_obs[i], ctx_action[i], ctx_valid[i] = self._context_for(ep, t)
@@ -1681,7 +1782,18 @@ class _ResearchImZeroBuffer:
         self._reanalyze_generation += 1
         gen = self._reanalyze_generation
         for i, (ep_i, t) in enumerate(zip(episode_idx.tolist(), timestep.tolist())):
-            if not (0 <= ep_i < len(self.episodes)):
+            if ep_i < 0:
+                lane = -ep_i - 1
+                if lane >= len(self._cur):
+                    continue
+                ep = self._cur[lane]
+                if t >= len(ep["reward"]):
+                    continue
+                ep["policy_target"][t] = np.asarray(policy_targets[i], dtype=np.float32)
+                ep["search_value"][t] = float(search_values[i])
+                ep["reanalyzed_gen"][t] = gen
+                continue
+            if ep_i >= len(self.episodes):
                 continue
             ep = self.episodes[ep_i]
             if t >= len(ep["reward"]):
@@ -1765,9 +1877,10 @@ class NativeResearchImZero(CustomAlgorithm):
         # gradiented per-call, per `use_target_for_bootstrap`'s own
         # docstring) - only for `_train_step`'s n-step TD bootstrap.
         self.target_tokenizer = copy.deepcopy(self.tokenizer).eval()
+        self.target_action_embed = copy.deepcopy(self.action_embed).eval()
         self.target_transformer = copy.deepcopy(self.transformer).eval()
         self.target_heads = copy.deepcopy(self.heads).eval()
-        for module in (self.target_tokenizer, self.target_transformer, self.target_heads):
+        for module in (self.target_tokenizer, self.target_action_embed, self.target_transformer, self.target_heads):
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
         # SimSiam projector/predictor (module docstring's "no target
@@ -1864,6 +1977,22 @@ class NativeResearchImZero(CustomAlgorithm):
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
         self.num_sampled_actions = max(2, int(hyperparams.get("num_sampled_actions", 8)))
         self.num_simulations = max(2, int(hyperparams.get("num_simulations", 32)))
+        self.num_simulations_initial = max(
+            2, min(self.num_simulations, int(hyperparams.get("num_simulations_initial", 8))),
+        )
+        self.search_ramp_steps = max(1, int(hyperparams.get("search_ramp_steps", 100_000)))
+        self.search_model_error_low = max(
+            0.0, float(hyperparams.get("search_model_error_low", 0.02)),
+        )
+        self.search_model_error_high = max(
+            self.search_model_error_low + 1e-6,
+            float(hyperparams.get("search_model_error_high", 0.30)),
+        )
+        self.search_model_error_ema_decay = min(
+            0.9999, max(0.0, float(hyperparams.get("search_model_error_ema_decay", 0.99))),
+        )
+        self._model_error_ema = self.search_model_error_high
+        self._last_search_num_simulations = self.num_simulations_initial
         # Gumbel-Top-k + Sequential Halving (module docstring's "Search"
         # section) - `efficientzero.py`'s own defaults, not PUCT's
         # `pb_c_base`/`pb_c_init`/Dirichlet noise.
@@ -1872,14 +2001,22 @@ class NativeResearchImZero(CustomAlgorithm):
         self.c_scale = float(hyperparams.get("c_scale", 0.1))
         self.policy_target_temperature = max(1e-6, float(hyperparams.get("policy_target_temperature", 1.0)))
         self.temperature_anneal_start_scale = max(1.0, float(hyperparams.get("temperature_anneal_start_scale", 1.5)))
+        self.temperature_anneal_steps = max(1, int(hyperparams.get("temperature_anneal_steps", 100_000)))
         self.value_minmax_delta = float(hyperparams.get("value_minmax_delta", 0.01))
         self.value_loss_coef = float(hyperparams.get("value_loss_coef", 0.25))
         self.policy_loss_coef = float(hyperparams.get("policy_loss_coef", 1.0))
         self.reward_loss_coef = float(hyperparams.get("reward_loss_coef", 1.0))
         self.consistency_loss_coef = float(hyperparams.get("consistency_loss_coef", 2.0))
+        self.closed_loop_loss_coef = max(0.0, float(hyperparams.get("closed_loop_loss_coef", 0.5)))
+        self.closed_loop_horizon = max(1, min(
+            self.unroll_steps, int(hyperparams.get("closed_loop_horizon", 3)),
+        ))
+        self.closed_loop_batch_fraction = min(
+            1.0, max(0.0, float(hyperparams.get("closed_loop_batch_fraction", 0.25))),
+        )
         self.continuous_prior_scale = float(hyperparams.get("continuous_prior_scale", 2.5))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
-        _train_steps_per_iter_base = max(1, int(hyperparams.get("train_steps_per_iter", 1)))
+        _train_steps_per_iter_base = max(1, int(hyperparams.get("train_steps_per_iter", 2)))
         # `learn()` executes this many updates once a vector iteration
         # crosses a train-frequency boundary. Do not multiply by the
         # number of aggregate boundaries again there: with 24 envs that
@@ -1907,6 +2044,7 @@ class NativeResearchImZero(CustomAlgorithm):
         self.use_target_for_bootstrap = bool(int(hyperparams.get("use_target_for_bootstrap", 1)))
         self.target_update_theta = float(hyperparams.get("target_update_theta", 0.02))
         self.search_value_max_staleness = max(0, int(hyperparams.get("search_value_max_staleness", 5)))
+        self.reanalyze_value_mix = min(1.0, max(0.0, float(hyperparams.get("reanalyze_value_mix", 0.25))))
         self.rnd_bonus_coef = float(hyperparams.get("rnd_bonus_coef", 0.1))
         self.rnd = (
             RNDModule(
@@ -1938,6 +2076,8 @@ class NativeResearchImZero(CustomAlgorithm):
             # (`self.buffer.priority_beta` reassigned there each time,
             # see `_update_learning_rate`'s sibling schedule helpers).
             priority_alpha=self.priority_alpha, priority_beta=self.priority_beta_start, min_priority=self.min_priority,
+            recent_fraction=float(hyperparams.get("replay_recent_fraction", 0.5)),
+            recent_window=int(hyperparams.get("replay_recent_window", 512)),
         )
         self._last_metrics: dict[str, float] = {}
         # `learn()`'s own persistent per-lane real-history cache (module
@@ -1957,6 +2097,7 @@ class NativeResearchImZero(CustomAlgorithm):
     # ------------------------------------------------------------------
     def _embed_root_batch(
         self, ctx_obs: np.ndarray, ctx_action: np.ndarray, ctx_valid: np.ndarray, current_obs: np.ndarray,
+        tokenizer: nn.Module | None = None, action_embed: nn.Module | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
         """`ctx_*`: `(B, context_length, ...)`, right-padded (see
         `_ResearchImZeroBuffer._pad_one`). `current_obs`: `(B, *obs_shape)`.
@@ -1977,15 +2118,17 @@ class NativeResearchImZero(CustomAlgorithm):
         offset)."""
         b, length = ctx_obs.shape[0], self.context_length
         device = self.device
+        tokenizer = self.tokenizer if tokenizer is None else tokenizer
+        action_embed = self.action_embed if action_embed is None else action_embed
         n_valid = ctx_valid.sum(axis=1).astype(np.int64) if length > 0 else np.zeros(b, dtype=np.int64)
         valid_len = 2 * n_valid + 1
         lmax = int(valid_len.max()) if b > 0 else 1
         if length > 0:
             obs_flat = torch.as_tensor(ctx_obs.reshape(b * length, *self._obs_shape), dtype=torch.float32, device=device)
-            obs_emb_all = self.tokenizer(obs_flat).view(b, length, self.embed_dim)
+            obs_emb_all = tokenizer(obs_flat).view(b, length, self.embed_dim)
             act_flat = torch.as_tensor(ctx_action.reshape(b * length, self.action_dim), dtype=torch.float32, device=device)
-            act_emb_all = self.action_embed(act_flat).view(b, length, self.embed_dim)
-        cur_emb = self.tokenizer(torch.as_tensor(current_obs, dtype=torch.float32, device=device))
+            act_emb_all = action_embed(act_flat).view(b, length, self.embed_dim)
+        cur_emb = tokenizer(torch.as_tensor(current_obs, dtype=torch.float32, device=device))
         tokens = torch.zeros(b, lmax, self.embed_dim, device=device)
         pad_mask = torch.zeros(b, lmax, dtype=torch.bool, device=device)
         for i in range(b):
@@ -2133,6 +2276,28 @@ class NativeResearchImZero(CustomAlgorithm):
                 cache.evict_front(keep)
             return caches2
 
+    def _append_actions_to_root_caches(
+        self, root_caches: list[_TransformerCache], action_flat: np.ndarray,
+    ) -> list[_TransformerCache]:
+        """Persist search's already-computed root observation plus action.
+
+        ``search`` has just appended the current real observation to every
+        lane cache. Reusing that exact cache avoids tokenizing and attending
+        over the same observation a second time in `_advance_lane_caches`.
+        """
+        with torch.inference_mode():
+            positions, embed_positions = _cache_positions(root_caches, self.device)
+            action_emb = self.action_embed(
+                torch.as_tensor(action_flat, dtype=torch.float32, device=self.device),
+            )
+            _, caches = self.transformer.forward_incremental_batch(
+                action_emb, positions, root_caches, embed_positions,
+            )
+            keep = 2 * self.context_length
+            for cache in caches:
+                cache.evict_front(keep)
+            return caches
+
     # ------------------------------------------------------------------
     # Search - a genuine batched Gumbel search tree, see module docstring.
     # ------------------------------------------------------------------
@@ -2225,7 +2390,13 @@ class NativeResearchImZero(CustomAlgorithm):
                 root_std_np = root_std.detach().cpu().numpy()
 
         n_slots = self.n_actions if self.discrete else self.num_sampled_actions
-        num_top_actions = max(2, min(self.num_top_actions, n_slots))
+        current_num_simulations = self._current_num_simulations()
+        self._last_search_num_simulations = current_num_simulations
+        # Keep enough budget for an actual halving phase at the cheap
+        # beginning of the schedule (8 simulations -> at most 4 roots).
+        num_top_actions = max(
+            2, min(self.num_top_actions, n_slots, max(2, current_num_simulations // 2)),
+        )
         roots: list[_SearchNode] = []
         for i in range(batch_size):
             root = _SearchNode(prior=1.0)
@@ -2246,9 +2417,9 @@ class NativeResearchImZero(CustomAlgorithm):
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
         gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature * self._current_exploration_scale()
-        schedule = _HalvingSchedule(self.num_simulations, num_top_actions)
+        schedule = _HalvingSchedule(current_num_simulations, num_top_actions)
 
-        for sim_idx in range(self.num_simulations):
+        for sim_idx in range(current_num_simulations):
             leaf_nodes: list[_SearchNode] = []
             parent_caches: list[Any] = []
             chosen_actions: list[Any] = []
@@ -2339,7 +2510,12 @@ class NativeResearchImZero(CustomAlgorithm):
                 # below, not an importance-weighted NLL.
                 policy_target = (improved[:, None] * candidates_arr).sum(axis=0).astype(np.float32)
                 env_action = candidates_arr[best_idx].astype(np.float32)
-            results.append({"env_action": env_action, "policy_target": policy_target, "value_target": root.value()})
+            results.append({
+                "env_action": env_action,
+                "policy_target": policy_target,
+                "value_target": root.value(),
+                "root_cache": root.cache,
+            })
         return results
 
 
@@ -2418,6 +2594,7 @@ class NativeResearchImZero(CustomAlgorithm):
         with torch.no_grad():
             for target_module, online_module in (
                 (self.target_tokenizer, self.tokenizer),
+                (self.target_action_embed, self.action_embed),
                 (self.target_transformer, self.transformer),
                 (self.target_heads, self.heads),
             ):
@@ -2439,8 +2616,21 @@ class NativeResearchImZero(CustomAlgorithm):
         docstring)."""
         if self.temperature_anneal_start_scale <= 1.0:
             return 1.0
-        progress = self._training_progress()
+        progress = min(1.0, max(0.0, self._num_timesteps / self.temperature_anneal_steps))
         return 1.0 + (self.temperature_anneal_start_scale - 1.0) * (1.0 - progress)
+
+    def _current_num_simulations(self) -> int:
+        """Spend search compute only when the closed-loop model earns it."""
+        step_cap = min(1.0, max(0.0, self._num_timesteps / self.search_ramp_steps))
+        model_confidence = (
+            self.search_model_error_high - self._model_error_ema
+        ) / (self.search_model_error_high - self.search_model_error_low)
+        progress = min(step_cap, min(1.0, max(0.0, model_confidence)))
+        simulations = round(
+            self.num_simulations_initial
+            + progress * (self.num_simulations - self.num_simulations_initial),
+        )
+        return max(2, min(self.num_simulations, int(simulations)))
 
     # ------------------------------------------------------------------
     # Training - one forward pass over the full teacher-forced window
@@ -2526,23 +2716,58 @@ class NativeResearchImZero(CustomAlgorithm):
                 pad_mask[i, base_i:end_i] = True
 
             hidden = self.transformer(tokens, pad_mask)
-            # All K bootstrap observations are independent one-token
-            # contexts, so evaluate them as one `(B*K, 1)` batch. The old
-            # loop below launched tokenizer+Transformer+head K separate
-            # times per optimizer step; with `unroll_steps=5` that was
-            # pure launch/dispatch overhead and prevented the GPU from
-            # seeing the largest available batch.
+            # Context-aware EMA bootstrap. Build one target-network
+            # teacher-forced sequence per sampled start, extending its real
+            # context through enough future transitions to cover every
+            # k-step TD landing state. This is both cheaper than B*K
+            # independent context replays and, crucially, does not train a
+            # history-aware value head against a one-token/memoryless target.
             with torch.no_grad():
                 bootstrap_tokenizer = self.target_tokenizer if self.use_target_for_bootstrap else self.tokenizer
+                bootstrap_action_embed = (
+                    self.target_action_embed if self.use_target_for_bootstrap else self.action_embed
+                )
                 bootstrap_transformer = self.target_transformer if self.use_target_for_bootstrap else self.transformer
                 bootstrap_heads = self.target_heads if self.use_target_for_bootstrap else self.heads
-                td_obs_flat = torch.as_tensor(
-                    batch["td_obs"], dtype=torch.float32, device=device,
-                ).view(b * k_steps, *self._obs_shape)
-                td_obs_emb = bootstrap_tokenizer(td_obs_flat)
-                td_pad = torch.ones(b * k_steps, 1, dtype=torch.bool, device=device)
-                td_hidden = bootstrap_transformer(td_obs_emb.unsqueeze(1), td_pad)[:, 0, :]
-                bootstrap_values = bootstrap_heads.value(td_hidden).view(b, k_steps)
+                target_root, target_root_pad, target_valid_len = self._embed_root_batch(
+                    batch["context_obs"], batch["context_action"], batch["context_valid"], batch["obs0"],
+                    tokenizer=bootstrap_tokenizer, action_embed=bootstrap_action_embed,
+                )
+                bootstrap_steps = batch["bootstrap_action"].shape[1]
+                target_actions = torch.as_tensor(
+                    batch["bootstrap_action"], dtype=torch.float32, device=device,
+                )
+                target_next_obs = torch.as_tensor(
+                    batch["bootstrap_next_obs"], dtype=torch.float32, device=device,
+                )
+                target_act_emb = bootstrap_action_embed(
+                    target_actions.view(b * bootstrap_steps, self.action_dim),
+                ).view(b, bootstrap_steps, self.embed_dim)
+                target_obs_emb = bootstrap_tokenizer(
+                    target_next_obs.view(b * bootstrap_steps, *self._obs_shape),
+                ).view(b, bootstrap_steps, self.embed_dim)
+                target_total_len = target_root.shape[1] + 2 * bootstrap_steps
+                target_tokens = torch.zeros(b, target_total_len, self.embed_dim, device=device)
+                target_pad = torch.zeros(b, target_total_len, dtype=torch.bool, device=device)
+                target_tokens[:, : target_root.shape[1]] = target_root
+                target_pad[:, : target_root.shape[1]] = target_root_pad
+                target_steps_valid = batch["bootstrap_mask"].sum(axis=1).astype(np.int64)
+                for i in range(b):
+                    base_i = int(target_valid_len[i])
+                    n_i = int(target_steps_valid[i])
+                    target_tokens[i, base_i : base_i + 2 * n_i : 2] = target_act_emb[i, :n_i]
+                    target_tokens[i, base_i + 1 : base_i + 2 * n_i : 2] = target_obs_emb[i, :n_i]
+                    target_pad[i, base_i : base_i + 2 * n_i] = True
+                target_hidden = bootstrap_transformer(target_tokens, target_pad)
+                td_horizon = torch.as_tensor(batch["td_horizon"], dtype=torch.long, device=device)
+                target_root_pos = torch.as_tensor(target_valid_len - 1, dtype=torch.long, device=device)
+                target_landing_pos = target_root_pos[:, None] + 2 * (
+                    torch.arange(k_steps, device=device)[None, :] + td_horizon
+                )
+                target_batch_idx = torch.arange(b, device=device)[:, None].expand(b, k_steps)
+                bootstrap_values = bootstrap_heads.value(
+                    target_hidden[target_batch_idx, target_landing_pos],
+                )
                 bootstrap_values = bootstrap_values * td_bootstrap_mask
             # `obs0_pos[i]` = lane `i`'s own obs0 token position (its context's
             # last real slot) - differs per lane now, so every hidden-state
@@ -2558,6 +2783,7 @@ class NativeResearchImZero(CustomAlgorithm):
             first_step_value_pred: torch.Tensor | None = None
             first_step_value_target: torch.Tensor | None = None
             first_step_policy_error: torch.Tensor | None = None
+            value_targets: list[torch.Tensor] = []
 
             for k in range(k_steps):
                 m = mask[:, k]
@@ -2567,25 +2793,18 @@ class NativeResearchImZero(CustomAlgorithm):
                 h_act_k = hidden[batch_idx, obs0_pos + 2 * k + 1]  # act_k's own hidden state
 
                 value_pred_logits = self.heads.value_logits(h_obs_k)
-                # Bootstrap value comes from the *online* network, under
-                # `no_grad` (module docstring's "no target network" section) -
-                # `efficientzero.py`'s own `self.representation(td_obs[:, k])`
-                # bootstrap call, not a separate target network. Context is
-                # empty for *every* lane here, so every lane's `valid_len` is
-                # uniformly `1` and `[:, -1, :]` unambiguously means "the only
-                # (td_obs's own) token" - no per-lane offset needed. This
-                # *does* mean the online value head is trained partly towards
-                # a target it itself just produced (the classic bootstrapped-
-                # TD moving-target problem a target network exists to break) -
-                # the `max(td_target, search_value)` blend right below is
-                # this file's chosen mitigation instead (`efficientzero.py`'s
-                # own `value_target: 'max'` mode): a transition that's been
-                # reanalyzed with the network's *own current* weights carries
-                # a fresher root-value estimate than a plain online-net
-                # bootstrap that's chasing its own recent update.
+                # Bootstrap values above come from one context-aware EMA
+                # sequence. Fresh reanalysis can contribute through a
+                # bounded convex blend; stale or absent search values fall
+                # back to pure n-step TD.
                 with torch.no_grad():
                     td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_values[:, k]
-                    value_target = torch.maximum(td_target, search_value[:, k])
+                    mixed_target = (
+                        (1.0 - self.reanalyze_value_mix) * td_target
+                        + self.reanalyze_value_mix * search_value[:, k]
+                    )
+                    value_target = torch.where(is_fresh[:, k], mixed_target, td_target)
+                value_targets.append(value_target.detach())
                 value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
                 v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
                 value_loss = value_loss + (v_loss * wm).sum() / denom
@@ -2673,6 +2892,64 @@ class NativeResearchImZero(CustomAlgorithm):
                 c_loss = 1.0 - (p_true * p_pred).sum(-1)
                 consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
+            # Closed-loop latent overshooting. A small sampled sub-batch is
+            # rolled forward recursively through `_step_imagine`, so step
+            # k+1 consumes the model's own predicted observation token from
+            # step k exactly as MCTS does. Teacher forcing above remains the
+            # stable anchor; this auxiliary branch closes the train/search
+            # exposure gap without trusting wholly imagined trajectories.
+            closed_loop_loss = torch.zeros((), device=device)
+            closed_loop_latent_errors: list[torch.Tensor] = []
+            closed_n = min(
+                b,
+                max(2, int(round(b * self.closed_loop_batch_fraction))),
+            ) if b >= 2 and self.closed_loop_batch_fraction > 0 and self.closed_loop_loss_coef > 0 else 0
+            if closed_n:
+                cl_obs_emb = self.tokenizer(obs0[:closed_n])
+                cl_positions = torch.zeros(closed_n, dtype=torch.long, device=device)
+                _, cl_caches = self.transformer.forward_incremental_batch(
+                    cl_obs_emb, cl_positions, [None] * closed_n,
+                )
+                cl_terms = torch.zeros((), device=device)
+                cl_denom = torch.zeros((), device=device)
+                for k in range(self.closed_loop_horizon):
+                    cl_caches, cl_h_act, cl_h_obs = self._step_imagine(cl_caches, action[:closed_n, k])
+                    cl_mask = mask[:closed_n, k]
+                    cl_weight = cl_mask * is_weight[:closed_n]
+
+                    cl_reward_target = _scalar_to_two_hot(
+                        reward[:closed_n, k], self.support_size, self.label_smoothing_eps,
+                    )
+                    cl_reward_loss = -(
+                        cl_reward_target * F.log_softmax(self.heads.reward_logits(cl_h_act), dim=-1)
+                    ).sum(-1)
+                    cl_pred_latent = self.heads.latent(cl_h_act)
+                    cl_true = F.normalize(
+                        self.projector(next_obs_embs_grad[:closed_n, k].detach()), dim=-1,
+                    ).detach()
+                    cl_pred = F.normalize(
+                        self.predictor(self.projector(cl_pred_latent)), dim=-1,
+                    )
+                    cl_latent_loss = 1.0 - (cl_true * cl_pred).sum(-1)
+                    closed_loop_latent_errors.append(
+                        (cl_latent_loss * cl_mask).sum() / cl_mask.sum().clamp_min(1.0),
+                    )
+                    step_loss = self.reward_loss_coef * cl_reward_loss + self.consistency_loss_coef * cl_latent_loss
+
+                    if k + 1 < k_steps:
+                        cl_value_target = _scalar_to_two_hot(
+                            value_targets[k + 1][:closed_n], self.support_size, self.label_smoothing_eps,
+                        )
+                        cl_value_loss = -(
+                            cl_value_target * F.log_softmax(self.heads.value_logits(cl_h_obs), dim=-1)
+                        ).sum(-1)
+                        step_loss = step_loss + self.value_loss_coef * cl_value_loss
+
+                    horizon_weight = 0.8 ** k
+                    cl_terms = cl_terms + horizon_weight * (step_loss * cl_weight).sum()
+                    cl_denom = cl_denom + horizon_weight * cl_mask.sum()
+                closed_loop_loss = cl_terms / cl_denom.clamp_min(1.0)
+
             n = float(k_steps)
             reward_loss, value_loss, policy_loss, consistency_loss, policy_entropy = (
                 reward_loss / n, value_loss / n, policy_loss / n, consistency_loss / n, policy_entropy / n,
@@ -2723,6 +3000,7 @@ class NativeResearchImZero(CustomAlgorithm):
                     self.reward_loss_coef * reward_loss + self.value_loss_coef * value_loss
                     + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
                 )
+            total_loss = total_loss + self.closed_loop_loss_coef * closed_loop_loss
             # Entropy *bonus* - reference's own `policy_entropy_weight`
             # (default `5e-3`): subtracted from the total loss (not
             # added) since higher policy entropy is the *goal* here, one
@@ -2754,6 +3032,12 @@ class NativeResearchImZero(CustomAlgorithm):
             self.loss_log_vars.data.clamp_(-5.0, 5.0)
         if self.use_target_for_bootstrap:
             self._update_target_network()
+        if closed_n:
+            observed_model_error = float(closed_loop_loss.detach().item())
+            decay = self.search_model_error_ema_decay
+            self._model_error_ema = (
+                decay * self._model_error_ema + (1.0 - decay) * observed_model_error
+            )
 
         assert first_step_value_pred is not None and first_step_value_target is not None
         assert first_step_policy_error is not None
@@ -2785,12 +3069,21 @@ class NativeResearchImZero(CustomAlgorithm):
             "value_loss": float(value_loss.item()),
             "policy_loss": float(policy_loss.item()),
             "consistency_loss": float(consistency_loss.item()),
+            "closed_loop_loss": float(closed_loop_loss.item()),
+            **{
+                f"closed_loop_latent_error_h{horizon + 1}": float(error.item())
+                for horizon, error in enumerate(closed_loop_latent_errors)
+            },
             "policy_entropy": float(policy_entropy.item()),
             "mean_priority": float(fresh_priority.mean()) if fresh_priority.size else 0.0,
             "mean_is_weight": float(is_weight.mean().item()),
+            "active_sample_fraction": float(batch["active_sample_fraction"]),
+            "recent_sample_fraction": float(batch["recent_sample_fraction"]),
             "total_loss": float(total_loss.item()),
             "learning_rate": current_lr,
             "priority_beta": current_priority_beta,
+            "search_num_simulations": float(self._last_search_num_simulations),
+            "search_model_error_ema": float(self._model_error_ema),
             **(
                 {
                     "loss_weight_reward": float(torch.exp(-self.loss_log_vars[0]).item()),
@@ -2838,6 +3131,7 @@ class NativeResearchImZero(CustomAlgorithm):
             env_actions: list[Any] = []
             action_flats: list[np.ndarray] = []
             policy_targets: list[np.ndarray] = []
+            searched_root_caches: list[_TransformerCache] | None = None
             if num_timesteps < self.learning_starts:
                 for _ in range(n_envs):
                     raw_action = self._action_space.sample()
@@ -2863,6 +3157,9 @@ class NativeResearchImZero(CustomAlgorithm):
                 # (removed) cold-start-every-step approach this file used
                 # to take.
                 results = self.search(obs_arr, self._lane_cache, deterministic=None)
+                root_cache_candidates = [result.get("root_cache") for result in results]
+                if all(cache is not None for cache in root_cache_candidates):
+                    searched_root_caches = root_cache_candidates
                 for result in results:
                     env_action = action_to_env(result["env_action"], self._action_space)
                     env_actions.append(env_action)
@@ -2914,10 +3211,15 @@ class NativeResearchImZero(CustomAlgorithm):
                     self._lane_cache[int(lane)] = None
                 active_lanes = np.flatnonzero(~dones)
                 if active_lanes.size:
-                    active_caches = [self._lane_cache[int(lane)] for lane in active_lanes]
-                    active_obs = obs_arr[active_lanes]
                     active_actions = np.stack([action_flats[int(lane)] for lane in active_lanes])
-                    advanced = self._advance_lane_caches(active_caches, active_obs, active_actions)
+                    if searched_root_caches is not None:
+                        active_roots = [searched_root_caches[int(lane)] for lane in active_lanes]
+                        advanced = self._append_actions_to_root_caches(active_roots, active_actions)
+                    else:
+                        active_caches = [self._lane_cache[int(lane)] for lane in active_lanes]
+                        advanced = self._advance_lane_caches(
+                            active_caches, obs_arr[active_lanes], active_actions,
+                        )
                     for lane, cache in zip(active_lanes, advanced):
                         self._lane_cache[int(lane)] = cache
             obs_arr = next_obs_arr
@@ -2986,7 +3288,9 @@ class NativeResearchImZero(CustomAlgorithm):
         results = self.search(obs_arr[None], [self._eval_cache], deterministic=np.array([deterministic]))
         env_action = action_to_env(results[0]["env_action"], self._action_space)
         action_flat = obs_to_array(env_action, self._action_space)
-        self._eval_cache = self._advance_lane_caches([self._eval_cache], obs_arr[None], action_flat[None])[0]
+        self._eval_cache = self._append_actions_to_root_caches(
+            [results[0]["root_cache"]], action_flat[None],
+        )[0]
         return env_action, None
 
     def save(self, path: Path) -> None:
@@ -2999,6 +3303,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 "projector_state_dict": self.projector.state_dict(),
                 "predictor_state_dict": self.predictor.state_dict(),
                 "target_tokenizer_state_dict": self.target_tokenizer.state_dict(),
+                "target_action_embed_state_dict": self.target_action_embed.state_dict(),
                 "target_transformer_state_dict": self.target_transformer.state_dict(),
                 "target_heads_state_dict": self.target_heads.state_dict(),
                 "loss_log_vars": self.loss_log_vars.detach().cpu(),
@@ -3021,6 +3326,9 @@ class NativeResearchImZero(CustomAlgorithm):
             algo.predictor.load_state_dict(payload["predictor_state_dict"])
         if "target_tokenizer_state_dict" in payload:
             algo.target_tokenizer.load_state_dict(payload["target_tokenizer_state_dict"])
+            algo.target_action_embed.load_state_dict(
+                payload.get("target_action_embed_state_dict", payload["action_embed_state_dict"]),
+            )
             algo.target_transformer.load_state_dict(payload["target_transformer_state_dict"])
             algo.target_heads.load_state_dict(payload["target_heads_state_dict"])
         if algo.rnd and payload.get("rnd_state"):

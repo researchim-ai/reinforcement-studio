@@ -31,6 +31,8 @@ const DIMENSION_LABELS: Record<string, string> = {
   ffn_multiplier: 'FFN multiplier',
   dropout: 'Transformer dropout',
   rotary_emb: 'RoPE',
+  stoch_variables: 'Категориальных переменных',
+  stoch_classes: 'Классов на переменную',
 }
 
 const COMPONENT_LABELS: Record<string, string> = {
@@ -41,6 +43,15 @@ const COMPONENT_LABELS: Record<string, string> = {
   heads: 'Reward / Value / Policy trunk',
   projector: 'SimSiam projector',
   predictor: 'SimSiam predictor',
+  stochastic_prior: 'Stochastic prior',
+  stochastic_posterior: 'Observation posterior',
+  state_feature: 'Deterministic + stochastic state feature',
+  reward: 'Symlog reward head',
+  continue: 'Continue head',
+  actor: 'Imagination actor / search prior',
+  critic: 'Online / EMA critic',
+  ensemble_prior: 'Prior ensemble',
+  ensemble_reward: 'Reward ensemble',
 }
 
 function encoderTemplate(kind: CompositeEncoderSpec['kind']): NetworkLayer[] {
@@ -281,6 +292,14 @@ function MlpEditor({
 export function CompositeNetworkBuilder({ spec, preview, onChange }: Props) {
   const skeleton = spec.family === 'efficientzero'
     ? ['Observation encoder', 'Representation', 'Dynamics + value-prefix LSTM', 'Prediction heads']
+    : spec.family === 'latentimzero'
+      ? [
+          'Observation tokenizer',
+          'Causal Transformer memory',
+          'Categorical prior / posterior',
+          'Continue-aware imagination actor-critic',
+          'Uncertainty-gated Gumbel planner',
+        ]
     : ['Observation tokenizer + Action embedding', 'Causal Transformer + KV-cache', 'Reward / Value / Policy / Latent heads', 'EMA target']
   return (
     <div className="h-full overflow-auto p-4">

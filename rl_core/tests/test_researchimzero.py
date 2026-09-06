@@ -107,11 +107,12 @@ class TestNativeResearchImZeroDiscrete:
             assert r["policy_target"].shape == (algo.n_actions,)
             assert np.isclose(float(r["policy_target"].sum()), 1.0, atol=1e-4)
             assert isinstance(r["env_action"], (int, np.integer))
+            assert r["root_cache"] is not None
         env.close()
 
 
 class TestVectorCollectionRegressions:
-    def test_default_training_cadence_is_one_update_per_vector_iteration(self) -> None:
+    def test_default_training_cadence_is_two_updates_per_vector_iteration(self) -> None:
         env = make_env_or_vec(_OneStepResearchEnv, num_envs=24, parallel=False)
         algo = NativeResearchImZero(
             env,
@@ -146,8 +147,8 @@ class TestVectorCollectionRegressions:
         algo._train_step = fake_train_step
         algo._advance_lane_caches = lambda caches, obs, actions: [None] * len(caches)
         algo.learn(48, TrainingCallback(lambda *args, **kwargs: True))
-        assert train_calls == 2
-        assert algo.train_steps_per_iter == 1
+        assert train_calls == 4
+        assert algo.train_steps_per_iter == 2
         env.close()
 
     def test_autoscale_is_explicit_and_not_multiplied_by_crossed_boundaries(self) -> None:
@@ -158,7 +159,7 @@ class TestVectorCollectionRegressions:
             seed=0,
             device="cpu",
         )
-        assert algo.train_steps_per_iter == 6
+        assert algo.train_steps_per_iter == 12
         env.close()
 
     def test_terminal_replay_observation_is_not_same_step_reset_observation(self) -> None:
@@ -283,15 +284,97 @@ class TestSimSiamModules:
         assert np.isfinite(metrics["consistency_loss"])
         assert np.isfinite(metrics["value_loss"])
         assert np.isfinite(metrics["policy_loss"])
+        assert np.isfinite(metrics["closed_loop_loss"])
         env.close()
 
 
-class TestValueTargetMaxBlend:
-    """`_train_step`'s `value_target = max(td_target, search_value)`
-    (module docstring's "no target network" section, `efficientzero.py`'s
-    own `value_target: 'max'` mode) - `_ResearchImZeroBuffer` must
-    actually carry a `search_value` array per transition for this to have
-    anything to blend with."""
+class TestStreamingReplayAndTargets:
+    """Active replay, context targets and bounded reanalysis blend."""
+
+    def test_active_lane_is_sampleable_before_episode_end(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeResearchImZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        obs, _info = env.reset(seed=0)
+        for _ in range(4):
+            action = env.action_space.sample()
+            next_obs, reward, _terminated, _truncated, _info = env.step(action)
+            action_flat = np.eye(algo.n_actions, dtype=np.float32)[action]
+            policy_target = np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32)
+            algo.buffer.add(obs, action_flat, float(reward), next_obs, policy_target, False, lane=0)
+            obs = next_obs
+
+        assert algo.buffer.num_episodes == 0
+        assert algo.buffer.num_replay_transitions == 4
+        batch = algo.buffer.sample(8, algo.unroll_steps, algo.td_steps, algo.gamma)
+        assert np.all(batch["episode_idx"] < 0)
+        assert np.any(batch["td_bootstrap_mask"] > 0)
+        assert batch["bootstrap_action"].shape[1] == algo.unroll_steps + algo.td_steps
+        fresh_priorities = np.full(8, 0.25, dtype=np.float32)
+        algo.buffer.update_priorities(batch["episode_idx"], batch["timestep"], fresh_priorities)
+        for timestep in np.unique(batch["timestep"]):
+            assert np.isclose(algo.buffer._cur[0]["priority"][int(timestep)], 0.25)
+
+        ep_idx, timesteps, *_ = algo.buffer.sample_for_reanalyze(4)
+        assert np.all(ep_idx < 0)
+        refreshed_policy = np.full((4, algo.n_actions), 1.0 / algo.n_actions, dtype=np.float32)
+        refreshed_values = np.arange(4, dtype=np.float32)
+        algo.buffer.update_reanalyzed_targets(ep_idx, timesteps, refreshed_policy, refreshed_values)
+        assert any(gen > 0 for gen in algo.buffer._cur[0]["reanalyzed_gen"])
+        active_priorities = np.asarray(algo.buffer._cur[0]["priority"]).copy()
+        active_generations = np.asarray(algo.buffer._cur[0]["reanalyzed_gen"]).copy()
+        algo.buffer._flush_episode(0)
+        assert np.allclose(algo.buffer.episodes[0]["priority"], active_priorities)
+        assert np.array_equal(algo.buffer.episodes[0]["reanalyzed_gen"], active_generations)
+        env.close()
+
+    def test_recent_replay_samples_only_configured_active_tail(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeResearchImZero(env, {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}, seed=0, device="cpu")
+        algo.buffer.recent_fraction = 1.0
+        algo.buffer.recent_window = 1
+        obs, _info = env.reset(seed=0)
+        for _ in range(4):
+            action = env.action_space.sample()
+            next_obs, reward, _terminated, _truncated, _info = env.step(action)
+            algo.buffer.add(
+                obs,
+                np.eye(algo.n_actions, dtype=np.float32)[action],
+                float(reward),
+                next_obs,
+                np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32),
+                False,
+                lane=0,
+            )
+            obs = next_obs
+        batch = algo.buffer.sample(16, algo.unroll_steps, algo.td_steps, algo.gamma)
+        assert np.all(batch["timestep"] == 3)
+        assert np.allclose(batch["is_weight"], 1.0)
+        env.close()
+
+    def test_adaptive_search_budget_reaches_configured_maximum(self) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        algo = NativeResearchImZero(
+            env,
+            {
+                **DEFAULT_HYPERPARAMS,
+                **_TINY_DISCRETE,
+                "num_simulations_initial": 2,
+                "num_simulations": 10,
+                "search_ramp_steps": 100,
+            },
+            seed=0,
+            device="cpu",
+        )
+        algo._num_timesteps = 0
+        assert algo._current_num_simulations() == 2
+        algo._num_timesteps = 100
+        assert algo._current_num_simulations() == 2
+        algo._model_error_ema = algo.search_model_error_low
+        algo._num_timesteps = 50
+        assert algo._current_num_simulations() == 6
+        algo._num_timesteps = 100
+        assert algo._current_num_simulations() == 10
+        env.close()
 
     def test_buffer_sample_carries_search_value_field(self) -> None:
         env = gym.make(_DISCRETE_ENV_ID)

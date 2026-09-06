@@ -15,12 +15,15 @@ describe('typed composite network builder', () => {
     expect(networkFamilyFor('unizero', 'gym')).toBe('unizero')
     expect(networkFamilyFor('researchimzero', 'gym')).toBe('researchimzero')
     expect(isCompositeFamily('researchimzero')).toBe(true)
+    expect(networkFamilyFor('latentimzero', 'gym')).toBe('latentimzero')
+    expect(isCompositeFamily('latentimzero')).toBe(true)
   })
 
   it('creates complete versioned defaults without exposing algorithm outputs', () => {
     const efficientzero = defaultCompositeSpec('efficientzero')
     const unizero = defaultCompositeSpec('unizero')
     const researchimzero = defaultCompositeSpec('researchimzero')
+    const latentimzero = defaultCompositeSpec('latentimzero')
 
     expect(isCompositeSpec(efficientzero)).toBe(true)
     expect(Object.keys(efficientzero.components)).toEqual([
@@ -30,6 +33,11 @@ describe('typed composite network builder', () => {
     expect(unizero.components).not.toHaveProperty('projector')
     expect(researchimzero.components.projector.batch_norm).toBe(true)
     expect(researchimzero.components.predictor.batch_norm).toBe(true)
+    expect(latentimzero.components).toHaveProperty('stochastic_prior')
+    expect(latentimzero.components).toHaveProperty('stochastic_posterior')
+    expect(latentimzero.components).toHaveProperty('continue')
+    expect(latentimzero.components).toHaveProperty('actor')
+    expect(latentimzero.components).toHaveProperty('critic')
   })
 
   it('renders the protected skeleton, editable slots and real preview', () => {

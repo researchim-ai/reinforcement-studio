@@ -40,7 +40,8 @@ interface Step {
 
 type Family =
   | 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero'
-  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'unizero' | 'ippo' | 'qmix' | 'generic'
+  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'unizero' | 'latentimzero'
+  | 'ippo' | 'qmix' | 'generic'
 
 /** Best-effort family detection from the algorithm id — used to pick which
  * canned "how it learns" loop to render. Custom plugins (`custom:*`) fall
@@ -62,6 +63,7 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (id.includes('mbpo')) return 'mbpo'
   if (id.includes('pets')) return 'pets'
   if (id.includes('world_models_ha') || id.includes('world-models-ha')) return 'world_models_ha'
+  if (id.includes('latentimzero')) return 'latentimzero'
   if (id.includes('efficientzero') || id.includes('efficient-zero') || id.includes('muzero')) return 'efficientzero'
   if (id.includes('unizero') || id.includes('researchimzero')) return 'unizero'
   if (id === 'ippo' || id.includes('ippo')) return 'ippo'
@@ -282,6 +284,16 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
           },
         ],
         loopCaption: 'Как EfficientZero, но вместо рекуррентной (LSTM/MLP) динамики — единый causal Transformer над явной последовательностью токенов [obs₀, act₀, obs₁, act₁, ...]: каждое прошлое наблюдение остаётся напрямую доступным через attention, а не сжимается в один вектор состояния',
+      }
+    case 'latentimzero':
+      return {
+        steps: [
+          { icon: History, title: 'Posterior stochastic state', detail: hp(hyperparams, 'context_length', 'context=') },
+          { icon: Moon, title: 'Prior imagination', detail: hp(hyperparams, 'imagination_horizon', 'horizon=') },
+          { icon: Brain, title: 'Continue-aware λ-return actor-critic', detail: hp(hyperparams, 'imagination_lambda', 'λ=') },
+          { icon: Crosshair, title: 'Uncertainty-gated Gumbel planner', detail: hp(hyperparams, 'num_simulations', 'sim≤') },
+        ],
+        loopCaption: 'Stochastic imagination planning: реальный posterior обучает модель мира, длинные prior-rollout дают actor/value сигналы, а uncertainty-gated поиск корректирует и дистиллирует политику',
       }
     case 'ippo':
       return {

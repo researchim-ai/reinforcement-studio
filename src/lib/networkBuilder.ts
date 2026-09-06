@@ -19,6 +19,7 @@ export const FAMILY_LABELS: Record<NetworkFamily, string> = {
   efficientzero: 'EfficientZero (representation + dynamics + prediction)',
   unizero: 'UniZero (tokenizer + Transformer + heads)',
   researchimzero: 'ResearchImZero (Transformer + SimSiam)',
+  latentimzero: 'LatentImZero (stochastic imagination actor-critic)',
 }
 
 export const FAMILY_HEADS: Record<FlatNetworkFamily, string[]> = {
@@ -185,7 +186,12 @@ export function requiredFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'
  * picker (includes `alphazero`, unlike `requiredFamilyFor` above). */
 export function networkFamilyFor(algorithmId: string, kind: 'gym' | 'alphazero'): NetworkFamily | null {
   if (kind === 'alphazero') return algorithmId === 'alphazero' ? 'alphazero' : null
-  if (algorithmId === 'efficientzero' || algorithmId === 'unizero' || algorithmId === 'researchimzero') return algorithmId
+  if (
+    algorithmId === 'efficientzero'
+    || algorithmId === 'unizero'
+    || algorithmId === 'researchimzero'
+    || algorithmId === 'latentimzero'
+  ) return algorithmId
   return requiredFamilyFor(algorithmId, kind)
 }
 
@@ -225,7 +231,10 @@ function compositeMlp(hiddenSizes: number[], batchNorm = false): CompositeMlpSpe
 }
 
 export function isCompositeFamily(family: NetworkFamily): family is CompositeNetworkFamily {
-  return family === 'efficientzero' || family === 'unizero' || family === 'researchimzero'
+  return family === 'efficientzero'
+    || family === 'unizero'
+    || family === 'researchimzero'
+    || family === 'latentimzero'
 }
 
 export function isCompositeSpec(spec: unknown): spec is CompositeNetworkSpec {
@@ -245,6 +254,36 @@ export function defaultCompositeSpec(family: CompositeNetworkFamily): CompositeN
         prediction: compositeMlp([]),
         projector: compositeMlp([64], true),
         predictor: compositeMlp([64], true),
+      },
+    }
+  }
+  if (family === 'latentimzero') {
+    return {
+      format: 'composite_v1',
+      family,
+      dimensions: {
+        embed_dim: 64,
+        hidden_dim: 128,
+        num_layers: 2,
+        num_heads: 4,
+        ffn_multiplier: 4,
+        dropout: 0,
+        rotary_emb: 1,
+        stoch_variables: 16,
+        stoch_classes: 16,
+      },
+      encoder: { kind: 'auto', layers: [] },
+      components: {
+        tokenizer: compositeMlp([128]),
+        stochastic_prior: compositeMlp([]),
+        stochastic_posterior: compositeMlp([128]),
+        state_feature: compositeMlp([128]),
+        reward: compositeMlp([]),
+        continue: compositeMlp([]),
+        actor: compositeMlp([128, 128]),
+        critic: compositeMlp([128]),
+        ensemble_prior: compositeMlp([]),
+        ensemble_reward: compositeMlp([]),
       },
     }
   }

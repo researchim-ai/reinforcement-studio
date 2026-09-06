@@ -78,6 +78,24 @@ def test_composite_preview_returns_real_components_and_fixed_outputs() -> None:
     assert result["fixed_outputs"]["value"] == [21]
 
 
+def test_latentimzero_preview_exposes_stochastic_and_continue_outputs() -> None:
+    request = network_routes.PreviewRequest(
+        family="latentimzero",
+        spec=default_composite_spec("latentimzero"),
+        environment_id="CartPole-v1",
+        hyperparams={"value_support_size": 10},
+    )
+    result = asyncio.run(network_routes.preview(request))
+    assert result["ok"] is True
+    assert {component["name"] for component in result["components"]} >= {
+        "world_model", "actor", "critic", "ema_critic",
+    }
+    assert result["fixed_outputs"]["policy"] == [2]
+    assert result["fixed_outputs"]["value"] == [21]
+    assert result["fixed_outputs"]["continue"] == [1]
+    assert result["fixed_outputs"]["stochastic_state"] == ["stoch_variables", "stoch_classes"]
+
+
 def test_old_run_without_snapshots_gets_materialized_composite_spec(tmp_path: Path, monkeypatch) -> None:
     runs_dir = tmp_path / "runs"
     run_dir = runs_dir / "legacy"

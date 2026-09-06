@@ -332,7 +332,7 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
         }
 
     algo_id = (algo_id or "ppo").lower()
-    if algo_id in ("efficientzero", "unizero", "researchimzero"):
+    if algo_id in ("efficientzero", "unizero", "researchimzero", "latentimzero"):
         if algo_id == "efficientzero":
             from rl_core.algorithms.native.efficientzero import DEFAULT_HYPERPARAMS, NativeEfficientZero
 
@@ -343,11 +343,16 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
 
             algorithm_cls = NativeUniZero
             label = "UniZero Transformer world model"
-        else:
+        elif algo_id == "researchimzero":
             from rl_core.algorithms.native.researchimzero import DEFAULT_HYPERPARAMS, NativeResearchImZero
 
             algorithm_cls = NativeResearchImZero
             label = "ResearchImZero Transformer world model"
+        else:
+            from rl_core.algorithms.native.latentimzero import DEFAULT_HYPERPARAMS, NativeLatentImZero
+
+            algorithm_cls = NativeLatentImZero
+            label = "LatentImZero stochastic imagination world model"
         algorithm = algorithm_cls(env, {**DEFAULT_HYPERPARAMS, **hyperparams}, 0, "cpu")
         module = _find_torch_module(algorithm)
         return {

@@ -21,6 +21,8 @@ from rl_core.algorithms.native.efficientzero import DEFAULT_HYPERPARAMS as EFFIC
 from rl_core.algorithms.native.efficientzero import NativeEfficientZero
 from rl_core.algorithms.native.es import DEFAULT_HYPERPARAMS as ES_DEFAULTS
 from rl_core.algorithms.native.es import NativeES
+from rl_core.algorithms.native.latentimzero import DEFAULT_HYPERPARAMS as LATENTIMZERO_DEFAULTS
+from rl_core.algorithms.native.latentimzero import NativeLatentImZero
 from rl_core.algorithms.native.marl_ppo import DEFAULT_HYPERPARAMS as IPPO_DEFAULTS
 from rl_core.algorithms.native.marl_ppo import MultiAgentPPO
 from rl_core.algorithms.native.mbpo import DEFAULT_HYPERPARAMS as MBPO_DEFAULTS
@@ -64,6 +66,7 @@ ALGO_CLASSES = {
     "efficientzero": NativeEfficientZero,
     "unizero": NativeUniZero,
     "researchimzero": NativeResearchImZero,
+    "latentimzero": NativeLatentImZero,
 }
 DEFAULT_HYPERPARAMS = {
     "ppo": PPO_DEFAULTS,
@@ -83,6 +86,7 @@ DEFAULT_HYPERPARAMS = {
     "efficientzero": EFFICIENTZERO_DEFAULTS,
     "unizero": UNIZERO_DEFAULTS,
     "researchimzero": RESEARCHIMZERO_DEFAULTS,
+    "latentimzero": LATENTIMZERO_DEFAULTS,
 }
 # Which world model type (rl_core.world_models.spec.WORLD_MODEL_TYPES) each
 # of the four algorithms above actually uses — `runner_utils.py` needs this

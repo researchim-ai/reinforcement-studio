@@ -19,7 +19,7 @@ router = APIRouter()
 
 NetworkFamily = Literal[
     "actor_critic", "q_network", "dueling_q", "alphazero",
-    "efficientzero", "unizero", "researchimzero",
+    "efficientzero", "unizero", "researchimzero", "latentimzero",
 ]
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -198,10 +198,17 @@ def _composite_fixed_outputs(
     try:
         action_space = env.action_space
         action_dim = int(action_space.n) if isinstance(action_space, gym.spaces.Discrete) else int(np.prod(action_space.shape))
-        support = max(1, int(hyperparams.get("value_support_size", 300 if family != "unizero" else 50)))
+        default_support = 50 if family == "unizero" else (100 if family == "latentimzero" else 300)
+        support = max(1, int(hyperparams.get("value_support_size", default_support)))
         outputs = {"policy": [action_dim], "value": [2 * support + 1]}
         if family == "efficientzero":
             outputs.update({"value_prefix": [2 * support + 1], "next_latent": ["latent_dim"]})
+        elif family == "latentimzero":
+            outputs.update({
+                "reward": [2 * support + 1],
+                "continue": [1],
+                "stochastic_state": ["stoch_variables", "stoch_classes"],
+            })
         else:
             outputs.update({"reward": [2 * support + 1], "next_token": ["embed_dim"]})
         return outputs

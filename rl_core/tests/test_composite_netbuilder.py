@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from rl_core.algorithms.native.efficientzero import DEFAULT_HYPERPARAMS as EZ_DEFAULTS, NativeEfficientZero
+from rl_core.algorithms.native.latentimzero import DEFAULT_HYPERPARAMS as LIZ_DEFAULTS, NativeLatentImZero
 from rl_core.algorithms.native.researchimzero import DEFAULT_HYPERPARAMS as RIZ_DEFAULTS, NativeResearchImZero
 from rl_core.algorithms.native.unizero import DEFAULT_HYPERPARAMS as UZ_DEFAULTS, NativeUniZero
 from rl_core.composite_netbuilder import (
@@ -46,6 +47,14 @@ def _tiny_spec(family: str) -> dict:
             "embed_dim": 16, "num_layers": 1, "num_heads": 2, "ffn_multiplier": 2,
         })
         spec["components"]["tokenizer"]["hidden_sizes"] = [16]
+        if family == "latentimzero":
+            spec["dimensions"].update({
+                "hidden_dim": 24, "stoch_variables": 4, "stoch_classes": 4,
+            })
+            spec["components"]["stochastic_posterior"]["hidden_sizes"] = [13]
+            spec["components"]["state_feature"]["hidden_sizes"] = [17]
+            spec["components"]["actor"]["hidden_sizes"] = [19]
+            spec["components"]["critic"]["hidden_sizes"] = [23]
         if family == "researchimzero":
             spec["dimensions"]["proj_dim"] = 8
             spec["components"]["projector"]["hidden_sizes"] = [8]
@@ -53,7 +62,7 @@ def _tiny_spec(family: str) -> dict:
     return spec
 
 
-@pytest.mark.parametrize("family", ["efficientzero", "unizero", "researchimzero"])
+@pytest.mark.parametrize("family", ["efficientzero", "unizero", "researchimzero", "latentimzero"])
 def test_default_composite_specs_validate(family: str) -> None:
     assert validate_composite_spec(default_composite_spec(family), family)["family"] == family
 
@@ -107,6 +116,7 @@ def test_custom_vector_and_image_encoders_produce_flat_features() -> None:
         (NativeEfficientZero, EZ_DEFAULTS, "efficientzero"),
         (NativeUniZero, UZ_DEFAULTS, "unizero"),
         (NativeResearchImZero, RIZ_DEFAULTS, "researchimzero"),
+        (NativeLatentImZero, LIZ_DEFAULTS, "latentimzero"),
     ],
 )
 def test_composite_runtime_save_load_and_optimizer_contract(
@@ -133,15 +143,29 @@ def test_composite_runtime_save_load_and_optimizer_contract(
     assert len(results) == 2
     assert algorithm.hyperparams["network_spec"]["format"] == "composite_v1"
 
+    optimizers = [
+        optimizer for optimizer in (
+            getattr(algorithm, "optimizer", None),
+            getattr(algorithm, "model_optimizer", None),
+            getattr(algorithm, "actor_optimizer", None),
+            getattr(algorithm, "critic_optimizer", None),
+        )
+        if optimizer is not None
+    ]
     optimizer_ids = {
         id(parameter)
-        for group in algorithm.optimizer.param_groups
+        for optimizer in optimizers
+        for group in optimizer.param_groups
         for parameter in group["params"]
     }
     for target_name in ("target_tokenizer", "target_transformer", "target_heads"):
         target_module = getattr(algorithm, target_name, None)
         if target_module is not None:
             assert all(id(parameter) not in optimizer_ids for parameter in target_module.parameters())
+    ema_critic = getattr(algorithm, "ema_critic", None)
+    if ema_critic is not None:
+        assert all(id(parameter) not in optimizer_ids for parameter in ema_critic.parameters())
+        assert all(not parameter.requires_grad for parameter in ema_critic.parameters())
 
     checkpoint = tmp_path / f"{family}.pt"
     algorithm.save(checkpoint)
@@ -163,12 +187,53 @@ def test_legacy_hyperparams_still_build_without_composite_spec() -> None:
     env.close()
 
 
+def test_latentimzero_component_configs_reach_runtime_modules() -> None:
+    env = gym.make("CartPole-v1")
+    spec = _tiny_spec("latentimzero")
+    widths = {
+        "tokenizer": 11,
+        "stochastic_prior": 12,
+        "stochastic_posterior": 13,
+        "state_feature": 14,
+        "reward": 15,
+        "continue": 16,
+        "actor": 17,
+        "critic": 18,
+        "ensemble_prior": 19,
+        "ensemble_reward": 20,
+    }
+    for name, width in widths.items():
+        spec["components"][name]["hidden_sizes"] = [width]
+    algorithm = NativeLatentImZero(
+        env, {**LIZ_DEFAULTS, "network_spec": spec, "value_support_size": 10},
+        seed=0, device="cpu",
+    )
+
+    modules = {
+        "tokenizer": algorithm.world_model.tokenizer.head,
+        "stochastic_prior": algorithm.world_model.prior_head,
+        "stochastic_posterior": algorithm.world_model.posterior_head,
+        "state_feature": algorithm.world_model.feature_head[0],
+        "reward": algorithm.world_model.reward_head,
+        "continue": algorithm.world_model.continue_head,
+        "actor": algorithm.actor.trunk,
+        "critic": algorithm.critic.net,
+        "ensemble_prior": algorithm.world_model.ensemble_prior[0],
+        "ensemble_reward": algorithm.world_model.ensemble_reward[0],
+    }
+    for name, module in modules.items():
+        first_linear = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear))
+        assert first_linear.out_features == widths[name]
+    env.close()
+
+
 @pytest.mark.parametrize(
     ("algorithm_cls", "defaults", "family"),
     [
         (NativeEfficientZero, EZ_DEFAULTS, "efficientzero"),
         (NativeUniZero, UZ_DEFAULTS, "unizero"),
         (NativeResearchImZero, RIZ_DEFAULTS, "researchimzero"),
+        (NativeLatentImZero, LIZ_DEFAULTS, "latentimzero"),
     ],
 )
 def test_composite_specs_support_continuous_actions(algorithm_cls, defaults: dict, family: str) -> None:
@@ -200,6 +265,7 @@ def test_composite_specs_support_continuous_actions(algorithm_cls, defaults: dic
         (NativeEfficientZero, EZ_DEFAULTS, "efficientzero"),
         (NativeUniZero, UZ_DEFAULTS, "unizero"),
         (NativeResearchImZero, RIZ_DEFAULTS, "researchimzero"),
+        (NativeLatentImZero, LIZ_DEFAULTS, "latentimzero"),
     ],
 )
 def test_custom_image_encoder_runs_through_search(algorithm_cls, defaults: dict, family: str) -> None:

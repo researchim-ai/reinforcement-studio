@@ -30,6 +30,7 @@ _ALGO_FAMILY: dict[str, str] = {
     "efficientzero": "efficientzero",
     "unizero": "unizero",
     "researchimzero": "researchimzero",
+    "latentimzero": "latentimzero",
 }
 
 
@@ -144,7 +145,11 @@ def write_network_snapshot(run_dir: Path, config: dict[str, Any], network_spec: 
         "format": (
             network_spec.get("format", "trunk_heads_v1")
             if network_spec is not None
-            else ("composite_v1" if family in {"efficientzero", "unizero", "researchimzero"} else "trunk_heads_v1")
+            else (
+                "composite_v1"
+                if family in {"efficientzero", "unizero", "researchimzero", "latentimzero"}
+                else "trunk_heads_v1"
+            )
         ),
         "spec": network_spec,
         "source": source,

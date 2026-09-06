@@ -304,7 +304,7 @@ export interface ResumeFrom {
 // ------------------------------------------------- Network Architecture Builder
 
 export type FlatNetworkFamily = 'actor_critic' | 'q_network' | 'dueling_q' | 'alphazero'
-export type CompositeNetworkFamily = 'efficientzero' | 'unizero' | 'researchimzero'
+export type CompositeNetworkFamily = 'efficientzero' | 'unizero' | 'researchimzero' | 'latentimzero'
 export type NetworkFamily = FlatNetworkFamily | CompositeNetworkFamily
 
 export type NetworkLayerType = 'linear' | 'conv2d' | 'maxpool2d' | 'flatten' | 'activation' | 'dropout' | 'batchnorm'
