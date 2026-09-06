@@ -5,6 +5,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +17,7 @@ from rl_core.algorithms.native.latentimzero import (
     _backpropagate_variable_discount,
     _balanced_kl,
     _lambda_return,
+    _latent_information,
     _st_categorical,
     _stochastic_usage,
     _symexp,
@@ -246,7 +248,12 @@ def test_grounded_critic_metrics_and_stochastic_diagnostics() -> None:
         "real_critic_loss", "imagined_critic_loss", "real_target_mean",
         "model_bias", "posterior_prior_kl", "posterior_entropy",
         "stochastic_usage", "model_error_ema", "planning_budget",
-        "imagination_horizon",
+        "imagination_horizon", "observation_prediction_error",
+        "observation_target_variance", "observation_predictor_variance",
+        "posterior_conditional_entropy", "posterior_marginal_entropy",
+        "latent_information_loss", "latent_class_utilization",
+        "observation_error_ema", "stochastic_usage_ema",
+        "uncertainty_representation", "representation_readiness",
     ):
         assert key in metrics and np.isfinite(metrics[key])
     assert metrics["real_critic_loss"] > 0
@@ -335,7 +342,7 @@ def test_prior_rollout_advances_cache_and_target_is_outside_optimizers() -> None
         for parameter in group["params"]
     }
     assert all(id(parameter) not in optimizer_ids for parameter in algo.ema_critic.parameters())
-    assert all(id(parameter) not in optimizer_ids for parameter in algo.target_tokenizer.parameters())
+    assert not list(algo.observation_target.parameters())
 
 
 def test_causal_prior_is_obs_invariant_and_posterior_corrects_without_advance() -> None:
@@ -360,6 +367,71 @@ def test_causal_prior_is_obs_invariant_and_posterior_corrects_without_advance() 
 def test_uniform_posterior_has_near_zero_stochastic_usage() -> None:
     logits = torch.zeros(8, 4, 16)
     assert _stochastic_usage(logits, unimix=0.01).item() < 1e-6
+
+
+def test_latent_information_prefers_confident_diverse_classes() -> None:
+    uniform = torch.zeros(16, 4, 4)
+    single = torch.full((16, 4, 4), -12.0)
+    single[..., 0] = 12.0
+    diverse = torch.full((16, 4, 4), -12.0)
+    for sample in range(16):
+        diverse[sample, :, sample % 4] = 12.0
+    uniform_loss = _latent_information(uniform, 0.0)[0]
+    single_loss = _latent_information(single, 0.0)[0]
+    diverse_loss, conditional, marginal, utilization = _latent_information(diverse, 0.0)
+    assert abs(float(uniform_loss)) < 1e-6
+    assert abs(float(single_loss)) < 1e-5
+    assert diverse_loss < uniform_loss and diverse_loss < single_loss
+    assert conditional < 1e-4
+    assert marginal > 1.3
+    assert utilization > 0.99
+
+
+def test_fixed_observation_target_is_distinct_and_constant(tmp_path: Path) -> None:
+    algo = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=7, device="cpu")
+    same_seed = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=7, device="cpu")
+    assert torch.equal(
+        algo.observation_target.projection, same_seed.observation_target.projection,
+    )
+    observations = torch.stack([torch.zeros(4), torch.ones(4)])
+    before = algo.observation_target(observations).clone()
+    assert not torch.allclose(before[0], before[1])
+    state_before = {
+        key: value.clone() for key, value in algo.observation_target.state_dict().items()
+    }
+    algo._update_ema_critic()
+    algo.model_optimizer.zero_grad()
+    state = algo.world_model.observe(observations, [None, None], sample=True)
+    prediction = F.layer_norm(
+        algo.world_model.observation_predictor(algo.world_model.features(state)), (16,),
+    )
+    F.mse_loss(prediction, before).backward()
+    algo.model_optimizer.step()
+    assert all(
+        torch.equal(value, state_before[key])
+        for key, value in algo.observation_target.state_dict().items()
+    )
+    checkpoint = tmp_path / "fixed-target.pt"
+    algo.save(checkpoint)
+    loaded = NativeLatentImZero.load(checkpoint, _OneStepDiscrete(), device="cpu")
+    assert torch.equal(loaded.observation_target(observations), before)
+
+
+def test_v2_checkpoint_is_rejected_with_collapse_reason(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "v2.pt"
+    torch.save({"checkpoint_version": 2}, checkpoint)
+    with pytest.raises(ValueError, match="collapsing EMA tokenizer target"):
+        NativeLatentImZero.load(checkpoint, _OneStepDiscrete(), device="cpu")
+
+
+def test_constant_predictor_cannot_fit_varied_fixed_targets() -> None:
+    algo = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=0, device="cpu")
+    observations = torch.eye(4)
+    targets = algo.observation_target(observations)
+    constant = targets.mean(0, keepdim=True).expand_as(targets)
+    error = F.mse_loss(constant, targets)
+    assert targets.var(dim=0, unbiased=False).mean() > 0.05
+    assert error > 0.05
 
 
 def test_batched_reconstruction_matches_lane_reference() -> None:
@@ -451,10 +523,11 @@ def test_observation_objective_reaches_posterior_and_encoder() -> None:
     algo = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=0, device="cpu")
     model = algo.world_model
     state = model.observe(torch.randn(3, 4), [None] * 3, sample=True)
-    prediction = F.normalize(model.observation_predictor(model.features(state)), dim=-1)
+    prediction = model.observation_predictor(model.features(state))
+    prediction = F.layer_norm(prediction, (prediction.shape[-1],))
     with torch.no_grad():
-        target = F.normalize(algo.target_tokenizer(torch.randn(3, 4)), dim=-1)
-    (1.0 - (prediction * target).sum(-1)).mean().backward()
+        target = algo.observation_target(torch.randn(3, 4))
+    F.mse_loss(prediction, target).backward()
     posterior_grad = sum(
         float(parameter.grad.abs().sum())
         for parameter in model.posterior_head.parameters() if parameter.grad is not None
@@ -484,9 +557,23 @@ def test_normalized_model_error_opens_planner_and_imagination() -> None:
     algo = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=0, device="cpu")
     algo._model_error_ema = 0.02
     algo._posterior_kl_ema = 0.02
+    algo._observation_error_ema = 0.01
+    algo._stochastic_usage_ema = 0.25
     uncertainty = float(algo._effective_uncertainty(torch.tensor(0.0)))
     assert algo._planning_budget(uncertainty) > algo.num_simulations_initial
     assert algo._gated_imagination_horizon(uncertainty) > 1
+
+
+def test_collapsed_latent_keeps_planner_and_imagination_closed() -> None:
+    algo = NativeLatentImZero(_OneStepDiscrete(), TINY, seed=0, device="cpu")
+    algo._model_error_ema = 0.0
+    algo._posterior_kl_ema = 0.0
+    algo._observation_error_ema = 0.0
+    algo._stochastic_usage_ema = 0.024
+    uncertainty = float(algo._effective_uncertainty(torch.tensor(0.00044)))
+    assert uncertainty >= algo.uncertainty_high
+    assert algo._planning_budget(uncertainty) == algo.num_simulations_initial
+    assert algo._gated_imagination_horizon(uncertainty) == 1
 
 
 def test_stochastic_and_continue_ablation_switches_are_exact() -> None:
@@ -537,6 +624,8 @@ def test_continuous_learn_predict_and_save_load() -> None:
         path = Path(directory) / "latentimzero.pt"
         algo._model_error_ema = 0.123
         algo._posterior_kl_ema = 0.456
+        algo._observation_error_ema = 0.234
+        algo._stochastic_usage_ema = 0.345
         algo.save(path)
         loaded = NativeLatentImZero.load(path, _OneStepContinuous(), device="cpu")
         loaded_action, _ = loaded.predict(obs, deterministic=True, episode_start=True)
@@ -544,6 +633,8 @@ def test_continuous_learn_predict_and_save_load() -> None:
         assert all(not parameter.requires_grad for parameter in loaded.ema_critic.parameters())
         assert loaded._model_error_ema == 0.123
         assert loaded._posterior_kl_ema == 0.456
+        assert loaded._observation_error_ema == 0.234
+        assert loaded._stochastic_usage_ema == 0.345
     algo.env.close()
 
 

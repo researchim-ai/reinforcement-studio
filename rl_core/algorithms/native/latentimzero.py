@@ -74,6 +74,9 @@ DEFAULT_HYPERPARAMS = {
     "free_bits": 0.25,
     "kl_coef": 1.0,
     "observation_loss_coef": 1.0,
+    "latent_information_coef": 0.1,
+    "latent_usage_threshold": 0.1,
+    "observation_error_threshold": 0.2,
     "value_support_size": 100,
     "buffer_size": 2_000,
     "batch_size": 32,
@@ -176,6 +179,55 @@ def _stochastic_usage(post_logits: torch.Tensor, unimix: float) -> torch.Tensor:
     probs = _unimix_probs(post_logits, unimix)
     entropy = -(probs * probs.clamp_min(1e-8).log()).sum(-1).mean()
     return (1.0 - entropy / math.log(post_logits.shape[-1])).clamp(0.0, 1.0)
+
+
+def _latent_information(
+    post_logits: torch.Tensor, unimix: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Categorical -MI: confident samples and diverse batch marginals win."""
+    probs = _unimix_probs(post_logits, unimix)
+    conditional = -(probs * probs.clamp_min(1e-8).log()).sum(-1).mean()
+    marginal = probs.mean(dim=0)
+    marginal_entropy = -(
+        marginal * marginal.clamp_min(1e-8).log()
+    ).sum(-1).mean()
+    loss = conditional - marginal_entropy
+    effective_classes = marginal_entropy.exp()
+    utilization = effective_classes / post_logits.shape[-1]
+    return loss, conditional, marginal_entropy, utilization
+
+
+class _FixedObservationTarget(nn.Module):
+    """Frozen JL projection of normalized raw observations."""
+
+    def __init__(self, observation_space: gym.Space, input_shape: tuple[int, ...], embed_dim: int) -> None:
+        super().__init__()
+        input_dim = int(np.prod(input_shape))
+        if isinstance(observation_space, gym.spaces.Box):
+            low = np.asarray(observation_space.low, dtype=np.float32).reshape(-1)
+            high = np.asarray(observation_space.high, dtype=np.float32).reshape(-1)
+        elif isinstance(observation_space, gym.spaces.Discrete):
+            low = np.zeros(input_dim, dtype=np.float32)
+            high = np.ones(input_dim, dtype=np.float32)
+        else:
+            low = np.full(input_dim, -np.inf, dtype=np.float32)
+            high = np.full(input_dim, np.inf, dtype=np.float32)
+        if low.size != input_dim:
+            low = np.resize(low, input_dim)
+            high = np.resize(high, input_dim)
+        self.register_buffer("low", torch.as_tensor(low))
+        self.register_buffer("high", torch.as_tensor(high))
+        self.register_buffer(
+            "projection", torch.randn(input_dim, embed_dim) / math.sqrt(max(1, input_dim)),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = torch.nan_to_num(obs.float().reshape(obs.shape[0], -1))
+        finite = torch.isfinite(self.low) & torch.isfinite(self.high) & (self.high > self.low)
+        bounded = (2.0 * (x - self.low) / (self.high - self.low).clamp_min(1e-6) - 1.0).clamp(-2.0, 2.0)
+        x = torch.where(finite, bounded, torch.tanh(x))
+        projected = x @ self.projection
+        return F.layer_norm(projected, (projected.shape[-1],))
 
 
 def _balanced_kl(
@@ -676,9 +728,11 @@ class NativeLatentImZero(CustomAlgorithm):
         ).to(device)
         self.world_model.use_stochastic_state = bool(int(hyperparams.get("use_stochastic_state", 1)))
         self.world_model.use_continue = bool(int(hyperparams.get("use_continue", 1)))
-        self.target_tokenizer = copy.deepcopy(self.world_model.tokenizer).eval()
-        for p in self.target_tokenizer.parameters():
-            p.requires_grad_(False)
+        sample_obs = obs_to_array(self._obs_space.sample(), self._obs_space)
+        self._obs_shape = sample_obs.shape
+        self.observation_target = _FixedObservationTarget(
+            self._obs_space, self._obs_shape, embed_dim,
+        ).to(device).eval()
         self.actor = _Actor(
             self.world_model.feat_dim, self._action_space, hidden_dim, components.get("actor"),
         ).to(device)
@@ -705,12 +759,17 @@ class NativeLatentImZero(CustomAlgorithm):
         self.gamma = float(hyperparams.get("gamma", 0.99))
         self.unimix = float(hyperparams.get("unimix", 0.01))
         self.kl_balance = float(hyperparams.get("kl_balance", 0.8))
-        self.free_bits = float(hyperparams.get("free_bits", 1.0))
+        self.free_bits = float(hyperparams.get("free_bits", 0.25))
         self.kl_coef = (
             float(hyperparams.get("kl_coef", 1.0))
             if self.world_model.use_stochastic_state else 0.0
         )
         self.observation_loss_coef = float(hyperparams.get("observation_loss_coef", 1.0))
+        self.latent_information_coef = float(hyperparams.get("latent_information_coef", 0.1))
+        self.latent_usage_threshold = float(hyperparams.get("latent_usage_threshold", 0.1))
+        self.observation_error_threshold = float(
+            hyperparams.get("observation_error_threshold", 0.2),
+        )
         self.model_loss_coef = float(hyperparams.get("model_loss_coef", 1.0))
         self.actor_loss_coef = float(hyperparams.get("actor_loss_coef", 1.0))
         self.critic_loss_coef = float(hyperparams.get("critic_loss_coef", 1.0))
@@ -749,8 +808,6 @@ class NativeLatentImZero(CustomAlgorithm):
         self.reanalyze_freq = max(1, int(hyperparams.get("reanalyze_freq", 200)))
         self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 32)))
         self.max_grad_norm = float(hyperparams.get("max_grad_norm", 10.0))
-        sample_obs = obs_to_array(self._obs_space.sample(), self._obs_space)
-        self._obs_shape = sample_obs.shape
         self.buffer = _LatentReplay(
             int(hyperparams.get("buffer_size", 2_000)), self._obs_shape, self.action_dim,
             self.n_actions if self.discrete else self.action_dim,
@@ -766,6 +823,8 @@ class NativeLatentImZero(CustomAlgorithm):
         # uncertainty_high, then can decay below it from actual symlog error.
         self._model_error_ema = 1.0
         self._posterior_kl_ema = self.free_bits
+        self._observation_error_ema = 1.0
+        self._stochastic_usage_ema = 0.0
         self._last_planning_budget = self.num_simulations_initial
         self._last_imagination_horizon = 1
 
@@ -788,7 +847,26 @@ class NativeLatentImZero(CustomAlgorithm):
             kl_norm.clamp(0.0, 1.0),
             error_norm.clamp(0.0, 1.0),
         ))
-        return 1.0 - torch.prod(1.0 - components, dim=0)
+        model_uncertainty = 1.0 - torch.prod(1.0 - components, dim=0)
+        representation = torch.as_tensor(
+            self._representation_uncertainty(),
+            dtype=disagreement.dtype,
+            device=disagreement.device,
+        )
+        return torch.maximum(model_uncertainty, representation)
+
+    def _representation_uncertainty(self) -> float:
+        usage_threshold = max(self.latent_usage_threshold, 1e-6)
+        error_threshold = max(self.observation_error_threshold, 1e-6)
+        # Exactly conservative below either readiness threshold, then a
+        # continuous ramp to zero as usage doubles and fixed-target error falls.
+        usage_deficit = min(
+            1.0, max(0.0, 2.0 - self._stochastic_usage_ema / usage_threshold),
+        )
+        observation_deficit = min(
+            1.0, max(0.0, self._observation_error_ema / error_threshold),
+        )
+        return self.uncertainty_high * max(usage_deficit, observation_deficit)
 
     def _confidence(self, uncertainty: torch.Tensor) -> torch.Tensor:
         span = max(1e-6, self.uncertainty_high - self.uncertainty_low)
@@ -1007,10 +1085,6 @@ class NativeLatentImZero(CustomAlgorithm):
         with torch.no_grad():
             for target, online in zip(self.ema_critic.parameters(), self.critic.parameters()):
                 target.mul_(1.0 - self.ema_tau).add_(online, alpha=self.ema_tau)
-            for target, online in zip(
-                self.target_tokenizer.parameters(), self.world_model.tokenizer.parameters(),
-            ):
-                target.mul_(1.0 - self.ema_tau).add_(online, alpha=self.ema_tau)
 
     @torch.no_grad()
     def _grounded_targets(
@@ -1076,11 +1150,17 @@ class NativeLatentImZero(CustomAlgorithm):
         kl_loss = torch.zeros((), device=self.device)
         ensemble_loss = torch.zeros((), device=self.device)
         observation_loss = torch.zeros((), device=self.device)
+        latent_information_loss = torch.zeros((), device=self.device)
         raw_kl_values: list[torch.Tensor] = []
         posterior_entropies: list[torch.Tensor] = []
         prior_entropies: list[torch.Tensor] = []
         z_feature_deltas: list[torch.Tensor] = []
         model_errors: list[torch.Tensor] = []
+        observation_errors: list[torch.Tensor] = []
+        posterior_logits_all: list[torch.Tensor] = []
+        posterior_masks: list[torch.Tensor] = []
+        observation_targets: list[torch.Tensor] = []
+        observation_predictions: list[torch.Tensor] = []
         for t in range(self.unroll_steps):
             m = mask[:, t] * is_weight
             denom = mask[:, t].sum().clamp_min(1.0)
@@ -1096,6 +1176,8 @@ class NativeLatentImZero(CustomAlgorithm):
             posterior_states = self.world_model.observe(next_obs[:, t], prior_states)
             post_logits = torch.stack([s.post_logits for s in posterior_states])
             prior_logits = torch.stack([s.prior_logits for s in prior_states])
+            posterior_logits_all.append(post_logits)
+            posterior_masks.append(mask[:, t].bool())
             kl_t, raw_kl = _balanced_kl(
                 post_logits, prior_logits, self.kl_balance, self.free_bits, self.unimix,
             )
@@ -1110,13 +1192,19 @@ class NativeLatentImZero(CustomAlgorithm):
                 -(prior_probs * prior_probs.clamp_min(1e-8).log()).sum(-1).mean(),
             )
             posterior_feat = self.world_model.features(posterior_states)
-            prediction = F.normalize(
-                self.world_model.observation_predictor(posterior_feat), dim=-1,
+            prediction = self.world_model.observation_predictor(posterior_feat)
+            prediction = F.layer_norm(
+                prediction, (prediction.shape[-1],),
             )
             with torch.no_grad():
-                target_embed = F.normalize(self.target_tokenizer(next_obs[:, t]), dim=-1)
-            obs_each = 1.0 - (prediction * target_embed).sum(-1)
+                target_embed = self.observation_target(next_obs[:, t])
+            obs_each = (prediction - target_embed).square().mean(-1)
             observation_loss = observation_loss + (m * obs_each).sum() / denom
+            observation_errors.append(
+                (mask[:, t] * obs_each.detach()).sum() / mask[:, t].sum().clamp_min(1.0),
+            )
+            observation_targets.append(target_embed)
+            observation_predictions.append(prediction)
             zero_z_feat = self.world_model.feat(
                 torch.stack([s.h for s in posterior_states]),
                 torch.zeros_like(torch.stack([s.z for s in posterior_states])),
@@ -1155,9 +1243,22 @@ class NativeLatentImZero(CustomAlgorithm):
         kl_loss /= scale
         ensemble_loss /= scale * len(self.world_model.ensemble_prior)
         observation_loss /= scale
+        all_post_logits = torch.cat(posterior_logits_all, dim=0)
+        all_post_mask = torch.cat(posterior_masks, dim=0)
+        valid_post_logits = all_post_logits[all_post_mask]
+        if not len(valid_post_logits):
+            valid_post_logits = all_post_logits
+            all_post_mask = torch.ones_like(all_post_mask)
+        (
+            latent_information_loss,
+            posterior_conditional_entropy,
+            posterior_marginal_entropy,
+            class_utilization,
+        ) = _latent_information(valid_post_logits, self.unimix)
         model_loss = (
             reward_loss + continue_loss + self.kl_coef * kl_loss
             + self.observation_loss_coef * observation_loss + 0.1 * ensemble_loss
+            + self.latent_information_coef * latent_information_loss
         )
         self.model_optimizer.zero_grad()
         (self.model_loss_coef * model_loss).backward()
@@ -1167,18 +1268,29 @@ class NativeLatentImZero(CustomAlgorithm):
         raw_kl = torch.stack(raw_kl_values).mean()
         posterior_entropy = torch.stack(posterior_entropies).mean()
         prior_entropy = torch.stack(prior_entropies).mean()
-        stochastic_usage = (
-            1.0 - posterior_entropy / math.log(self.world_model.stoch_classes)
-        ).clamp(0.0, 1.0)
+        stochastic_usage = _stochastic_usage(valid_post_logits, self.unimix)
         kl_per_variable = raw_kl / self.world_model.stoch_variables
         z_feature_delta = torch.stack(z_feature_deltas).mean()
         observed_model_error = torch.stack(model_errors).mean().detach()
+        observed_observation_error = torch.stack(observation_errors).mean().detach()
+        valid_targets = torch.cat(observation_targets, dim=0)[all_post_mask]
+        valid_predictions = torch.cat(observation_predictions, dim=0)[all_post_mask]
+        target_variance = valid_targets.var(dim=0, unbiased=False).mean()
+        predictor_variance = valid_predictions.var(dim=0, unbiased=False).mean()
         decay = self.model_error_ema_decay
         self._model_error_ema = (
             decay * self._model_error_ema + (1.0 - decay) * float(observed_model_error.item())
         )
         self._posterior_kl_ema = (
             decay * self._posterior_kl_ema + (1.0 - decay) * float(raw_kl.item())
+        )
+        self._observation_error_ema = (
+            decay * self._observation_error_ema
+            + (1.0 - decay) * float(observed_observation_error.item())
+        )
+        self._stochastic_usage_ema = (
+            decay * self._stochastic_usage_ema
+            + (1.0 - decay) * float(stochastic_usage.item())
         )
 
         # Rebuild posterior states after the model update. These states include
@@ -1318,14 +1430,24 @@ class NativeLatentImZero(CustomAlgorithm):
             "reward_loss": float(reward_loss.item()),
             "continue_loss": float(continue_loss.item()),
             "observation_loss": float(observation_loss.item()),
+            "observation_prediction_error": float(observed_observation_error.item()),
+            "observation_target_variance": float(target_variance.item()),
+            "observation_predictor_variance": float(predictor_variance.item()),
             "kl_loss": float(kl_loss.item()),
             "kl_active_loss": float(kl_loss.item()),
             "kl_raw": float(raw_kl.item()),
             "kl_per_variable": float(kl_per_variable.item()),
             "posterior_prior_kl": float(raw_kl.item()),
             "posterior_entropy": float(posterior_entropy.item()),
+            "posterior_conditional_entropy": float(posterior_conditional_entropy.item()),
+            "posterior_marginal_entropy": float(posterior_marginal_entropy.item()),
             "prior_entropy": float(prior_entropy.item()),
             "stochastic_usage": float(stochastic_usage.item()),
+            "latent_information_loss": float(latent_information_loss.item()),
+            "latent_class_utilization": float(class_utilization.item()),
+            "latent_effective_classes": float(
+                (class_utilization * self.world_model.stoch_classes).item()
+            ),
             "z_feature_delta": float(z_feature_delta.item()),
             "ensemble_loss": float(ensemble_loss.item()),
             "actor_loss": float(actor_loss.item()),
@@ -1353,6 +1475,16 @@ class NativeLatentImZero(CustomAlgorithm):
             ),
             "uncertainty_model_error": float(
                 self._model_error_ema / (1.0 + self._model_error_ema)
+            ),
+            "uncertainty_representation": self._representation_uncertainty(),
+            "observation_error_ema": self._observation_error_ema,
+            "stochastic_usage_ema": self._stochastic_usage_ema,
+            "representation_readiness": float(
+                max(
+                    0.0,
+                    1.0 - self._representation_uncertainty()
+                    / max(self.uncertainty_high, 1e-6),
+                )
             ),
             "model_error_ema": self._model_error_ema,
             "planning_budget": float(self._last_planning_budget),
@@ -1473,9 +1605,9 @@ class NativeLatentImZero(CustomAlgorithm):
 
     def save(self, path: Path) -> None:
         torch.save({
-            "checkpoint_version": 2,
+            "checkpoint_version": 3,
             "world_model": self.world_model.state_dict(),
-            "target_tokenizer": self.target_tokenizer.state_dict(),
+            "observation_target": self.observation_target.state_dict(),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "ema_critic": self.ema_critic.state_dict(),
@@ -1485,6 +1617,8 @@ class NativeLatentImZero(CustomAlgorithm):
             "uncertainty_ema": self._uncertainty_ema,
             "model_error_ema": self._model_error_ema,
             "posterior_kl_ema": self._posterior_kl_ema,
+            "observation_error_ema": self._observation_error_ema,
+            "stochastic_usage_ema": self._stochastic_usage_ema,
             "hyperparams": self.hyperparams,
         }, path)
 
@@ -1492,14 +1626,18 @@ class NativeLatentImZero(CustomAlgorithm):
     def load(cls, path: Path, env: gym.Env, device: str = "cpu") -> "NativeLatentImZero":
         payload = torch.load(path, map_location="cpu", weights_only=False)
         version = int(payload.get("checkpoint_version", 1))
-        if version != 2:
+        if version != 3:
+            reason = (
+                "v2 used a collapsing EMA tokenizer target"
+                if version == 2 else "v1 used observation-leaking dynamics"
+            )
             raise ValueError(
-                "LatentImZero checkpoint v1 used observation-leaking dynamics and "
-                "cannot be migrated safely; start a new run with checkpoint v2.",
+                f"LatentImZero checkpoint {reason} and cannot be migrated safely; "
+                "start a new run with checkpoint v3.",
             )
         algo = cls(env, payload.get("hyperparams", {}), None, device)
         algo.world_model.load_state_dict(payload["world_model"])
-        algo.target_tokenizer.load_state_dict(payload["target_tokenizer"])
+        algo.observation_target.load_state_dict(payload["observation_target"])
         algo.actor.load_state_dict(payload["actor"])
         algo.critic.load_state_dict(payload["critic"])
         algo.ema_critic.load_state_dict(payload["ema_critic"])
@@ -1509,4 +1647,6 @@ class NativeLatentImZero(CustomAlgorithm):
         algo._uncertainty_ema = float(payload.get("uncertainty_ema", algo.uncertainty_high))
         algo._model_error_ema = float(payload.get("model_error_ema", 1.0))
         algo._posterior_kl_ema = float(payload.get("posterior_kl_ema", algo.free_bits))
+        algo._observation_error_ema = float(payload.get("observation_error_ema", 1.0))
+        algo._stochastic_usage_ema = float(payload.get("stochastic_usage_ema", 0.0))
         return algo
