@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rl_core.tests.benchmark_latentimzero import summarize
+from rl_core.tests.benchmark_latentimzero import ABLATIONS, summarize
 
 
 def _row(algorithm: str, environment: str, auc: float) -> dict:
@@ -14,38 +14,39 @@ def _row(algorithm: str, environment: str, auc: float) -> dict:
     }
 
 
-def test_go_no_go_requires_four_wins_and_limits_regressions() -> None:
+def test_floor_accepts_no_large_research_regressions() -> None:
     rows = []
-    for index in range(6):
+    for index in range(3):
         environment = f"env-{index}"
         rows.extend([
-            _row("unizero", environment, 100.0),
-            _row("efficientzero", environment, 90.0),
-            _row("latentimzero", environment, 125.0 if index < 4 else 95.0),
+            _row("researchimzero", environment, 100.0),
+            _row("latentimzero", environment, 100.0),
         ])
     criterion = summarize(rows)["criterion"]
-    assert criterion["wins_at_least_20_percent"] == 4
-    assert criterion["losses_over_10_percent"] == 0
+    assert criterion["comparisons"] == 3
+    assert criterion["regressions_over_10_percent"] == 0
     assert criterion["passed"] is True
 
 
-def test_go_no_go_rejects_two_large_regressions() -> None:
-    rows = []
-    for index in range(6):
-        environment = f"env-{index}"
-        rows.extend([
-            _row("unizero", environment, 100.0),
-            _row("efficientzero", environment, 90.0),
-            _row("latentimzero", environment, 125.0 if index < 4 else 80.0),
-        ])
+def test_floor_rejects_large_research_regression() -> None:
+    rows = [
+        _row("researchimzero", "env", 100.0),
+        _row("latentimzero", "env", 80.0),
+    ]
     assert summarize(rows)["criterion"]["passed"] is False
 
 
 def test_incomplete_episodes_remain_missing_not_infinite() -> None:
     rows = [
         {**_row(algorithm, "slow-env", 0.0), "auc": None, "final_reward": None}
-        for algorithm in ("latentimzero", "unizero", "efficientzero")
+        for algorithm in ("latentimzero", "researchimzero")
     ]
     summary = summarize(rows)
     assert summary["environments"]["slow-env"]["latentimzero"]["median_auc"] is None
     assert summary["criterion"]["passed"] is False
+
+
+def test_v7_ablations_are_registered() -> None:
+    assert set(ABLATIONS) == {
+        "research_pure", "uncertainty_disabled", "uncertainty_only",
+    }

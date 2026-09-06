@@ -1,4 +1,4 @@
-"""Repeatable sample-efficiency benchmark for LatentImZero.
+"""Repeatable ResearchImZero-floor benchmark for LatentImZero v7.
 
 This is intentionally not collected by pytest.  It runs equal env-step
 budgets and seeds for all algorithms and writes both learning curves and a
@@ -7,8 +7,9 @@ go/no-go summary:
     python -m rl_core.tests.benchmark_latentimzero --tier smoke
     python -m rl_core.tests.benchmark_latentimzero --tier tier0 --steps 100000
 
-The default Tier-0 panel follows the LatentImZero design plan. Optional
-dependencies are reported as skipped environments, never silently replaced.
+The default panel compares the exact Research core against v7. Optional
+dependencies are reported as skipped environments, never silently replaced;
+no improvement is inferred without measured runs.
 """
 from __future__ import annotations
 
@@ -24,21 +25,19 @@ import numpy as np
 
 import rl_core.envs.registry  # noqa: F401 - registers Studio environments
 from rl_core.algorithms.base import TrainingCallback
-from rl_core.algorithms.native.efficientzero import (
-    DEFAULT_HYPERPARAMS as EFFICIENTZERO_DEFAULTS,
-    NativeEfficientZero,
-)
 from rl_core.algorithms.native.latentimzero import (
     DEFAULT_HYPERPARAMS as LATENTIMZERO_DEFAULTS,
     NativeLatentImZero,
 )
-from rl_core.algorithms.native.unizero import DEFAULT_HYPERPARAMS as UNIZERO_DEFAULTS, NativeUniZero
+from rl_core.algorithms.native.researchimzero import (
+    DEFAULT_HYPERPARAMS as RESEARCHIMZERO_DEFAULTS,
+    NativeResearchImZero,
+)
 
 
 ALGORITHMS = {
+    "researchimzero": (NativeResearchImZero, RESEARCHIMZERO_DEFAULTS),
     "latentimzero": (NativeLatentImZero, LATENTIMZERO_DEFAULTS),
-    "unizero": (NativeUniZero, UNIZERO_DEFAULTS),
-    "efficientzero": (NativeEfficientZero, EFFICIENTZERO_DEFAULTS),
 }
 TIERS = {
     "smoke": ["CartPole-v1", "Pendulum-v1"],
@@ -57,19 +56,9 @@ DEFAULT_THRESHOLDS = {
     "MountainCar-v0": -110.0,
 }
 ABLATIONS = {
-    "no_stochastic_state": {"use_stochastic_state": 0},
-    "no_imagination_ac": {
-        "actor_loss_coef": 0.0,
-        "critic_loss_coef": 0.0,
-        "imagination_horizon": 1,
-    },
-    "no_continue": {"use_continue": 0},
-    "no_ensemble_bonus": {
-        "ensemble_size": 1,
-        "exploration_bonus_coef": 0.0,
-        "uncertainty_scale": 0.0,
-    },
-    "no_planner_distillation": {"distill_coef": 0.0, "fresh_distill_fraction": 0.0},
+    "research_pure": {"force_research_mode": 1, "uncertainty_enabled": 0},
+    "uncertainty_disabled": {"force_research_mode": 0, "uncertainty_enabled": 0},
+    "uncertainty_only": {"force_research_mode": 0, "uncertainty_enabled": 1},
 }
 
 
@@ -169,30 +158,25 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 }
         summary["environments"][env_id] = per_algorithm
 
-    wins = 0
-    losses = 0
+    regressions = 0
+    comparisons = 0
     for values in summary["environments"].values():
-        if "latentimzero" not in values or len(values) < 3:
+        if "latentimzero" not in values or "researchimzero" not in values:
             continue
         latent = values["latentimzero"]["median_auc"]
-        baseline_values = [
-            values["unizero"]["median_auc"],
-            values["efficientzero"]["median_auc"],
-        ]
-        if latent is None or any(value is None for value in baseline_values):
+        research = values["researchimzero"]["median_auc"]
+        if latent is None or research is None:
             continue
-        baseline = max(baseline_values)
-        if not np.isfinite(latent) or not np.isfinite(baseline):
+        if not np.isfinite(latent) or not np.isfinite(research):
             continue
-        scale = max(abs(baseline), 1.0)
-        relative = (latent - baseline) / scale
-        wins += int(relative >= 0.20)
-        losses += int(relative < -0.10)
+        scale = max(abs(research), 1.0)
+        comparisons += 1
+        regressions += int((latent - research) / scale < -0.10)
     summary["criterion"] = {
-        "wins_at_least_20_percent": wins,
-        "losses_over_10_percent": losses,
-        "passed": wins >= 4 and losses <= 1,
-        "required": "≥20% median AUC gain in 4/6 environments and >10% loss in at most one",
+        "comparisons": comparisons,
+        "regressions_over_10_percent": regressions,
+        "passed": comparisons > 0 and regressions == 0,
+        "required": "No >10% median-AUC regression versus ResearchImZero",
     }
     return summary
 

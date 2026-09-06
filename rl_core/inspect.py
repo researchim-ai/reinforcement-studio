@@ -352,7 +352,7 @@ def _inspect_gym_network(env: Any, algo_id: str, hyperparams: dict[str, Any]) ->
             from rl_core.algorithms.native.latentimzero import DEFAULT_HYPERPARAMS, NativeLatentImZero
 
             algorithm_cls = NativeLatentImZero
-            label = "LatentImZero stochastic imagination world model"
+            label = "LatentImZero v7 Research core + uncertainty sidecar"
         algorithm = algorithm_cls(env, {**DEFAULT_HYPERPARAMS, **hyperparams}, 0, "cpu")
         module = _find_torch_module(algorithm)
         return {

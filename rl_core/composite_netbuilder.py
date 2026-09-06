@@ -55,35 +55,6 @@ def default_composite_spec(family: str) -> dict[str, Any]:
                 "predictor": _default_mlp([64], batch_norm=True),
             },
         }
-    if family == "latentimzero":
-        return {
-            "format": "composite_v1",
-            "family": family,
-            "dimensions": {
-                "embed_dim": 64,
-                "hidden_dim": 128,
-                "num_layers": 2,
-                "num_heads": 4,
-                "ffn_multiplier": 4,
-                "dropout": 0.0,
-                "rotary_emb": 1,
-                "stoch_variables": 16,
-                "stoch_classes": 16,
-            },
-            "encoder": _default_encoder(),
-            "components": {
-                "tokenizer": _default_mlp([128]),
-                "stochastic_prior": _default_mlp([]),
-                "stochastic_posterior": _default_mlp([128]),
-                "state_feature": _default_mlp([128]),
-                "reward": _default_mlp([]),
-                "continue": _default_mlp([]),
-                "actor": _default_mlp([128, 128]),
-                "critic": _default_mlp([128]),
-                "ensemble_prior": _default_mlp([]),
-                "ensemble_reward": _default_mlp([]),
-            },
-        }
     return {
         "format": "composite_v1",
         "family": family,
@@ -94,7 +65,7 @@ def default_composite_spec(family: str) -> dict[str, Any]:
             "ffn_multiplier": 4,
             "dropout": 0.1 if family == "unizero" else 0.0,
             "rotary_emb": 1,
-            **({"proj_dim": 64} if family == "researchimzero" else {}),
+            **({"proj_dim": 64} if family in {"researchimzero", "latentimzero"} else {}),
         },
         "encoder": _default_encoder(),
         "components": {
@@ -105,7 +76,7 @@ def default_composite_spec(family: str) -> dict[str, Any]:
                     "projector": _default_mlp([64], batch_norm=True),
                     "predictor": _default_mlp([64], batch_norm=True),
                 }
-                if family == "researchimzero"
+                if family in {"researchimzero", "latentimzero"}
                 else {}
             ),
         },
@@ -125,18 +96,11 @@ def composite_spec_from_hyperparams(family: str, hyperparams: dict[str, Any]) ->
             spec["components"][name]["hidden_sizes"] = [int(dimensions["proj_dim"])]
     else:
         dimension_keys = ("embed_dim", "num_layers", "num_heads", "dropout", "rotary_emb", "ffn_multiplier")
-        if family == "latentimzero":
-            dimension_keys += ("hidden_dim", "stoch_variables", "stoch_classes")
         for key in dimension_keys:
             if key in hyperparams:
                 dimensions[key] = hyperparams[key]
         spec["components"]["tokenizer"]["hidden_sizes"] = [2 * int(dimensions["embed_dim"])]
-        if family == "latentimzero":
-            hidden_dim = int(dimensions["hidden_dim"])
-            for name in ("stochastic_posterior", "state_feature", "critic"):
-                spec["components"][name]["hidden_sizes"] = [hidden_dim]
-            spec["components"]["actor"]["hidden_sizes"] = [hidden_dim, hidden_dim]
-        if family == "researchimzero":
+        if family in {"researchimzero", "latentimzero"}:
             if "proj_dim" in hyperparams:
                 dimensions["proj_dim"] = hyperparams["proj_dim"]
             for name in ("projector", "predictor"):
@@ -219,22 +183,9 @@ def validate_composite_spec(spec: dict[str, Any], expected_family: str | None = 
         if dimensions["rotary_emb"] and (dimensions["embed_dim"] // dimensions["num_heads"]) % 2:
             raise NetworkSpecError("Для RoPE размер одной attention-head должен быть чётным")
         required = ("tokenizer", "heads")
-        if family == "researchimzero":
+        if family in {"researchimzero", "latentimzero"}:
             dimensions["proj_dim"] = _positive_int(dimensions.get("proj_dim"), "proj_dim")
             required += ("projector", "predictor")
-        elif family == "latentimzero":
-            dimensions["hidden_dim"] = _positive_int(dimensions.get("hidden_dim"), "hidden_dim")
-            dimensions["stoch_variables"] = _positive_int(
-                dimensions.get("stoch_variables"), "stoch_variables",
-            )
-            dimensions["stoch_classes"] = _positive_int(
-                dimensions.get("stoch_classes"), "stoch_classes",
-            )
-            required = (
-                "tokenizer", "stochastic_prior", "stochastic_posterior",
-                "state_feature", "reward", "continue", "actor", "critic",
-                "ensemble_prior", "ensemble_reward",
-            )
 
     for name in required:
         cfg = components.setdefault(name, _default_mlp([]))

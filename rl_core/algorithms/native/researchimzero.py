@@ -1805,6 +1805,8 @@ class _ResearchImZeroBuffer:
 
 
 class NativeResearchImZero(CustomAlgorithm):
+    COMPOSITE_FAMILY = "researchimzero"
+
     def __init__(self, env: gym.Env, hyperparams: dict[str, Any], seed: int | None, device: str) -> None:
         super().__init__(env, hyperparams, seed, device)
         if seed is not None:
@@ -1818,11 +1820,11 @@ class NativeResearchImZero(CustomAlgorithm):
 
         network_spec = hyperparams.get("network_spec")
         if network_spec is not None:
-            network_spec = validate_composite_spec(network_spec, "researchimzero")
+            network_spec = validate_composite_spec(network_spec, self.COMPOSITE_FAMILY)
             self.hyperparams["network_spec"] = network_spec
         dimensions = dimensions_from_spec(
             network_spec,
-            "researchimzero",
+            self.COMPOSITE_FAMILY,
             {
                 "embed_dim": int(hyperparams.get("embed_dim", 128)),
                 "num_layers": max(1, int(hyperparams.get("num_layers", 2))),
@@ -2169,6 +2171,13 @@ class NativeResearchImZero(CustomAlgorithm):
         h_obs, caches2 = self.transformer.forward_incremental_batch(z_pred, positions2, caches1, embed_positions2)
         return caches2, h_act, h_obs
 
+    def _adjust_search_reward(
+        self, action_hidden: torch.Tensor, reward: torch.Tensor,
+    ) -> torch.Tensor:
+        """Optional search-edge-only adjustment hook; identity by default."""
+        del action_hidden
+        return reward
+
     def _replay_context_to_cache(
         self, ctx_obs: np.ndarray, ctx_action: np.ndarray, ctx_valid: np.ndarray,
     ) -> list[_TransformerCache | None]:
@@ -2449,6 +2458,7 @@ class NativeResearchImZero(CustomAlgorithm):
             with torch.inference_mode():
                 child_caches, h_act, h_obs = self._step_imagine(parent_caches, action_t)
                 reward_scalar = self.heads.reward(h_act)
+                reward_scalar = self._adjust_search_reward(h_act, reward_scalar)
                 next_value = self.heads.value(h_obs)
                 if self.discrete:
                     next_logits = self.heads.policy_logits(h_obs)
@@ -2631,6 +2641,16 @@ class NativeResearchImZero(CustomAlgorithm):
             + progress * (self.num_simulations - self.num_simulations_initial),
         )
         return max(2, min(self.num_simulations, int(simulations)))
+
+    def _after_core_train_step(
+        self,
+        batch: dict[str, Any],
+        hidden: torch.Tensor,
+        obs0_pos: torch.Tensor,
+    ) -> dict[str, float]:
+        """Optional detached sidecar hook; a strict no-op for ResearchImZero."""
+        del batch, hidden, obs0_pos
+        return {}
 
     # ------------------------------------------------------------------
     # Training - one forward pass over the full teacher-forced window
@@ -3063,6 +3083,7 @@ class NativeResearchImZero(CustomAlgorithm):
             self.rnd.update_predictor(
                 batch["next_obs"].reshape(-1, *self._obs_shape), mask=batch["mask"].reshape(-1),
             )
+        sidecar_metrics = self._after_core_train_step(batch, hidden.detach(), obs0_pos)
 
         return {
             "reward_loss": float(reward_loss.item()),
@@ -3102,6 +3123,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 if self.rnd
                 else {}
             ),
+            **sidecar_metrics,
         }
 
     # ------------------------------------------------------------------

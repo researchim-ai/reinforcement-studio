@@ -198,7 +198,7 @@ def _composite_fixed_outputs(
     try:
         action_space = env.action_space
         action_dim = int(action_space.n) if isinstance(action_space, gym.spaces.Discrete) else int(np.prod(action_space.shape))
-        default_support = 50 if family == "unizero" else (100 if family == "latentimzero" else 300)
+        default_support = 50 if family == "unizero" else 300
         support = max(1, int(hyperparams.get("value_support_size", default_support)))
         outputs = {"policy": [action_dim], "value": [2 * support + 1]}
         if family == "efficientzero":
@@ -206,8 +206,8 @@ def _composite_fixed_outputs(
         elif family == "latentimzero":
             outputs.update({
                 "reward": [2 * support + 1],
-                "continue": [1],
-                "stochastic_state": ["stoch_variables", "stoch_classes"],
+                "next_token": ["embed_dim"],
+                "uncertainty_rewards": ["uncertainty_members"],
             })
         else:
             outputs.update({"reward": [2 * support + 1], "next_token": ["embed_dim"]})

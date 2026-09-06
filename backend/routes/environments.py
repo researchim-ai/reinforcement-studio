@@ -614,64 +614,12 @@ ALGORITHM_CATALOG = [
     },
     {
         "id": "latentimzero",
-        "name": "LatentImZero (stochastic imagination)",
+        "name": "LatentImZero v7 (Research floor)",
         "kind": "gym",
-        "description": "Stochastic Transformer world model + continue-aware imagination actor-critic + uncertainty-gated Gumbel planning. Discrete и continuous.",
-        "hyperparams": [
-            {"key": "model_learning_rate", "label": "World model learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
-            {"key": "actor_learning_rate", "label": "Actor learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
-            {"key": "critic_learning_rate", "label": "Critic learning rate", "type": "float", "default": 3e-4, "min": 1e-6, "max": 1e-1},
-            {"key": "embed_dim", "label": "Transformer token embedding", "type": "int", "default": 64, "min": 8, "max": 1024},
-            {"key": "hidden_dim", "label": "State/actor/critic hidden size", "type": "int", "default": 128, "min": 16, "max": 2048},
-            {"key": "num_layers", "label": "Transformer blocks", "type": "int", "default": 2, "min": 1, "max": 12},
-            {"key": "num_heads", "label": "Attention heads", "type": "int", "default": 4, "min": 1, "max": 32},
-            {"key": "dropout", "label": "Transformer dropout", "type": "float", "default": 0.0, "min": 0.0, "max": 0.5},
-            {"key": "context_length", "label": "Окно Transformer-памяти", "type": "int", "default": 8, "min": 0, "max": 128},
-            {"key": "stoch_variables", "label": "Категориальных stochastic-переменных", "type": "int", "default": 16, "min": 1, "max": 128},
-            {"key": "stoch_classes", "label": "Классов на stochastic-переменную", "type": "int", "default": 16, "min": 2, "max": 128},
-            {"key": "use_stochastic_state", "label": "Использовать stochastic state", "type": "int", "default": 1, "min": 0, "max": 1},
-            {"key": "use_continue", "label": "Использовать learned continue discount", "type": "int", "default": 1, "min": 0, "max": 1},
-            {"key": "unimix", "label": "Unimix probability", "type": "float", "default": 0.01, "min": 0.0, "max": 0.2},
-            {"key": "kl_balance", "label": "KL balance (dynamics share)", "type": "float", "default": 0.8, "min": 0.0, "max": 1.0},
-            {"key": "free_bits", "label": "KL free nats (total across variables)", "type": "float", "default": 0.25, "min": 0.0, "max": 20.0},
-            {"key": "kl_coef", "label": "KL loss weight", "type": "float", "default": 1.0, "min": 0.0, "max": 20.0},
-            {"key": "observation_loss_coef", "label": "Latent observation prediction weight", "type": "float", "default": 1.0, "min": 0.0, "max": 20.0},
-            {"key": "latent_information_coef", "label": "Categorical latent information weight", "type": "float", "default": 0.1, "min": 0.0, "max": 10.0},
-            {"key": "latent_usage_threshold", "label": "Latent usage readiness threshold", "type": "float", "default": 0.1, "min": 0.0, "max": 1.0},
-            {"key": "observation_error_threshold", "label": "Fixed-target error readiness threshold", "type": "float", "default": 0.2, "min": 0.001, "max": 10.0},
-            {"key": "value_support_size", "label": "Symlog two-hot support (±N)", "type": "int", "default": 100, "min": 5, "max": 1000},
-            {"key": "buffer_size", "label": "Replay buffer (эпизодов)", "type": "int", "default": 2_000, "min": 10, "max": 100_000},
-            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 32, "min": 2, "max": 1024},
-            {"key": "unroll_steps", "label": "Posterior training unroll", "type": "int", "default": 5, "min": 1, "max": 50},
-            {"key": "td_steps", "label": "Replay TD horizon", "type": "int", "default": 5, "min": 1, "max": 100},
-            {"key": "imagination_horizon", "label": "Prior imagination horizon", "type": "int", "default": 15, "min": 1, "max": 100},
-            {"key": "imagination_lambda", "label": "Imagination λ-return", "type": "float", "default": 0.95, "min": 0.0, "max": 1.0},
-            {"key": "gamma", "label": "Maximum discount (gamma)", "type": "float", "default": 0.99, "min": 0.5, "max": 0.9999},
-            {"key": "entropy_coef", "label": "Actor entropy weight", "type": "float", "default": 1e-3, "min": 0.0, "max": 0.1},
-            {"key": "distill_coef", "label": "Planner distillation weight", "type": "float", "default": 0.5, "min": 0.0, "max": 10.0},
-            {"key": "fresh_distill_fraction", "label": "Доля batch с fresh planner targets", "type": "float", "default": 0.0, "min": 0.0, "max": 1.0},
-            {"key": "ema_tau", "label": "EMA critic update rate", "type": "float", "default": 0.01, "min": 1e-5, "max": 1.0},
-            {"key": "ensemble_size", "label": "Epistemic ensemble size", "type": "int", "default": 3, "min": 2, "max": 10},
-            {"key": "uncertainty_scale", "label": "Imagined-gradient uncertainty penalty", "type": "float", "default": 2.0, "min": 0.0, "max": 20.0},
-            {"key": "uncertainty_low", "label": "Uncertainty для полного compute budget", "type": "float", "default": 0.02, "min": 0.0, "max": 10.0},
-            {"key": "uncertainty_high", "label": "Uncertainty для минимального compute budget", "type": "float", "default": 0.5, "min": 0.001, "max": 20.0},
-            {"key": "num_sampled_actions", "label": "Planner action candidates", "type": "int", "default": 8, "min": 2, "max": 128},
-            {"key": "num_simulations", "label": "Максимальный Gumbel compute budget", "type": "int", "default": 16, "min": 2, "max": 256},
-            {"key": "num_simulations_initial", "label": "Минимальный Gumbel compute budget", "type": "int", "default": 2, "min": 1, "max": 256},
-            {"key": "planner_horizon", "label": "Planner prior-rollout horizon", "type": "int", "default": 3, "min": 1, "max": 30},
-            {"key": "exploration_bonus_coef", "label": "Search-only disagreement bonus", "type": "float", "default": 0.1, "min": 0.0, "max": 10.0},
-            {"key": "learning_starts", "label": "Legacy fallback warm-up", "type": "int", "default": 500, "min": 0, "max": 1_000_000},
-            {"key": "world_model_learning_starts", "label": "Шагов до обучения world model", "type": "int", "default": 512, "min": 0, "max": 1_000_000},
-            {"key": "policy_learning_starts", "label": "Шагов до actor/search", "type": "int", "default": 5_000, "min": 0, "max": 1_000_000},
-            {"key": "min_context_transitions_per_lane", "label": "Минимум переходов на параллельную среду", "type": "int", "default": 16, "min": 0, "max": 10_000},
-            {"key": "model_error_ema_decay", "label": "EMA decay ошибки world model", "type": "float", "default": 0.99, "min": 0.0, "max": 0.99999},
-            {"key": "ensemble_bootstrap_probability", "label": "Bootstrap probability для ensemble", "type": "float", "default": 0.7, "min": 0.05, "max": 1.0},
-            {"key": "train_freq", "label": "Реальных шагов между обновлениями", "type": "int", "default": 1, "min": 1, "max": 10_000},
-            {"key": "train_steps_per_iter", "label": "Gradient updates за train interval", "type": "int", "default": 1, "min": 1, "max": 100},
-            {"key": "reanalyze_freq", "label": "Реальных шагов между reanalyze", "type": "int", "default": 200, "min": 1, "max": 100_000},
-            {"key": "reanalyze_batch_size", "label": "Fresh targets за reanalyze (0 = off)", "type": "int", "default": 32, "min": 0, "max": 1024},
-            {"key": "max_grad_norm", "label": "Max gradient norm", "type": "float", "default": 10.0, "min": 0.1, "max": 100.0},
-        ],
+        "description": "Точное ядро ResearchImZero с изолированным опциональным bootstrap-probe. "
+                       "Probe активен по умолчанию, калиброванный бонус плавно включается после warmup "
+                       "и влияет только на reward рёбер Gumbel-поиска.",
+        "hyperparams": [],
     },
     {
         "id": "ippo",
@@ -778,6 +726,79 @@ ALGORITHM_CATALOG = [
             {"key": "channels", "label": "Conv channels", "type": "int", "default": 48, "min": 8, "max": 256},
             {"key": "num_blocks", "label": "Residual blocks", "type": "int", "default": 3, "min": 1, "max": 10},
         ],
+    },
+]
+
+# LatentImZero v7 deliberately exposes the complete ResearchImZero surface:
+# its floor is the same implementation and defaults, with only these isolated
+# experimental controls appended.
+_research_entry = next(item for item in ALGORITHM_CATALOG if item["id"] == "researchimzero")
+_latent_entry = next(item for item in ALGORITHM_CATALOG if item["id"] == "latentimzero")
+_latent_entry["hyperparams"] = [
+    {**item} for item in _research_entry["hyperparams"]
+] + [
+    {
+        "key": "force_research_mode", "label": "Принудительно чистый ResearchImZero",
+        "type": "int", "default": 0, "min": 0, "max": 1,
+    },
+    {
+        "key": "uncertainty_enabled", "label": "Экспериментальный uncertainty sidecar",
+        "type": "int", "default": 1, "min": 0, "max": 1,
+    },
+    {
+        "key": "uncertainty_bonus_coef", "label": "Search-only uncertainty bonus",
+        "type": "float", "default": 0.05, "min": 0.0, "max": 10.0,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_scale", "label": "Runtime scale uncertainty residual",
+        "type": "float", "default": 1.0, "min": 0.0, "max": 10.0,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_members", "label": "Bootstrap reward heads",
+        "type": "int", "default": 2, "min": 2, "max": 8,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_aux_learning_rate", "label": "Uncertainty probe learning rate",
+        "type": "float", "default": 1e-4, "min": 1e-6, "max": 1e-1,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_warmup_steps", "label": "Шагов нулевого search-бонуса",
+        "type": "int", "default": 5_000, "min": 0, "max": 10_000_000,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_ramp_steps", "label": "Шагов линейного включения бонуса",
+        "type": "int", "default": 20_000, "min": 1, "max": 10_000_000,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_anneal_start", "label": "Начало позднего затухания",
+        "type": "int", "default": 100_000, "min": 0, "max": 100_000_000,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_anneal_end", "label": "Конец позднего затухания",
+        "type": "int", "default": 250_000, "min": 1, "max": 100_000_000,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_bonus_clip", "label": "Максимум нормализованной uncertainty",
+        "type": "float", "default": 1.0, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_ema_decay", "label": "EMA decay калибровки",
+        "type": "float", "default": 0.99, "min": 0.0, "max": 0.9999,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+    },
+    {
+        "key": "uncertainty_sparse_threshold", "label": "Минимальная доля нулевых reward",
+        "type": "float", "default": 0.5, "min": 0.0, "max": 0.9999,
+        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
     },
 ]
 

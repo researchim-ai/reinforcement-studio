@@ -78,7 +78,7 @@ def test_composite_preview_returns_real_components_and_fixed_outputs() -> None:
     assert result["fixed_outputs"]["value"] == [21]
 
 
-def test_latentimzero_preview_exposes_stochastic_and_continue_outputs() -> None:
+def test_latentimzero_preview_exposes_research_core_and_probe_outputs() -> None:
     request = network_routes.PreviewRequest(
         family="latentimzero",
         spec=default_composite_spec("latentimzero"),
@@ -88,12 +88,13 @@ def test_latentimzero_preview_exposes_stochastic_and_continue_outputs() -> None:
     result = asyncio.run(network_routes.preview(request))
     assert result["ok"] is True
     assert {component["name"] for component in result["components"]} >= {
-        "world_model", "actor", "critic", "ema_critic",
+        "tokenizer", "action_embed", "transformer", "heads", "uncertainty_probe",
     }
     assert result["fixed_outputs"]["policy"] == [2]
     assert result["fixed_outputs"]["value"] == [21]
-    assert result["fixed_outputs"]["continue"] == [1]
-    assert result["fixed_outputs"]["stochastic_state"] == ["stoch_variables", "stoch_classes"]
+    assert result["fixed_outputs"]["reward"] == [21]
+    assert result["fixed_outputs"]["next_token"] == ["embed_dim"]
+    assert result["fixed_outputs"]["uncertainty_rewards"] == ["uncertainty_members"]
 
 
 def test_old_run_without_snapshots_gets_materialized_composite_spec(tmp_path: Path, monkeypatch) -> None:

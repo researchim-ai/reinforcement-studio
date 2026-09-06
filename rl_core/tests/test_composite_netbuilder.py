@@ -47,15 +47,7 @@ def _tiny_spec(family: str) -> dict:
             "embed_dim": 16, "num_layers": 1, "num_heads": 2, "ffn_multiplier": 2,
         })
         spec["components"]["tokenizer"]["hidden_sizes"] = [16]
-        if family == "latentimzero":
-            spec["dimensions"].update({
-                "hidden_dim": 24, "stoch_variables": 4, "stoch_classes": 4,
-            })
-            spec["components"]["stochastic_posterior"]["hidden_sizes"] = [13]
-            spec["components"]["state_feature"]["hidden_sizes"] = [17]
-            spec["components"]["actor"]["hidden_sizes"] = [19]
-            spec["components"]["critic"]["hidden_sizes"] = [23]
-        if family == "researchimzero":
+        if family in {"researchimzero", "latentimzero"}:
             spec["dimensions"]["proj_dim"] = 8
             spec["components"]["projector"]["hidden_sizes"] = [8]
             spec["components"]["predictor"]["hidden_sizes"] = [8]
@@ -187,20 +179,14 @@ def test_legacy_hyperparams_still_build_without_composite_spec() -> None:
     env.close()
 
 
-def test_latentimzero_component_configs_reach_runtime_modules() -> None:
+def test_latentimzero_uses_research_components_and_isolated_probe() -> None:
     env = gym.make("CartPole-v1")
     spec = _tiny_spec("latentimzero")
     widths = {
         "tokenizer": 11,
-        "stochastic_prior": 12,
-        "stochastic_posterior": 13,
-        "state_feature": 14,
-        "reward": 15,
-        "continue": 16,
-        "actor": 17,
-        "critic": 18,
-        "ensemble_prior": 19,
-        "ensemble_reward": 20,
+        "heads": 12,
+        "projector": 13,
+        "predictor": 14,
     }
     for name, width in widths.items():
         spec["components"][name]["hidden_sizes"] = [width]
@@ -210,16 +196,10 @@ def test_latentimzero_component_configs_reach_runtime_modules() -> None:
     )
 
     modules = {
-        "tokenizer": algorithm.world_model.tokenizer.head,
-        "stochastic_prior": algorithm.world_model.prior_head,
-        "stochastic_posterior": algorithm.world_model.posterior_head,
-        "state_feature": algorithm.world_model.feature_head[0],
-        "reward": algorithm.world_model.reward_head,
-        "continue": algorithm.world_model.continue_head,
-        "actor": algorithm.actor.trunk,
-        "critic": algorithm.critic.net,
-        "ensemble_prior": algorithm.world_model.ensemble_prior[0],
-        "ensemble_reward": algorithm.world_model.ensemble_reward[0],
+        "tokenizer": algorithm.tokenizer.head,
+        "heads": algorithm.heads.trunk,
+        "projector": algorithm.projector.net,
+        "predictor": algorithm.predictor.net,
     }
     for name, module in modules.items():
         first_linear = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear))
