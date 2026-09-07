@@ -54,4 +54,41 @@ describe('AlgorithmDiagram', () => {
     expect(container.textContent).toContain('Всего параметров:')
     expect(container.textContent).toContain('Обучаемых:')
   })
+
+  it('hides the per-layer weight dump in compact designer preview', () => {
+    const { container } = render(
+      <AlgorithmDiagram
+        show={{ loop: false, network: true }}
+        compact
+        network={{
+          inputShape: [21, 79, 1],
+          outputShape: [23],
+          totalParams: 200,
+          trainableParams: 100,
+          components: [
+            {
+              name: 'transformer',
+              type: '_CausalTransformer',
+              role: 'online',
+              params: 100,
+              trainable_params: 100,
+              layers: [{
+                path: 'blocks.11.attn.q_proj',
+                type: 'Linear',
+                detail: '128→128',
+                params: 10,
+                trainable_params: 10,
+              }],
+            },
+          ],
+        }}
+      />,
+    )
+
+    expect(container.textContent).toContain('[21×79×1]')
+    expect(container.textContent).toContain('[23]')
+    expect(container.textContent).toContain('Всего параметров:')
+    expect(container.textContent).not.toContain('blocks.11.attn.q_proj')
+    expect(container.textContent).not.toContain('Causal Transformer')
+  })
 })

@@ -207,7 +207,8 @@ def _composite_fixed_outputs(
             outputs.update({
                 "reward": [2 * support + 1],
                 "next_token": ["embed_dim"],
-                "uncertainty_rewards": ["uncertainty_members"],
+                "uncertainty_reward_heads": ["uncertainty_members"],
+                "uncertainty_value_heads": ["uncertainty_members"],
             })
         else:
             outputs.update({"reward": [2 * support + 1], "next_token": ["embed_dim"]})

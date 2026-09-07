@@ -11,6 +11,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
+import pytest
 import torch
 
 from rl_core.algorithms.base import TrainingCallback
@@ -219,6 +220,32 @@ class TestGumbelSearchPrimitives:
         schedule = _HalvingSchedule(num_simulations=32, num_top_actions=8)
         assert schedule.next_cutoff % 8 == 0
 
+    def test_halving_schedule_never_eliminates_unvisited_custom_top_actions(self) -> None:
+        schedule = _HalvingSchedule(num_simulations=32, num_top_actions=16)
+        assert schedule.current_top == 16
+        assert schedule.next_cutoff == 16
+        for sim_idx in range(15):
+            assert schedule.maybe_advance(sim_idx) is False
+            assert schedule.current_top == 16
+        assert schedule.maybe_advance(15) is True
+        assert schedule.current_top == 8
+
+    def test_halving_schedule_phases_consume_exact_total_budget(self) -> None:
+        schedule = _HalvingSchedule(num_simulations=32, num_top_actions=16)
+        phase_allocations: dict[int, int] = {}
+        for sim_idx in range(32):
+            top = schedule.current_top
+            phase_allocations[top] = phase_allocations.get(top, 0) + 1
+            schedule.maybe_advance(sim_idx)
+        assert sum(phase_allocations.values()) == 32
+        assert phase_allocations[16] == 16
+        assert all(
+            allocated % top == 0
+            for top, allocated in phase_allocations.items()
+            if top > 1
+        )
+        assert schedule.next_cutoff == 32
+
     def test_select_action_at_root_does_equal_visit_round_robin(self) -> None:
         root = _SearchNode(prior=1.0)
         root.expand(np.array([0.5, 0.3, 0.2]), cache=None, reward_value=0.0)
@@ -395,6 +422,110 @@ class TestStreamingReplayAndTargets:
         # Never-reanalyzed transitions keep the buffer's own sentinel.
         assert np.all(batch["search_value"] <= _ResearchImZeroBuffer._NO_SEARCH_VALUE + 1.0)
         env.close()
+
+    def test_checkpoint_roundtrips_finalized_and_active_replay(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        env = gym.make(_DISCRETE_ENV_ID)
+        params = {**DEFAULT_HYPERPARAMS, **_TINY_DISCRETE}
+        algo = NativeResearchImZero(env, params, seed=0, device="cpu")
+        policy = np.full(algo.n_actions, 1.0 / algo.n_actions, dtype=np.float32)
+        action = np.eye(algo.n_actions, dtype=np.float32)[0]
+        metadata = {
+            "policy_target_valid": True,
+            "search_budget": 4,
+            "model_expansions": 6,
+            "behavior_policy": policy,
+            "audit_type": "targeted",
+            "stage_index": 2,
+            "stage_id": "medium",
+            "nominal_stage_budget": 4,
+            "requested_budget": 4,
+            "predicted_stage_index": 1,
+            "predicted_stage_id": "small",
+            "predicted_requested_budget": 2,
+            "executed_search_expansions": 4,
+            "common_evaluator_expansions": 2,
+            "total_model_calls": 6,
+            "termination_reason": "controller_stop",
+        }
+        algo.buffer.add(
+            np.zeros(4, dtype=np.float32),
+            action,
+            1.5,
+            np.ones(4, dtype=np.float32),
+            policy,
+            True,
+            **metadata,
+        )
+        algo.buffer.add(
+            np.ones(4, dtype=np.float32),
+            action,
+            2.5,
+            np.full(4, 2.0, dtype=np.float32),
+            policy,
+            False,
+            **metadata,
+        )
+        indices = np.asarray([0, -1])
+        timesteps = np.asarray([0, 0])
+        algo.buffer.update_priorities(indices, timesteps, np.asarray([1.7, 1.8]))
+        algo.buffer.update_raw_learning_errors(
+            indices, timesteps, np.asarray([0.4, 0.6]),
+        )
+        algo.buffer.update_reanalyzed_targets(
+            indices,
+            timesteps,
+            np.stack([policy, policy]),
+            np.asarray([3.0, 4.0]),
+            np.asarray([True, True]),
+        )
+        checkpoint = tmp_path / "research-replay.pt"
+        algo.save(checkpoint)
+        loaded = NativeResearchImZero.load(
+            checkpoint, gym.make(_DISCRETE_ENV_ID), device="cpu",
+        )
+
+        assert len(loaded.buffer.episodes) == 1
+        assert len(loaded.buffer._cur[0]["reward"]) == 1
+        assert loaded.buffer._reanalyze_generation == 1
+        assert loaded.buffer._max_priority == 1.8
+        assert loaded.buffer._episode_last_reanalyzed_gen == [1.0]
+        assert loaded.buffer._episode_returns == [1.5]
+        assert loaded.buffer._episode_alpha_sum == pytest.approx([1.7])
+        assert loaded.buffer.raw_learning_errors_for(
+            indices, timesteps,
+        ).tolist() == pytest.approx([0.4, 0.6])
+        assert loaded.buffer.episodes[0]["priority"].tolist() == [1.7]
+        assert loaded.buffer._cur[0]["priority"] == [1.8]
+        assert loaded.buffer.episodes[0]["search_value"].tolist() == [3.0]
+        assert loaded.buffer._cur[0]["search_value"] == [4.0]
+        assert loaded.buffer.episodes[0]["reanalyzed_gen"].tolist() == [1]
+        assert loaded.buffer._cur[0]["reanalyzed_gen"] == [1]
+
+        np.random.seed(5)
+        sample = loaded.buffer.sample(16, 1, 1, loaded.gamma)
+        assert np.all(sample["stage_index"][:, 0] == 2)
+        assert np.all(sample["requested_budget"][:, 0] == 4)
+        assert np.all(sample["executed_search_expansions"][:, 0] == 4)
+        assert np.all(sample["common_evaluator_expansions"][:, 0] == 2)
+        assert np.all(sample["total_model_calls"][:, 0] == 6)
+        assert set(sample["termination_reason"][:, 0]) == {"controller_stop"}
+
+        legacy_payload = torch.load(
+            checkpoint, map_location="cpu", weights_only=False,
+        )
+        legacy_payload.pop("replay_buffer_state")
+        legacy_checkpoint = tmp_path / "research-legacy-empty-replay.pt"
+        torch.save(legacy_payload, legacy_checkpoint)
+        legacy_loaded = NativeResearchImZero.load(
+            legacy_checkpoint, gym.make(_DISCRETE_ENV_ID), device="cpu",
+        )
+        assert len(legacy_loaded.buffer) == 0
+        env.close()
+        loaded.env.close()
+        legacy_loaded.env.close()
 
 
 class TestAdaptiveLossWeights:

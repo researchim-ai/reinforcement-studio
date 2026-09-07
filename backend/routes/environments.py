@@ -614,11 +614,10 @@ ALGORITHM_CATALOG = [
     },
     {
         "id": "latentimzero",
-        "name": "LatentImZero v7 (Research floor)",
+        "name": "LatentImZero v10.1 (optional learned search)",
         "kind": "gym",
-        "description": "Точное ядро ResearchImZero с изолированным опциональным bootstrap-probe. "
-                       "Probe активен по умолчанию, калиброванный бонус плавно включается после warmup "
-                       "и влияет только на reward рёбер Gumbel-поиска.",
+        "description": "ResearchImZero с безопасным learned value-of-computation routing по budget checkpoints. "
+                       "По умолчанию начинает в full-budget shadow; force mode сохраняет точный Research.",
         "hyperparams": [],
     },
     {
@@ -729,7 +728,7 @@ ALGORITHM_CATALOG = [
     },
 ]
 
-# LatentImZero v7 deliberately exposes the complete ResearchImZero surface:
+# LatentImZero v10.1 deliberately exposes the complete ResearchImZero surface:
 # its floor is the same implementation and defaults, with only these isolated
 # experimental controls appended.
 _research_entry = next(item for item in ALGORITHM_CATALOG if item["id"] == "researchimzero")
@@ -756,7 +755,7 @@ _latent_entry["hyperparams"] = [
         "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
     },
     {
-        "key": "uncertainty_members", "label": "Bootstrap reward heads",
+        "key": "uncertainty_members", "label": "Bootstrap reward/value heads",
         "type": "int", "default": 2, "min": 2, "max": 8,
         "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
     },
@@ -796,9 +795,112 @@ _latent_entry["hyperparams"] = [
         "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
     },
     {
-        "key": "uncertainty_sparse_threshold", "label": "Минимальная доля нулевых reward",
-        "type": "float", "default": 0.5, "min": 0.0, "max": 0.9999,
-        "visibleWhen": [{"key": "uncertainty_enabled", "eq": 1}],
+        "key": "adaptive_train_steps", "label": "Adaptive learner cadence",
+        "type": "int", "default": 1, "min": 0, "max": 1,
+    },
+    {
+        "key": "adaptive_train_steps_min", "label": "Минимум updates/iteration",
+        "type": "int", "default": 2, "min": 1, "max": 100,
+    },
+    {
+        "key": "adaptive_train_steps_max", "label": "Максимум updates/iteration",
+        "type": "int", "default": 4, "min": 1, "max": 100,
+    },
+    {
+        "key": "replay_success_fraction", "label": "Доля top-return replay",
+        "type": "float", "default": 0.15, "min": 0.0, "max": 0.5,
+    },
+    {
+        "key": "replay_success_top_quantile", "label": "Top-return quantile",
+        "type": "float", "default": 0.25, "min": 0.01, "max": 1.0,
+    },
+    {
+        "key": "adaptive_closed_loop", "label": "Adaptive closed-loop horizon",
+        "type": "int", "default": 1, "min": 0, "max": 1,
+    },
+    {
+        "key": "adaptive_closed_loop_max_horizon", "label": "Максимальный closed-loop horizon",
+        "type": "int", "default": 5, "min": 3, "max": 30,
+    },
+    {
+        "key": "path_consistency_coef", "label": "Path consistency loss weight",
+        "type": "float", "default": 0.1, "min": 0.0, "max": 5.0,
+    },
+    {
+        "key": "uncertainty_sve_beta", "label": "Return uncertainty SVE beta",
+        "type": "float", "default": 2.0, "min": 0.0, "max": 20.0,
+    },
+    {
+        "key": "uncertainty_extra_simulations_max", "label": "Макс. ambiguity search simulations",
+        "type": "int", "default": 4, "min": 0, "max": 32,
+    },
+    {
+        "key": "learning_progress_priority_weight", "label": "Learning-progress priority weight",
+        "type": "float", "default": 0.1, "min": 0.0, "max": 1.0,
+    },
+    {
+        "key": "voc_enabled", "label": "Value-of-computation controller",
+        "type": "int", "default": 1, "min": 0, "max": 1,
+    },
+    {
+        "key": "voc_threshold", "label": "VoC continue threshold",
+        "type": "float", "default": 0.5, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_compute_cost_per_expansion", "label": "VoC cost per model call",
+        "type": "float", "default": 0.001, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_label_margin", "label": "VoC marginal gain margin",
+        "type": "float", "default": 0.0, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_return_scale", "label": "VoC raw-return scale",
+        "type": "float", "default": 1.0, "min": 1e-6, "max": 1000000.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_label_sample_fraction", "label": "Shadow label sample fraction",
+        "type": "float", "default": 0.25, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_min_labels", "label": "VoC minimum valid labels",
+        "type": "int", "default": 128, "min": 1, "max": 100000,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_min_stop_audits", "label": "VoC minimum STOP audits / edge",
+        "type": "int", "default": 64, "min": 1, "max": 100000,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_min_class_samples", "label": "VoC samples per target class",
+        "type": "int", "default": 64, "min": 1, "max": 100000,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_health_check_steps", "label": "VoC activation health deadline",
+        "type": "int", "default": 100000, "min": 1, "max": 100000000,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_safety_patience", "label": "VoC safety-gate patience",
+        "type": "int", "default": 20, "min": 1, "max": 10000,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_random_audit_fraction", "label": "Uniform full-budget audits",
+        "type": "float", "default": 0.05, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
+    },
+    {
+        "key": "voc_targeted_audit_fraction", "label": "Uncertainty-targeted audits",
+        "type": "float", "default": 0.05, "min": 0.0, "max": 1.0,
+        "visibleWhen": [{"key": "voc_enabled", "eq": 1}],
     },
 ]
 

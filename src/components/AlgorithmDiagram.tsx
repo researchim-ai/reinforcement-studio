@@ -495,7 +495,13 @@ function ArchitectureComponentCard({ component }: { component: ArchitectureCompo
   )
 }
 
-function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null }) {
+function NetworkDiagram({
+  network,
+  compact,
+}: {
+  network?: AlgorithmDiagramNetwork | null
+  compact?: boolean
+}) {
   if (!network) {
     return <p className="text-xs text-muted-foreground">Нет данных о сети</p>
   }
@@ -503,10 +509,20 @@ function NetworkDiagram({ network }: { network?: AlgorithmDiagramNetwork | null 
   const isBoardNet = network.channels != null && network.numBlocks != null
   const shownLayers = network.layers ?? []
   const hasComponents = (network.components?.length ?? 0) > 0
+  const inputShape = network.inputShape ?? (
+    isBoardNet ? [network.inputPlanes ?? 3, network.rows ?? 0, network.cols ?? 0] : undefined
+  )
+  const outputShape = network.outputShape ?? (isBoardNet && network.actionSize != null ? [network.actionSize] : undefined)
 
   return (
     <div>
-      {hasComponents ? (
+      {compact ? (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <ShapeChip label="Вход" shape={inputShape} />
+          <StepArrow />
+          <ShapeChip label="Выход" shape={outputShape} />
+        </div>
+      ) : hasComponents ? (
         <div className="space-y-2">
           <ShapeChip label="Вход среды" shape={network.inputShape} />
           <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
@@ -573,6 +589,10 @@ export interface AlgorithmDiagramProps {
    * for call sites that already have their own, more specific Card title
    * right above (e.g. Designer's InspectPanel says "Нейросеть" already). */
   hideTitles?: boolean
+  /** Designer-side preview: I/O shapes and parameter totals only.
+   * Skips the per-layer / per-component weight dump, which overflows the
+   * floating inspect card for world-model algorithms. */
+  compact?: boolean
   className?: string
 }
 
@@ -584,7 +604,7 @@ export interface AlgorithmDiagramProps {
  *   (`InspectNetwork` in the Designer, `MetricsSnapshot` fields in the
  *   Monitor) so it's honest about whatever architecture a plugin actually
  *   builds, without needing per-plugin special-casing. */
-export function AlgorithmDiagram({ algorithmId, kind, hyperparams, network, show, hideTitles, className }: AlgorithmDiagramProps) {
+export function AlgorithmDiagram({ algorithmId, kind, hyperparams, network, show, hideTitles, compact, className }: AlgorithmDiagramProps) {
   const showLoop = (show?.loop ?? true) && algorithmId != null && kind != null
   const showNetwork = show?.network ?? true
   return (
@@ -596,7 +616,7 @@ export function AlgorithmDiagram({ algorithmId, kind, hyperparams, network, show
       )}
       {showNetwork && (
         <Section title="Архитектура сети" hide={hideTitles}>
-          <NetworkDiagram network={network} />
+          <NetworkDiagram network={network} compact={compact} />
         </Section>
       )}
     </div>

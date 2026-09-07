@@ -46,7 +46,11 @@ def test_incomplete_episodes_remain_missing_not_infinite() -> None:
     assert summary["criterion"]["passed"] is False
 
 
-def test_v7_ablations_are_registered() -> None:
+def test_v10_ablations_are_registered() -> None:
     assert set(ABLATIONS) == {
-        "research_pure", "uncertainty_disabled", "uncertainty_only",
+        "research_pure", "no_adaptive_replay", "no_success_replay",
+        "no_adaptive_horizon", "no_uncertainty", "no_path_consistency",
+        "no_uncertainty_sve", "no_extra_sims", "no_learning_progress",
+        "fixed_max", "shadow_only", "no_common_eval_filter",
+        "full_shadow_labels", "random_audit_only", "no_voc_adaptive_scheduler",
     }

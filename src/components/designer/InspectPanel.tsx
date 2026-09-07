@@ -14,11 +14,11 @@ export interface InspectPanelProps {
 }
 
 /** Live, read-only preview docked over the Designer canvas — shows the
- * effective observation/action space of the env and the resulting network's
- * input/output dims, layer summary and parameter count, recomputed on the
- * backend (without training) whenever the env/wrappers/algorithm/hyperparams
- * change. Lets you track "сколько входов/выходов у сети и у среды" while
- * still designing. */
+ * effective observation/action space of the env and a compact network
+ * summary (I/O dims + parameter totals), recomputed on the backend
+ * (without training) whenever the env/wrappers/algorithm/hyperparams
+ * change. The per-layer weight dump stays on the Training Monitor /
+ * Network Builder; it overflows this floating card. */
 /** Memoized so dragging a node — which re-renders the whole Designer page
  * on every pointer-move frame to update that node's position — doesn't also
  * re-render (and repaint the `backdrop-blur`/shadow on) this floating panel
@@ -112,6 +112,7 @@ export const InspectPanel = memo(function InspectPanel({ data, isFetching, scene
             <AlgorithmDiagram
               show={{ loop: false, network: true }}
               hideTitles
+              compact
               network={{
                 policy: net.policy,
                 layers: net.layers,

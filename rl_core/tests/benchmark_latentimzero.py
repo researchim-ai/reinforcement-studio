@@ -1,4 +1,4 @@
-"""Repeatable ResearchImZero-floor benchmark for LatentImZero v7.
+"""Repeatable ResearchImZero-floor and model-call benchmark for LatentImZero v10.1.
 
 This is intentionally not collected by pytest.  It runs equal env-step
 budgets and seeds for all algorithms and writes both learning curves and a
@@ -7,7 +7,7 @@ go/no-go summary:
     python -m rl_core.tests.benchmark_latentimzero --tier smoke
     python -m rl_core.tests.benchmark_latentimzero --tier tier0 --steps 100000
 
-The default panel compares the exact Research core against v7. Optional
+The default panel compares the exact Research core against v10.1. Optional
 dependencies are reported as skipped environments, never silently replaced;
 no improvement is inferred without measured runs.
 """
@@ -56,9 +56,33 @@ DEFAULT_THRESHOLDS = {
     "MountainCar-v0": -110.0,
 }
 ABLATIONS = {
-    "research_pure": {"force_research_mode": 1, "uncertainty_enabled": 0},
-    "uncertainty_disabled": {"force_research_mode": 0, "uncertainty_enabled": 0},
-    "uncertainty_only": {"force_research_mode": 0, "uncertainty_enabled": 1},
+    "research_pure": {
+        "force_research_mode": 1, "uncertainty_enabled": 0,
+        "adaptive_train_steps": 0, "replay_success_fraction": 0.0,
+        "adaptive_closed_loop": 0, "path_consistency_coef": 0.0,
+        "uncertainty_sve_beta": 0.0, "uncertainty_extra_simulations_max": 0,
+        "learning_progress_priority_weight": 0.0,
+    },
+    "no_adaptive_replay": {"adaptive_train_steps": 0},
+    "no_success_replay": {"replay_success_fraction": 0.0},
+    "no_adaptive_horizon": {"adaptive_closed_loop": 0},
+    "no_uncertainty": {"uncertainty_enabled": 0},
+    "no_path_consistency": {"path_consistency_coef": 0.0},
+    "no_uncertainty_sve": {"uncertainty_sve_beta": 0.0},
+    "no_extra_sims": {"uncertainty_extra_simulations_max": 0},
+    "no_learning_progress": {"learning_progress_priority_weight": 0.0},
+    "fixed_max": {
+        "voc_enabled": 1,
+        "voc_safety_patience": 1_000_000_000,
+        "voc_label_sample_fraction": 0.0,
+        "voc_random_audit_fraction": 0.0,
+        "voc_targeted_audit_fraction": 0.0,
+    },
+    "shadow_only": {"voc_safety_patience": 1_000_000_000},
+    "no_common_eval_filter": {"voc_uncertainty_filter": 1.0},
+    "full_shadow_labels": {"voc_label_sample_fraction": 1.0},
+    "random_audit_only": {"voc_targeted_audit_fraction": 0.0},
+    "no_voc_adaptive_scheduler": {"voc_enabled": 0},
 }
 
 
@@ -67,6 +91,9 @@ class Curve:
     steps: list[int] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
     lengths: list[int] = field(default_factory=list)
+    model_calls: list[float] = field(default_factory=list)
+    search_budgets: list[float] = field(default_factory=list)
+    health_statuses: list[float] = field(default_factory=list)
 
     def callback(
         self,
@@ -75,7 +102,17 @@ class Curve:
         length: int | None = None,
         metrics: dict[str, float] | None = None,
     ) -> bool:
-        del metrics
+        if metrics:
+            if "total_model_calls_mean" in metrics:
+                self.model_calls.append(float(metrics["total_model_calls_mean"]))
+            elif "model_expansions_mean" in metrics:
+                self.model_calls.append(float(metrics["model_expansions_mean"]))
+            if "requested_budget_mean" in metrics:
+                self.search_budgets.append(float(metrics["requested_budget_mean"]))
+            elif "search_budget_mean" in metrics:
+                self.search_budgets.append(float(metrics["search_budget_mean"]))
+            if "voc_health_status" in metrics:
+                self.health_statuses.append(float(metrics["voc_health_status"]))
         if reward is not None:
             self.steps.append(int(step))
             self.rewards.append(float(reward))
@@ -132,6 +169,15 @@ def run_one(
         "mean_episode_length": float(np.mean(curve.lengths)) if curve.lengths else None,
         "wall_seconds": time.perf_counter() - started,
         "curve": {"steps": curve.steps, "rewards": curve.rewards, "lengths": curve.lengths},
+        "mean_model_calls_per_action": (
+            float(np.mean(curve.model_calls)) if curve.model_calls else None
+        ),
+        "mean_search_budget": (
+            float(np.mean(curve.search_budgets)) if curve.search_budgets else None
+        ),
+        "final_voc_health_status": (
+            curve.health_statuses[-1] if curve.health_statuses else None
+        ),
     }
 
 
@@ -155,6 +201,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
                     "median_wall_seconds": float(np.median([row["wall_seconds"] for row in selected])),
                     "threshold_successes": sum(row["steps_to_threshold"] is not None for row in selected),
                     "seeds": len(selected),
+                    "median_model_calls_per_action": (
+                        float(np.median([
+                            row.get("mean_model_calls_per_action")
+                            for row in selected
+                            if row.get("mean_model_calls_per_action") is not None
+                        ]))
+                        if any(row.get("mean_model_calls_per_action") is not None for row in selected)
+                        else None
+                    ),
                 }
         summary["environments"][env_id] = per_algorithm
 

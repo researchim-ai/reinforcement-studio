@@ -94,7 +94,8 @@ def test_latentimzero_preview_exposes_research_core_and_probe_outputs() -> None:
     assert result["fixed_outputs"]["value"] == [21]
     assert result["fixed_outputs"]["reward"] == [21]
     assert result["fixed_outputs"]["next_token"] == ["embed_dim"]
-    assert result["fixed_outputs"]["uncertainty_rewards"] == ["uncertainty_members"]
+    assert result["fixed_outputs"]["uncertainty_reward_heads"] == ["uncertainty_members"]
+    assert result["fixed_outputs"]["uncertainty_value_heads"] == ["uncertainty_members"]
 
 
 def test_old_run_without_snapshots_gets_materialized_composite_spec(tmp_path: Path, monkeypatch) -> None:

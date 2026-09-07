@@ -252,6 +252,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -359,6 +360,7 @@ DEFAULT_HYPERPARAMS = {
     # good NetHack runs, between `efficientzero.py`'s policy-level `5.0`
     # and this file's UniZero-parent's reference-matching `10.0`).
     "consistency_loss_coef": 2.0,
+    "path_consistency_coef": 0.0,
     # Autoregressive training in the exact predicted-latent mode used by
     # MCTS. Kept on a subset/horizon budget so it adds signal without
     # multiplying full teacher-forced training cost.
@@ -407,6 +409,9 @@ DEFAULT_HYPERPARAMS = {
     "continuous_prior_scale": 2.5,
     "train_freq": 1,
     "train_steps_per_iter": 2,
+    "adaptive_train_steps": 0,
+    "adaptive_train_steps_min": 2,
+    "adaptive_train_steps_max": 4,
     # Opt-in extra learner pressure for large vector envs. Off by default:
     # `learn()` already notices boundaries crossed by the aggregate
     # timestep counter, and the historical fast/successful native runs
@@ -441,9 +446,20 @@ DEFAULT_HYPERPARAMS = {
     # `|value_pred - value_target|` term - `0.0` recovers the old,
     # value-error-only priority exactly.
     "priority_policy_weight": 0.1,
+    "learning_progress_priority_weight": 0.0,
+    "learning_progress_priority_cap": 1.0,
     "min_priority": 1e-6,
     "replay_recent_fraction": 0.5,
     "replay_recent_window": 512,
+    "replay_success_fraction": 0.0,
+    "replay_success_top_quantile": 0.25,
+    "adaptive_closed_loop": 0,
+    "adaptive_closed_loop_max_horizon": 5,
+    "adaptive_closed_loop_error_threshold": 0.08,
+    "adaptive_closed_loop_min_grad_steps": 500,
+    "adaptive_closed_loop_stable_steps": 50,
+    "adaptive_closed_loop_ema_decay": 0.99,
+    "episode_reward_rolling_window": 20,
     "reanalyze_freq": 200,
     "reanalyze_batch_size": 64,
     # `1` (default): a context-aware slow-moving EMA/Polyak copy provides
@@ -1347,26 +1363,31 @@ def _backpropagate(path: list[_SearchNode], leaf_value: float, minmax: _MinMaxSt
 
 
 class _HalvingSchedule:
-    """Ports the reference `ready_for_next_gumble_phase`'s visit-budget
-    schedule verbatim: phase 0 gets `floor(n / (log2(m) * m)) * m`
-    simulations (always a multiple of `m = num_top_actions`, so the root's
-    equal-visit round robin exhausts exactly the top-`m` Gumbel-Top-k
-    candidates without ever spilling into a lower-ranked one - see
-    `_sequential_halving`'s docstring), then each subsequent phase gets
-    `floor(n / (log2(m) * current_m)) * current_m` more (or whatever's
-    left, once `current_m <= 2`), halving `current_m` every time, until
-    the budget of `n = num_simulations` simulations runs out."""
+    """Allocate complete equal-visit rounds before every halving.
+
+    The reference floor formula is retained whenever it allocates at least
+    one round.  Its zero-round corner case (for example ``n=32,m=16``)
+    previously collapsed to one simulation and eliminated fifteen
+    candidates before they were visited.  Here every non-final phase gets
+    at least ``current_top`` simulations, while ``m`` is capped at half the
+    total budget whenever that is feasible.  The final phase consumes the
+    exact remainder, so the total remains exactly ``n``.
+    """
 
     def __init__(self, num_simulations: int, num_top_actions: int) -> None:
         self.n = max(1, num_simulations)
-        self.m = max(2, num_top_actions)
+        maximum_top = max(2, self.n // 2)
+        self.m = max(2, min(num_top_actions, maximum_top))
         self.current_top = self.m
         self.next_cutoff = self._span(self.current_top, used=0)
 
     def _span(self, current_top: int, used: int) -> int:
         log2m = max(math.log2(self.m), 1e-9)
         if current_top > 2:
-            span = math.floor(self.n / (log2m * current_top)) * current_top
+            reference_span = (
+                math.floor(self.n / (log2m * current_top)) * current_top
+            )
+            span = max(current_top, reference_span)
         else:
             span = self.n - used
         return min(self.n, max(1, int(span)))
@@ -1390,11 +1411,13 @@ class _HalvingSchedule:
 # ----------------------------------------------------------------------
 class _ResearchImZeroBuffer:
     _NO_SEARCH_VALUE = -1e9
+    _STATE_SCHEMA_VERSION = 1
 
     def __init__(
         self, capacity_episodes: int, obs_shape: tuple[int, ...], action_dim: int, policy_target_dim: int,
         context_length: int, num_lanes: int = 1, priority_alpha: float = 1.0, priority_beta: float = 1.0,
         min_priority: float = 1e-6, recent_fraction: float = 0.5, recent_window: int = 512,
+        success_fraction: float = 0.0, success_top_quantile: float = 0.25,
     ) -> None:
         self.capacity = max(1, capacity_episodes)
         self.obs_shape = obs_shape
@@ -1406,8 +1429,13 @@ class _ResearchImZeroBuffer:
         self.min_priority = max(1e-8, min_priority)
         self.recent_fraction = min(1.0, max(0.0, recent_fraction))
         self.recent_window = max(1, recent_window)
+        self.success_fraction = min(1.0, max(0.0, success_fraction))
+        if self.recent_fraction + self.success_fraction > 1.0 + 1e-12:
+            raise ValueError("replay_recent_fraction + replay_success_fraction must be <= 1")
+        self.success_top_quantile = min(1.0, max(1e-6, success_top_quantile))
         self.episodes: list[dict[str, np.ndarray]] = []
         self._episode_alpha_sum: list[float] = []
+        self._episode_returns: list[float] = []
         # `sample_for_reanalyze`'s own bookkeeping (module docstring's
         # "Schedules, not fixed constants" section) - `_reanalyze_
         # generation` is a plain call counter (one "generation" per
@@ -1427,8 +1455,168 @@ class _ResearchImZeroBuffer:
     def _new_episode() -> dict[str, list[Any]]:
         return {
             "obs": [], "action": [], "reward": [], "next_obs": [], "policy_target": [],
-            "priority": [], "search_value": [], "reanalyzed_gen": [],
+            "priority": [], "raw_learning_error": [], "search_value": [], "reanalyzed_gen": [],
+            "policy_target_valid": [], "search_budget": [], "model_expansions": [],
+            "behavior_policy": [], "audit_type": [],
+            "stage_index": [], "stage_id": [], "nominal_stage_budget": [],
+            "requested_budget": [], "predicted_stage_index": [],
+            "predicted_stage_id": [], "predicted_requested_budget": [],
+            "executed_search_expansions": [], "common_evaluator_expansions": [],
+            "total_model_calls": [], "termination_reason": [],
         }
+
+    def _packed_active(
+        self,
+        active: dict[str, list[Any]],
+    ) -> dict[str, np.ndarray]:
+        n = len(active["reward"])
+        array_shapes = {
+            "obs": self.obs_shape,
+            "action": (self.action_dim,),
+            "next_obs": self.obs_shape,
+            "policy_target": (self.policy_target_dim,),
+            "behavior_policy": (self.policy_target_dim,),
+        }
+        packed: dict[str, np.ndarray] = {}
+        for key in self._new_episode():
+            values = active[key]
+            if key in array_shapes:
+                packed[key] = (
+                    np.stack(values).astype(np.float32, copy=True)
+                    if n
+                    else np.empty((0, *array_shapes[key]), dtype=np.float32)
+                )
+            else:
+                packed[key] = np.asarray(values).copy()
+        return packed
+
+    def _validated_store_copy(
+        self,
+        store: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        required = set(self._new_episode())
+        if not isinstance(store, dict) or not required.issubset(store):
+            missing = sorted(required.difference(store if isinstance(store, dict) else {}))
+            raise ValueError(f"Invalid ResearchImZero replay store; missing fields: {missing}")
+        copied = {
+            key: np.asarray(store[key]).copy()
+            for key in required
+        }
+        n = len(copied["reward"])
+        for key, value in copied.items():
+            if value.ndim == 0 or value.shape[0] != n:
+                raise ValueError(
+                    f"Invalid ResearchImZero replay field {key!r}: expected length {n}",
+                )
+        expected_shapes = {
+            "obs": (n, *self.obs_shape),
+            "next_obs": (n, *self.obs_shape),
+            "action": (n, self.action_dim),
+            "policy_target": (n, self.policy_target_dim),
+            "behavior_policy": (n, self.policy_target_dim),
+        }
+        for key, shape in expected_shapes.items():
+            if copied[key].shape != shape:
+                raise ValueError(
+                    f"ResearchImZero replay {key!r} shape {copied[key].shape} "
+                    f"does not match {shape}",
+                )
+        return copied
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return an explicit CPU/numpy replay snapshot.
+
+        Checkpoints intentionally include both finalized episodes and live
+        lanes: dropping live lanes loses the newest transitions and their
+        reanalysis/PER state on every resume.
+        """
+        return {
+            "schema_version": self._STATE_SCHEMA_VERSION,
+            "obs_shape": tuple(self.obs_shape),
+            "action_dim": self.action_dim,
+            "policy_target_dim": self.policy_target_dim,
+            "num_lanes": len(self._cur),
+            "episodes": [
+                {key: np.asarray(value).copy() for key, value in episode.items()}
+                for episode in self.episodes
+            ],
+            "active_lanes": [self._packed_active(active) for active in self._cur],
+            "episode_alpha_sum": np.asarray(
+                self._episode_alpha_sum, dtype=np.float64,
+            ),
+            "episode_returns": np.asarray(
+                self._episode_returns, dtype=np.float64,
+            ),
+            "episode_last_reanalyzed_gen": np.asarray(
+                self._episode_last_reanalyzed_gen, dtype=np.float64,
+            ),
+            "reanalyze_generation": int(self._reanalyze_generation),
+            "max_priority": float(self._max_priority),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict) or state.get("schema_version") != self._STATE_SCHEMA_VERSION:
+            raise ValueError("Unsupported ResearchImZero replay checkpoint schema")
+        if (
+            tuple(state.get("obs_shape", ())) != tuple(self.obs_shape)
+            or int(state.get("action_dim", -1)) != self.action_dim
+            or int(state.get("policy_target_dim", -1)) != self.policy_target_dim
+        ):
+            raise ValueError("ResearchImZero replay dimensions do not match the environment")
+        active_lanes = state.get("active_lanes", [])
+        if int(state.get("num_lanes", -1)) != len(active_lanes):
+            raise ValueError("ResearchImZero replay lane bookkeeping is inconsistent")
+
+        saved_episodes = [
+            self._validated_store_copy(episode)
+            for episode in state.get("episodes", [])
+        ]
+        saved_last = np.asarray(
+            state.get("episode_last_reanalyzed_gen", []),
+            dtype=np.float64,
+        )
+        if len(saved_last) != len(saved_episodes):
+            raise ValueError("ResearchImZero replay reanalysis bookkeeping is inconsistent")
+        keep_from = max(0, len(saved_episodes) - self.capacity)
+        self.episodes = saved_episodes[keep_from:]
+        self._episode_last_reanalyzed_gen = saved_last[keep_from:].tolist()
+        # Alpha sums and success returns are derived from the validated
+        # transition arrays; recomputing prevents stale/corrupt sampling mass.
+        self._episode_alpha_sum = [
+            float(np.sum(episode["priority"].astype(np.float64) ** self.priority_alpha))
+            for episode in self.episodes
+        ]
+        self._episode_returns = [
+            float(episode["reward"].astype(np.float64).sum())
+            for episode in self.episodes
+        ]
+
+        # A checkpoint may be inspected/resumed with fewer vector lanes.
+        # Lane identity cannot be merged safely, so restore the matching
+        # prefix and drop surplus live lanes rather than overflowing or
+        # pretending their unfinished tails were terminal episodes.
+        restored_active = [
+            self._validated_store_copy(active)
+            for active in active_lanes[: len(self._cur)]
+        ]
+        self._cur = [self._new_episode() for _ in self._cur]
+        array_fields = {
+            "obs", "action", "next_obs", "policy_target", "behavior_policy",
+        }
+        for lane, packed in enumerate(restored_active):
+            for key, values in packed.items():
+                self._cur[lane][key] = (
+                    [row.copy() for row in values]
+                    if key in array_fields
+                    else values.tolist()
+                )
+        self._reanalyze_generation = max(
+            0, int(state.get("reanalyze_generation", 0)),
+        )
+        saved_max_priority = float(state.get("max_priority", 1.0))
+        if not np.isfinite(saved_max_priority):
+            raise ValueError("ResearchImZero replay max priority must be finite")
+        self._max_priority = max(self.min_priority, saved_max_priority)
 
     def _pad_one(self, obs_hist: list[np.ndarray], action_hist: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Right-pads (valid transitions packed at the *front*, in
@@ -1460,6 +1648,18 @@ class _ResearchImZeroBuffer:
     def add(
         self, obs: np.ndarray, action_flat: np.ndarray, reward: float, next_obs: np.ndarray,
         policy_target: np.ndarray, done: bool, lane: int = 0,
+        policy_target_valid: bool = True, search_budget: int = 0,
+        model_expansions: int = 0, behavior_policy: np.ndarray | None = None,
+        audit_type: str = "none",
+        stage_index: int = -1, stage_id: str = "none",
+        nominal_stage_budget: int | None = None,
+        requested_budget: int | None = None,
+        predicted_stage_index: int = -1, predicted_stage_id: str = "none",
+        predicted_requested_budget: int | None = None,
+        executed_search_expansions: int | None = None,
+        common_evaluator_expansions: int = 0,
+        total_model_calls: int | None = None,
+        termination_reason: str = "budget_exhausted",
     ) -> None:
         cur = self._cur[lane]
         cur["obs"].append(np.asarray(obs, dtype=np.float32))
@@ -1468,8 +1668,39 @@ class _ResearchImZeroBuffer:
         cur["next_obs"].append(np.asarray(next_obs, dtype=np.float32))
         cur["policy_target"].append(np.asarray(policy_target, dtype=np.float32))
         cur["priority"].append(self._max_priority)
+        cur["raw_learning_error"].append(float("nan"))
         cur["search_value"].append(self._NO_SEARCH_VALUE)
         cur["reanalyzed_gen"].append(-1)
+        cur["policy_target_valid"].append(bool(policy_target_valid))
+        cur["search_budget"].append(int(search_budget))
+        cur["model_expansions"].append(int(model_expansions))
+        cur["behavior_policy"].append(
+            np.asarray(
+                policy_target if behavior_policy is None else behavior_policy,
+                dtype=np.float32,
+            )
+        )
+        cur["audit_type"].append(str(audit_type))
+        requested = search_budget if requested_budget is None else requested_budget
+        cur["stage_index"].append(int(stage_index))
+        cur["stage_id"].append(str(stage_id))
+        cur["nominal_stage_budget"].append(
+            int(requested if nominal_stage_budget is None else nominal_stage_budget)
+        )
+        cur["requested_budget"].append(int(requested))
+        cur["predicted_stage_index"].append(int(predicted_stage_index))
+        cur["predicted_stage_id"].append(str(predicted_stage_id))
+        cur["predicted_requested_budget"].append(
+            int(requested if predicted_requested_budget is None else predicted_requested_budget)
+        )
+        cur["executed_search_expansions"].append(
+            int(model_expansions if executed_search_expansions is None else executed_search_expansions)
+        )
+        cur["common_evaluator_expansions"].append(int(common_evaluator_expansions))
+        cur["total_model_calls"].append(
+            int(model_expansions if total_model_calls is None else total_model_calls)
+        )
+        cur["termination_reason"].append(str(termination_reason))
         if done:
             self._flush_episode(lane)
 
@@ -1485,18 +1716,37 @@ class _ResearchImZeroBuffer:
             "next_obs": np.stack(cur["next_obs"]),
             "policy_target": np.stack(cur["policy_target"]),
             "priority": np.asarray(cur["priority"], dtype=np.float64),
+            "raw_learning_error": np.asarray(cur["raw_learning_error"], dtype=np.float64),
             "search_value": np.asarray(cur["search_value"], dtype=np.float32),
             # `-1`: never reanalyzed - `sample_for_reanalyze`'s own
             # per-transition staleness tracking (see `__init__`'s own
             # comment on `_episode_last_reanalyzed_gen`).
             "reanalyzed_gen": np.asarray(cur["reanalyzed_gen"], dtype=np.int64),
+            "policy_target_valid": np.asarray(cur["policy_target_valid"], dtype=bool),
+            "search_budget": np.asarray(cur["search_budget"], dtype=np.int64),
+            "model_expansions": np.asarray(cur["model_expansions"], dtype=np.int64),
+            "behavior_policy": np.stack(cur["behavior_policy"]),
+            "audit_type": np.asarray(cur["audit_type"], dtype=object),
+            "stage_index": np.asarray(cur["stage_index"], dtype=np.int64),
+            "stage_id": np.asarray(cur["stage_id"], dtype=object),
+            "nominal_stage_budget": np.asarray(cur["nominal_stage_budget"], dtype=np.int64),
+            "requested_budget": np.asarray(cur["requested_budget"], dtype=np.int64),
+            "predicted_stage_index": np.asarray(cur["predicted_stage_index"], dtype=np.int64),
+            "predicted_stage_id": np.asarray(cur["predicted_stage_id"], dtype=object),
+            "predicted_requested_budget": np.asarray(cur["predicted_requested_budget"], dtype=np.int64),
+            "executed_search_expansions": np.asarray(cur["executed_search_expansions"], dtype=np.int64),
+            "common_evaluator_expansions": np.asarray(cur["common_evaluator_expansions"], dtype=np.int64),
+            "total_model_calls": np.asarray(cur["total_model_calls"], dtype=np.int64),
+            "termination_reason": np.asarray(cur["termination_reason"], dtype=object),
         }
         self.episodes.append(episode)
         self._episode_alpha_sum.append(float(np.sum(episode["priority"] ** self.priority_alpha)))
+        self._episode_returns.append(float(episode["reward"].sum()))
         self._episode_last_reanalyzed_gen.append(-1.0)
         if len(self.episodes) > self.capacity:
             self.episodes.pop(0)
             self._episode_alpha_sum.pop(0)
+            self._episode_returns.pop(0)
             self._episode_last_reanalyzed_gen.pop(0)
         self._cur[lane] = self._new_episode()
 
@@ -1545,6 +1795,27 @@ class _ResearchImZeroBuffer:
         reward = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         next_obs = np.zeros((batch_size, unroll_steps, *self.obs_shape), dtype=np.float32)
         policy_target = np.zeros((batch_size, unroll_steps, self.policy_target_dim), dtype=np.float32)
+        policy_target_valid = np.ones((batch_size, unroll_steps), dtype=np.float32)
+        search_budget = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        model_expansions = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        behavior_policy = np.zeros(
+            (batch_size, unroll_steps, self.policy_target_dim),
+            dtype=np.float32,
+        )
+        audit_type = np.full((batch_size, unroll_steps), "none", dtype=object)
+        stage_index = np.full((batch_size, unroll_steps), -1, dtype=np.int64)
+        stage_id = np.full((batch_size, unroll_steps), "none", dtype=object)
+        nominal_stage_budget = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        requested_budget = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        predicted_stage_index = np.full((batch_size, unroll_steps), -1, dtype=np.int64)
+        predicted_stage_id = np.full((batch_size, unroll_steps), "none", dtype=object)
+        predicted_requested_budget = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        executed_search_expansions = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        common_evaluator_expansions = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        total_model_calls = np.zeros((batch_size, unroll_steps), dtype=np.int64)
+        termination_reason = np.full(
+            (batch_size, unroll_steps), "budget_exhausted", dtype=object,
+        )
         mask = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_reward = np.zeros((batch_size, unroll_steps), dtype=np.float32)
         td_obs = np.zeros((batch_size, unroll_steps, *self.obs_shape), dtype=np.float32)
@@ -1568,6 +1839,7 @@ class _ResearchImZeroBuffer:
         sample_prob = np.zeros(batch_size, dtype=np.float64)
         sampled_active = np.zeros(batch_size, dtype=bool)
         sampled_recent = np.zeros(batch_size, dtype=bool)
+        sampled_success = np.zeros(batch_size, dtype=bool)
 
         # Every source, including active lanes, owns durable per-transition
         # priorities. Sampling is an exact mixture of global PER and a
@@ -1596,10 +1868,34 @@ class _ResearchImZeroBuffer:
             else np.full(len(sources), 1.0 / len(sources))
         )
         effective_recent_fraction = self.recent_fraction if total_recent > 0 else 0.0
+        success_episode_indices: list[int] = []
+        total_success_transitions = 0
+        if self.success_fraction > 0.0 and self.episodes:
+            cutoff = float(
+                np.quantile(
+                    np.asarray(self._episode_returns, dtype=np.float64),
+                    1.0 - self.success_top_quantile,
+                ),
+            )
+            success_episode_indices = [
+                index for index, value in enumerate(self._episode_returns) if value >= cutoff
+            ]
+            total_success_transitions = sum(
+                len(self.episodes[index]["reward"]) for index in success_episode_indices
+            )
+        effective_success_fraction = (
+            self.success_fraction if total_success_transitions > 0 else 0.0
+        )
+        per_fraction = 1.0 - effective_recent_fraction - effective_success_fraction
         n_total_transitions = max(1, self.num_replay_transitions)
 
         for b in range(batch_size):
-            choose_recent = np.random.random() < effective_recent_fraction
+            mixture_draw = np.random.random()
+            choose_recent = mixture_draw < effective_recent_fraction
+            choose_success = (
+                not choose_recent
+                and mixture_draw < effective_recent_fraction + effective_success_fraction
+            )
             if choose_recent:
                 recent_offset = int(np.random.randint(total_recent))
                 source_i = -1
@@ -1615,17 +1911,31 @@ class _ResearchImZeroBuffer:
                     recent_offset -= recent_len
                 if source_i < 0:
                     raise RuntimeError("Recent replay source accounting became inconsistent")
+            elif choose_success:
+                success_offset = int(np.random.randint(total_success_transitions))
+                source_index = -1
+                for candidate_index in success_episode_indices:
+                    candidate_len = len(self.episodes[candidate_index]["reward"])
+                    if success_offset < candidate_len:
+                        source_index = candidate_index
+                        start = success_offset
+                        break
+                    success_offset -= candidate_len
+                if source_index < 0:
+                    raise RuntimeError("Success replay source accounting became inconsistent")
+                source_i = source_index
             else:
                 source_i = int(np.random.choice(len(sources), p=source_probs))
             is_active, source_index = sources[source_i]
             sampled_active[b] = is_active
             sampled_recent[b] = choose_recent
+            sampled_success[b] = choose_success
             ep = self._cur[source_index] if is_active else self.episodes[source_index]
             t_len = len(ep["reward"])
             priority = np.asarray(ep["priority"], dtype=np.float64)
             local_weight = priority ** self.priority_alpha
             local_sum = float(local_weight.sum())
-            if not choose_recent:
+            if not choose_recent and not choose_success:
                 if local_sum > 0:
                     local_probs = local_weight / local_sum
                     start = int(np.random.choice(t_len, p=local_probs))
@@ -1642,9 +1952,15 @@ class _ResearchImZeroBuffer:
                 recent_start, recent_end = recent_ranges[source_index]
                 if recent_start <= start < recent_end:
                     recent_probability = 1.0 / total_recent
+            success_probability = (
+                1.0 / total_success_transitions
+                if not is_active and source_index in success_episode_indices
+                else 0.0
+            )
             sample_prob[b] = max(
-                (1.0 - effective_recent_fraction) * per_probability
-                + effective_recent_fraction * recent_probability,
+                per_fraction * per_probability
+                + effective_recent_fraction * recent_probability
+                + effective_success_fraction * success_probability,
                 1e-12,
             )
 
@@ -1666,6 +1982,41 @@ class _ResearchImZeroBuffer:
                 reward[b, k] = ep["reward"][idx]
                 next_obs[b, k] = ep["next_obs"][idx]
                 policy_target[b, k] = ep["policy_target"][idx]
+                if "policy_target_valid" in ep:
+                    policy_target_valid[b, k] = float(ep["policy_target_valid"][idx])
+                if "search_budget" in ep:
+                    search_budget[b, k] = int(ep["search_budget"][idx])
+                if "model_expansions" in ep:
+                    model_expansions[b, k] = int(ep["model_expansions"][idx])
+                if "behavior_policy" in ep:
+                    behavior_policy[b, k] = ep["behavior_policy"][idx]
+                else:
+                    behavior_policy[b, k] = ep["policy_target"][idx]
+                if "audit_type" in ep:
+                    audit_type[b, k] = str(ep["audit_type"][idx])
+                requested_budget[b, k] = search_budget[b, k]
+                nominal_stage_budget[b, k] = search_budget[b, k]
+                predicted_requested_budget[b, k] = search_budget[b, k]
+                executed_search_expansions[b, k] = model_expansions[b, k]
+                total_model_calls[b, k] = model_expansions[b, k]
+                if "stage_index" in ep:
+                    stage_index[b, k] = int(ep["stage_index"][idx])
+                    stage_id[b, k] = str(ep["stage_id"][idx])
+                    nominal_stage_budget[b, k] = int(ep["nominal_stage_budget"][idx])
+                    requested_budget[b, k] = int(ep["requested_budget"][idx])
+                    predicted_stage_index[b, k] = int(ep["predicted_stage_index"][idx])
+                    predicted_stage_id[b, k] = str(ep["predicted_stage_id"][idx])
+                    predicted_requested_budget[b, k] = int(
+                        ep["predicted_requested_budget"][idx]
+                    )
+                    executed_search_expansions[b, k] = int(
+                        ep["executed_search_expansions"][idx]
+                    )
+                    common_evaluator_expansions[b, k] = int(
+                        ep["common_evaluator_expansions"][idx]
+                    )
+                    total_model_calls[b, k] = int(ep["total_model_calls"][idx])
+                    termination_reason[b, k] = str(ep["termination_reason"][idx])
                 search_value[b, k] = ep["search_value"][idx]
                 search_value_gen[b, k] = ep["reanalyzed_gen"][idx]
 
@@ -1689,7 +2040,20 @@ class _ResearchImZeroBuffer:
         return {
             "context_obs": ctx_obs, "context_action": ctx_action, "context_valid": ctx_valid,
             "obs0": obs0, "action": action, "reward": reward, "next_obs": next_obs,
-            "policy_target": policy_target, "mask": mask, "td_reward": td_reward,
+            "policy_target": policy_target, "policy_target_valid": policy_target_valid,
+            "search_budget": search_budget, "model_expansions": model_expansions,
+            "behavior_policy": behavior_policy, "audit_type": audit_type,
+            "stage_index": stage_index, "stage_id": stage_id,
+            "nominal_stage_budget": nominal_stage_budget,
+            "requested_budget": requested_budget,
+            "predicted_stage_index": predicted_stage_index,
+            "predicted_stage_id": predicted_stage_id,
+            "predicted_requested_budget": predicted_requested_budget,
+            "executed_search_expansions": executed_search_expansions,
+            "common_evaluator_expansions": common_evaluator_expansions,
+            "total_model_calls": total_model_calls,
+            "termination_reason": termination_reason,
+            "mask": mask, "td_reward": td_reward,
             "td_obs": td_obs,
             "bootstrap_action": bootstrap_action,
             "bootstrap_next_obs": bootstrap_next_obs,
@@ -1701,6 +2065,8 @@ class _ResearchImZeroBuffer:
             "is_weight": is_weight.astype(np.float32),
             "active_sample_fraction": np.asarray(sampled_active.mean(), dtype=np.float32),
             "recent_sample_fraction": np.asarray(sampled_recent.mean(), dtype=np.float32),
+            "success_sample_fraction": np.asarray(sampled_success.mean(), dtype=np.float32),
+            "success_pool_size": np.asarray(len(success_episode_indices), dtype=np.float32),
         }
 
     def update_priorities(self, episode_idx: np.ndarray, timestep: np.ndarray, values: np.ndarray) -> None:
@@ -1720,6 +2086,48 @@ class _ResearchImZeroBuffer:
         for ep_i in touched:
             ep = self.episodes[ep_i]
             self._episode_alpha_sum[ep_i] = float(np.sum(ep["priority"] ** self.priority_alpha))
+
+    def raw_learning_errors_for(
+        self, episode_idx: np.ndarray, timestep: np.ndarray,
+    ) -> np.ndarray:
+        values = np.full(len(episode_idx), np.nan, dtype=np.float64)
+        for i, (ep_i, t) in enumerate(zip(episode_idx.tolist(), timestep.tolist())):
+            if ep_i < 0:
+                lane = -ep_i - 1
+                if 0 <= lane < len(self._cur):
+                    raw = self._cur[lane].get("raw_learning_error", [])
+                    if t < len(raw):
+                        values[i] = float(raw[t])
+            elif ep_i < len(self.episodes):
+                raw = self.episodes[ep_i].get("raw_learning_error")
+                if raw is not None and t < len(raw):
+                    values[i] = float(raw[t])
+        return values
+
+    def update_raw_learning_errors(
+        self,
+        episode_idx: np.ndarray,
+        timestep: np.ndarray,
+        values: np.ndarray,
+    ) -> None:
+        for ep_i, t, value in zip(
+            episode_idx.tolist(), timestep.tolist(), np.asarray(values).tolist(),
+        ):
+            if ep_i < 0:
+                lane = -ep_i - 1
+                if 0 <= lane < len(self._cur) and t < len(self._cur[lane]["reward"]):
+                    raw = self._cur[lane].setdefault(
+                        "raw_learning_error",
+                        [float("nan")] * len(self._cur[lane]["reward"]),
+                    )
+                    raw[t] = float(value)
+            elif ep_i < len(self.episodes) and t < len(self.episodes[ep_i]["reward"]):
+                ep = self.episodes[ep_i]
+                if "raw_learning_error" not in ep:
+                    ep["raw_learning_error"] = np.full(
+                        len(ep["reward"]), np.nan, dtype=np.float64,
+                    )
+                ep["raw_learning_error"][t] = float(value)
 
     def sample_for_reanalyze(
         self, n: int,
@@ -1777,7 +2185,12 @@ class _ResearchImZeroBuffer:
         return episode_idx, timestep, obs_out, ctx_obs, ctx_action, ctx_valid
 
     def update_reanalyzed_targets(
-        self, episode_idx: np.ndarray, timestep: np.ndarray, policy_targets: np.ndarray, search_values: np.ndarray,
+        self,
+        episode_idx: np.ndarray,
+        timestep: np.ndarray,
+        policy_targets: np.ndarray,
+        search_values: np.ndarray,
+        policy_target_valid: np.ndarray | None = None,
     ) -> None:
         self._reanalyze_generation += 1
         gen = self._reanalyze_generation
@@ -1792,6 +2205,12 @@ class _ResearchImZeroBuffer:
                 ep["policy_target"][t] = np.asarray(policy_targets[i], dtype=np.float32)
                 ep["search_value"][t] = float(search_values[i])
                 ep["reanalyzed_gen"][t] = gen
+                if policy_target_valid is not None:
+                    valid = ep.setdefault(
+                        "policy_target_valid",
+                        [True] * len(ep["reward"]),
+                    )
+                    valid[t] = bool(policy_target_valid[i])
                 continue
             if ep_i >= len(self.episodes):
                 continue
@@ -1801,6 +2220,10 @@ class _ResearchImZeroBuffer:
             ep["policy_target"][t] = policy_targets[i]
             ep["search_value"][t] = search_values[i]
             ep["reanalyzed_gen"][t] = gen
+            if policy_target_valid is not None:
+                if "policy_target_valid" not in ep:
+                    ep["policy_target_valid"] = np.ones(len(ep["reward"]), dtype=bool)
+                ep["policy_target_valid"][t] = bool(policy_target_valid[i])
             self._episode_last_reanalyzed_gen[ep_i] = float(gen)
 
 
@@ -1995,6 +2418,7 @@ class NativeResearchImZero(CustomAlgorithm):
         )
         self._model_error_ema = self.search_model_error_high
         self._last_search_num_simulations = self.num_simulations_initial
+        self._last_search_base_simulations = self.num_simulations_initial
         # Gumbel-Top-k + Sequential Halving (module docstring's "Search"
         # section) - `efficientzero.py`'s own defaults, not PUCT's
         # `pb_c_base`/`pb_c_init`/Dirichlet noise.
@@ -2009,6 +2433,9 @@ class NativeResearchImZero(CustomAlgorithm):
         self.policy_loss_coef = float(hyperparams.get("policy_loss_coef", 1.0))
         self.reward_loss_coef = float(hyperparams.get("reward_loss_coef", 1.0))
         self.consistency_loss_coef = float(hyperparams.get("consistency_loss_coef", 2.0))
+        self.path_consistency_coef = max(
+            0.0, float(hyperparams.get("path_consistency_coef", 0.0)),
+        )
         self.closed_loop_loss_coef = max(0.0, float(hyperparams.get("closed_loop_loss_coef", 0.5)))
         self.closed_loop_horizon = max(1, min(
             self.unroll_steps, int(hyperparams.get("closed_loop_horizon", 3)),
@@ -2016,6 +2443,26 @@ class NativeResearchImZero(CustomAlgorithm):
         self.closed_loop_batch_fraction = min(
             1.0, max(0.0, float(hyperparams.get("closed_loop_batch_fraction", 0.25))),
         )
+        self.adaptive_closed_loop = bool(int(hyperparams.get("adaptive_closed_loop", 0)))
+        self.adaptive_closed_loop_max_horizon = max(
+            self.closed_loop_horizon,
+            min(self.unroll_steps, int(hyperparams.get("adaptive_closed_loop_max_horizon", 5))),
+        )
+        self.adaptive_closed_loop_error_threshold = max(
+            0.0, float(hyperparams.get("adaptive_closed_loop_error_threshold", 0.08)),
+        )
+        self.adaptive_closed_loop_min_grad_steps = max(
+            0, int(hyperparams.get("adaptive_closed_loop_min_grad_steps", 500)),
+        )
+        self.adaptive_closed_loop_stable_steps = max(
+            1, int(hyperparams.get("adaptive_closed_loop_stable_steps", 50)),
+        )
+        self.adaptive_closed_loop_ema_decay = min(
+            0.9999, max(0.0, float(hyperparams.get("adaptive_closed_loop_ema_decay", 0.99))),
+        )
+        self._adaptive_closed_loop_horizon = self.closed_loop_horizon
+        self._adaptive_closed_loop_stable_count = 0
+        self._closed_loop_error_ema = [float("nan")] * self.unroll_steps
         self.continuous_prior_scale = float(hyperparams.get("continuous_prior_scale", 2.5))
         self.train_freq = max(1, int(hyperparams.get("train_freq", 1)))
         _train_steps_per_iter_base = max(1, int(hyperparams.get("train_steps_per_iter", 2)))
@@ -2040,6 +2487,12 @@ class NativeResearchImZero(CustomAlgorithm):
         self.priority_beta = max(0.0, float(hyperparams.get("priority_beta", 1.0)))
         self.priority_beta_start = max(0.0, float(hyperparams.get("priority_beta_start", 0.4)))
         self.priority_policy_weight = max(0.0, float(hyperparams.get("priority_policy_weight", 0.1)))
+        self.learning_progress_priority_weight = max(
+            0.0, float(hyperparams.get("learning_progress_priority_weight", 0.0)),
+        )
+        self.learning_progress_priority_cap = max(
+            0.0, float(hyperparams.get("learning_progress_priority_cap", 1.0)),
+        )
         self.min_priority = max(1e-8, float(hyperparams.get("min_priority", 1e-6)))
         self.reanalyze_freq = max(1, int(hyperparams.get("reanalyze_freq", 200)))
         self.reanalyze_batch_size = max(0, int(hyperparams.get("reanalyze_batch_size", 64)))
@@ -2080,8 +2533,13 @@ class NativeResearchImZero(CustomAlgorithm):
             priority_alpha=self.priority_alpha, priority_beta=self.priority_beta_start, min_priority=self.min_priority,
             recent_fraction=float(hyperparams.get("replay_recent_fraction", 0.5)),
             recent_window=int(hyperparams.get("replay_recent_window", 512)),
+            success_fraction=float(hyperparams.get("replay_success_fraction", 0.0)),
+            success_top_quantile=float(hyperparams.get("replay_success_top_quantile", 0.25)),
         )
         self._last_metrics: dict[str, float] = {}
+        self._episode_reward_rolling = deque(
+            maxlen=max(1, int(hyperparams.get("episode_reward_rolling_window", 20))),
+        )
         # `learn()`'s own persistent per-lane real-history cache (module
         # docstring's "Persistent, incrementally-extended per-lane root
         # cache" section) - `None` per lane means "no history yet this
@@ -2171,12 +2629,16 @@ class NativeResearchImZero(CustomAlgorithm):
         h_obs, caches2 = self.transformer.forward_incremental_batch(z_pred, positions2, caches1, embed_positions2)
         return caches2, h_act, h_obs
 
-    def _adjust_search_reward(
-        self, action_hidden: torch.Tensor, reward: torch.Tensor,
-    ) -> torch.Tensor:
-        """Optional search-edge-only adjustment hook; identity by default."""
-        del action_hidden
-        return reward
+    def _adjust_search_predictions(
+        self,
+        action_hidden: torch.Tensor,
+        next_hidden: torch.Tensor,
+        reward: torch.Tensor,
+        next_value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Optional search-edge hook; strict identity by default."""
+        del action_hidden, next_hidden
+        return reward, next_value
 
     def _replay_context_to_cache(
         self, ctx_obs: np.ndarray, ctx_action: np.ndarray, ctx_valid: np.ndarray,
@@ -2399,7 +2861,13 @@ class NativeResearchImZero(CustomAlgorithm):
                 root_std_np = root_std.detach().cpu().numpy()
 
         n_slots = self.n_actions if self.discrete else self.num_sampled_actions
-        current_num_simulations = self._current_num_simulations()
+        base_num_simulations = self._current_num_simulations()
+        current_num_simulations = self._effective_search_simulations(
+            base_num_simulations,
+            root_logits if self.discrete else None,
+            None if self.discrete else root_std,
+        )
+        self._last_search_base_simulations = base_num_simulations
         self._last_search_num_simulations = current_num_simulations
         # Keep enough budget for an actual halving phase at the cheap
         # beginning of the schedule (8 simulations -> at most 4 roots).
@@ -2458,8 +2926,10 @@ class NativeResearchImZero(CustomAlgorithm):
             with torch.inference_mode():
                 child_caches, h_act, h_obs = self._step_imagine(parent_caches, action_t)
                 reward_scalar = self.heads.reward(h_act)
-                reward_scalar = self._adjust_search_reward(h_act, reward_scalar)
                 next_value = self.heads.value(h_obs)
+                reward_scalar, next_value = self._adjust_search_predictions(
+                    h_act, h_obs, reward_scalar, next_value,
+                )
                 if self.discrete:
                     next_logits = self.heads.policy_logits(h_obs)
                 else:
@@ -2548,7 +3018,17 @@ class NativeResearchImZero(CustomAlgorithm):
         results = self.search(obs_batch, root_caches, deterministic=np.zeros(obs_batch.shape[0], dtype=bool))
         policy_targets = np.stack([r["policy_target"] for r in results])
         search_values = np.asarray([r["value_target"] for r in results], dtype=np.float32)
-        self.buffer.update_reanalyzed_targets(episode_idx, timestep, policy_targets, search_values)
+        policy_target_valid = np.asarray(
+            [r.get("policy_target_valid", True) for r in results],
+            dtype=bool,
+        )
+        self.buffer.update_reanalyzed_targets(
+            episode_idx,
+            timestep,
+            policy_targets,
+            search_values,
+            policy_target_valid,
+        )
         return {"reanalyze_mean_search_value": float(search_values.mean())}
 
     # ------------------------------------------------------------------
@@ -2642,14 +3122,137 @@ class NativeResearchImZero(CustomAlgorithm):
         )
         return max(2, min(self.num_simulations, int(simulations)))
 
+    def _effective_train_steps_per_iter(self) -> int:
+        """Learner cadence hook; ResearchImZero keeps its configured count."""
+        return self.train_steps_per_iter
+
+    def _effective_search_simulations(
+        self,
+        base_simulations: int,
+        policy_logits: torch.Tensor | None,
+        policy_std: torch.Tensor | None,
+    ) -> int:
+        del policy_logits, policy_std
+        return base_simulations
+
+    def _effective_reanalyze_value_mix(
+        self,
+        action_hidden: torch.Tensor,
+        next_hidden: torch.Tensor,
+        base_mix: float,
+    ) -> torch.Tensor:
+        del action_hidden, next_hidden
+        return torch.as_tensor(base_mix, dtype=torch.float32, device=self.device)
+
+    def _effective_closed_loop_horizon(self) -> int:
+        return (
+            self._adaptive_closed_loop_horizon
+            if self.adaptive_closed_loop
+            else self.closed_loop_horizon
+        )
+
+    def _update_closed_loop_error_ema(self, errors: list[torch.Tensor]) -> None:
+        if not self.adaptive_closed_loop:
+            return
+        decay = self.adaptive_closed_loop_ema_decay
+        for depth, error in enumerate(errors):
+            observed = float(error.detach().item())
+            previous = self._closed_loop_error_ema[depth]
+            self._closed_loop_error_ema[depth] = (
+                observed
+                if not np.isfinite(previous)
+                else decay * previous + (1.0 - decay) * observed
+            )
+        required = min(3, self._adaptive_closed_loop_horizon)
+        stable = (
+            self._grad_step_count >= self.adaptive_closed_loop_min_grad_steps
+            and all(
+                np.isfinite(self._closed_loop_error_ema[depth])
+                and self._closed_loop_error_ema[depth]
+                < self.adaptive_closed_loop_error_threshold
+                for depth in range(required)
+            )
+        )
+        self._adaptive_closed_loop_stable_count = (
+            self._adaptive_closed_loop_stable_count + 1 if stable else 0
+        )
+        if (
+            self._adaptive_closed_loop_stable_count
+            >= self.adaptive_closed_loop_stable_steps
+            and self._adaptive_closed_loop_horizon
+            < self.adaptive_closed_loop_max_horizon
+        ):
+            self._adaptive_closed_loop_horizon = self.adaptive_closed_loop_max_horizon
+            self._adaptive_closed_loop_stable_count = 0
+
+    def _rolling_reward_metrics(self) -> dict[str, float]:
+        values = np.asarray(self._episode_reward_rolling, dtype=np.float64)
+        return {
+            "episode_reward_rolling_mean": float(values.mean()) if values.size else 0.0,
+            "episode_reward_rolling_std": float(values.std()) if values.size else 0.0,
+            "episode_reward_rolling_count": float(values.size),
+        }
+
+    def _compute_path_consistency_loss(
+        self,
+        value_logits: list[torch.Tensor],
+        reward_predictions: list[torch.Tensor],
+        mask: torch.Tensor,
+        is_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(value_logits) < 2:
+            return mask.new_zeros(())
+        terms = mask.new_zeros(())
+        denominator = mask.new_zeros(())
+        for k in range(len(value_logits) - 1):
+            valid_pair = mask[:, k] * mask[:, k + 1]
+            target = (
+                reward_predictions[k].detach()
+                + self.gamma
+                * _logits_to_scalar(value_logits[k + 1], self.support_size).detach()
+            )
+            target_two_hot = _scalar_to_two_hot(
+                target, self.support_size, self.label_smoothing_eps,
+            )
+            cross_entropy = -(
+                target_two_hot * F.log_softmax(value_logits[k], dim=-1)
+            ).sum(-1)
+            terms = terms + (cross_entropy * valid_pair * is_weight).sum()
+            denominator = denominator + valid_pair.sum()
+        return terms / denominator.clamp_min(1.0)
+
+    def _apply_learning_progress_priority(
+        self,
+        current_priority: np.ndarray,
+        episode_idx: np.ndarray,
+        timestep: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        bonus = np.zeros_like(current_priority)
+        if self.learning_progress_priority_weight <= 0.0:
+            return current_priority, bonus
+        previous_raw_error = self.buffer.raw_learning_errors_for(episode_idx, timestep)
+        improvement = np.where(
+            np.isfinite(previous_raw_error),
+            np.maximum(previous_raw_error - current_priority, 0.0),
+            0.0,
+        )
+        bonus = self.learning_progress_priority_weight * np.clip(
+            improvement,
+            0.0,
+            self.learning_progress_priority_cap,
+        )
+        self.buffer.update_raw_learning_errors(episode_idx, timestep, current_priority)
+        return current_priority + bonus, bonus
+
     def _after_core_train_step(
         self,
         batch: dict[str, Any],
         hidden: torch.Tensor,
         obs0_pos: torch.Tensor,
+        value_targets: torch.Tensor,
     ) -> dict[str, float]:
         """Optional detached sidecar hook; a strict no-op for ResearchImZero."""
-        del batch, hidden, obs0_pos
+        del batch, hidden, obs0_pos, value_targets
         return {}
 
     # ------------------------------------------------------------------
@@ -2672,6 +3275,9 @@ class NativeResearchImZero(CustomAlgorithm):
         reward = torch.as_tensor(batch["reward"], dtype=torch.float32, device=device)
         next_obs = torch.as_tensor(batch["next_obs"], dtype=torch.float32, device=device)
         policy_target = torch.as_tensor(batch["policy_target"], dtype=torch.float32, device=device)
+        policy_target_valid = torch.as_tensor(
+            batch["policy_target_valid"], dtype=torch.float32, device=device,
+        )
         mask = torch.as_tensor(batch["mask"], dtype=torch.float32, device=device)
         td_reward = torch.as_tensor(batch["td_reward"], dtype=torch.float32, device=device)
         td_discount = torch.as_tensor(batch["td_discount"], dtype=torch.float32, device=device)
@@ -2804,11 +3410,17 @@ class NativeResearchImZero(CustomAlgorithm):
             first_step_value_target: torch.Tensor | None = None
             first_step_policy_error: torch.Tensor | None = None
             value_targets: list[torch.Tensor] = []
+            path_value_logits: list[torch.Tensor] = []
+            path_reward_predictions: list[torch.Tensor] = []
+            effective_sve_mixes: list[torch.Tensor] = []
 
             for k in range(k_steps):
                 m = mask[:, k]
                 wm = m * is_weight
                 denom = m.sum().clamp_min(1.0)
+                policy_mask = m * policy_target_valid[:, k]
+                policy_weight = policy_mask * is_weight
+                policy_denom = policy_mask.sum().clamp_min(1.0)
                 h_obs_k = hidden[batch_idx, obs0_pos + 2 * k]  # obs_k's own hidden state
                 h_act_k = hidden[batch_idx, obs0_pos + 2 * k + 1]  # act_k's own hidden state
 
@@ -2819,11 +3431,20 @@ class NativeResearchImZero(CustomAlgorithm):
                 # back to pure n-step TD.
                 with torch.no_grad():
                     td_target = td_reward[:, k] + td_discount[:, k] * bootstrap_values[:, k]
+                    sve_next_hidden = (
+                        hidden[batch_idx, obs0_pos + 2 * (k + 1)]
+                        if k + 1 < k_steps
+                        else h_obs_k
+                    )
+                    effective_mix = self._effective_reanalyze_value_mix(
+                        h_act_k, sve_next_hidden, self.reanalyze_value_mix,
+                    )
                     mixed_target = (
-                        (1.0 - self.reanalyze_value_mix) * td_target
-                        + self.reanalyze_value_mix * search_value[:, k]
+                        (1.0 - effective_mix) * td_target
+                        + effective_mix * search_value[:, k]
                     )
                     value_target = torch.where(is_fresh[:, k], mixed_target, td_target)
+                    effective_sve_mixes.append(torch.as_tensor(effective_mix).detach())
                 value_targets.append(value_target.detach())
                 value_two_hot = _scalar_to_two_hot(value_target, self.support_size, self.label_smoothing_eps)
                 v_loss = -(value_two_hot * F.log_softmax(value_pred_logits, dim=-1)).sum(-1)
@@ -2834,6 +3455,11 @@ class NativeResearchImZero(CustomAlgorithm):
                         first_step_value_target = value_target.detach()
 
                 reward_logits_k = self.heads.reward_logits(h_act_k)
+                if self.path_consistency_coef > 0.0:
+                    path_value_logits.append(value_pred_logits)
+                    path_reward_predictions.append(
+                        _logits_to_scalar(reward_logits_k, self.support_size),
+                    )
                 reward_two_hot = _scalar_to_two_hot(reward[:, k], self.support_size, self.label_smoothing_eps)
                 r_loss = -(reward_two_hot * F.log_softmax(reward_logits_k, dim=-1)).sum(-1)
                 reward_loss = reward_loss + (r_loss * wm).sum() / denom
@@ -2856,8 +3482,10 @@ class NativeResearchImZero(CustomAlgorithm):
                     # needed: `0.5*log(2*pi*e*sigma^2)` per dim.
                     var = std.clamp_min(1e-6) ** 2
                     entropy_k = (0.5 * torch.log(2.0 * math.pi * math.e * var)).sum(-1)
-                policy_loss = policy_loss + (p_loss * wm).sum() / denom
-                policy_entropy = policy_entropy + (entropy_k * wm).sum() / denom
+                policy_loss = policy_loss + (p_loss * policy_weight).sum() / policy_denom
+                policy_entropy = (
+                    policy_entropy + (entropy_k * policy_weight).sum() / policy_denom
+                )
                 if k == 0:
                     # Priority (below, after the unroll loop) blends this
                     # in alongside the value error - a transition whose
@@ -2867,7 +3495,9 @@ class NativeResearchImZero(CustomAlgorithm):
                     # `|value_pred - value_target|`-only priority never
                     # surfaced it (module docstring's "Schedules, not
                     # fixed constants" section).
-                    first_step_policy_error = p_loss.detach()
+                    first_step_policy_error = (
+                        p_loss * policy_target_valid[:, k]
+                    ).detach()
 
                 # SimSiam consistency loss (module docstring's "no target
                 # network" section, `efficientzero.py`'s own recipe): the
@@ -2912,6 +3542,12 @@ class NativeResearchImZero(CustomAlgorithm):
                 c_loss = 1.0 - (p_true * p_pred).sum(-1)
                 consistency_loss = consistency_loss + (c_loss * wm).sum() / denom
 
+            path_consistency_loss = torch.zeros((), device=device)
+            if self.path_consistency_coef > 0.0 and k_steps > 1:
+                path_consistency_loss = self._compute_path_consistency_loss(
+                    path_value_logits, path_reward_predictions, mask, is_weight,
+                )
+
             # Closed-loop latent overshooting. A small sampled sub-batch is
             # rolled forward recursively through `_step_imagine`, so step
             # k+1 consumes the model's own predicted observation token from
@@ -2920,6 +3556,7 @@ class NativeResearchImZero(CustomAlgorithm):
             # exposure gap without trusting wholly imagined trajectories.
             closed_loop_loss = torch.zeros((), device=device)
             closed_loop_latent_errors: list[torch.Tensor] = []
+            effective_closed_loop_horizon = self._effective_closed_loop_horizon()
             closed_n = min(
                 b,
                 max(2, int(round(b * self.closed_loop_batch_fraction))),
@@ -2932,7 +3569,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 )
                 cl_terms = torch.zeros((), device=device)
                 cl_denom = torch.zeros((), device=device)
-                for k in range(self.closed_loop_horizon):
+                for k in range(effective_closed_loop_horizon):
                     cl_caches, cl_h_act, cl_h_obs = self._step_imagine(cl_caches, action[:closed_n, k])
                     cl_mask = mask[:closed_n, k]
                     cl_weight = cl_mask * is_weight[:closed_n]
@@ -3021,6 +3658,7 @@ class NativeResearchImZero(CustomAlgorithm):
                     + self.policy_loss_coef * policy_loss + self.consistency_loss_coef * consistency_loss
                 )
             total_loss = total_loss + self.closed_loop_loss_coef * closed_loop_loss
+            total_loss = total_loss + self.path_consistency_coef * path_consistency_loss
             # Entropy *bonus* - reference's own `policy_entropy_weight`
             # (default `5e-3`): subtracted from the total loss (not
             # added) since higher policy entropy is the *goal* here, one
@@ -3052,6 +3690,7 @@ class NativeResearchImZero(CustomAlgorithm):
             self.loss_log_vars.data.clamp_(-5.0, 5.0)
         if self.use_target_for_bootstrap:
             self._update_target_network()
+        self._update_closed_loop_error_ema(closed_loop_latent_errors)
         if closed_n:
             observed_model_error = float(closed_loop_loss.detach().item())
             decay = self.search_model_error_ema_decay
@@ -3073,6 +3712,9 @@ class NativeResearchImZero(CustomAlgorithm):
         # actually tuned around.
         combined_priority = value_error + self.priority_policy_weight * first_step_policy_error
         fresh_priority = combined_priority.cpu().numpy()
+        fresh_priority, learning_progress_bonus = self._apply_learning_progress_priority(
+            fresh_priority, batch["episode_idx"], batch["timestep"],
+        )
         self.buffer.update_priorities(batch["episode_idx"], batch["timestep"], fresh_priority)
 
         if self.rnd:
@@ -3083,7 +3725,10 @@ class NativeResearchImZero(CustomAlgorithm):
             self.rnd.update_predictor(
                 batch["next_obs"].reshape(-1, *self._obs_shape), mask=batch["mask"].reshape(-1),
             )
-        sidecar_metrics = self._after_core_train_step(batch, hidden.detach(), obs0_pos)
+        stacked_value_targets = torch.stack(value_targets, dim=1).detach()
+        sidecar_metrics = self._after_core_train_step(
+            batch, hidden.detach(), obs0_pos, stacked_value_targets,
+        )
 
         return {
             "reward_loss": float(reward_loss.item()),
@@ -3091,19 +3736,38 @@ class NativeResearchImZero(CustomAlgorithm):
             "policy_loss": float(policy_loss.item()),
             "consistency_loss": float(consistency_loss.item()),
             "closed_loop_loss": float(closed_loop_loss.item()),
+            "path_consistency_loss": float(path_consistency_loss.item()),
             **{
                 f"closed_loop_latent_error_h{horizon + 1}": float(error.item())
                 for horizon, error in enumerate(closed_loop_latent_errors)
             },
             "policy_entropy": float(policy_entropy.item()),
             "mean_priority": float(fresh_priority.mean()) if fresh_priority.size else 0.0,
+            "learning_progress_priority_bonus": float(learning_progress_bonus.mean()),
             "mean_is_weight": float(is_weight.mean().item()),
             "active_sample_fraction": float(batch["active_sample_fraction"]),
             "recent_sample_fraction": float(batch["recent_sample_fraction"]),
+            "success_sample_fraction": float(batch["success_sample_fraction"]),
+            "success_pool_size": float(batch["success_pool_size"]),
+            "effective_closed_loop_horizon": float(effective_closed_loop_horizon),
+            **{
+                f"closed_loop_latent_error_ema_h{depth + 1}": float(value)
+                for depth, value in enumerate(self._closed_loop_error_ema)
+                if np.isfinite(value)
+            },
             "total_loss": float(total_loss.item()),
             "learning_rate": current_lr,
             "priority_beta": current_priority_beta,
             "search_num_simulations": float(self._last_search_num_simulations),
+            "search_base_simulations": float(self._last_search_base_simulations),
+            "effective_sve_mix_mean": float(
+                torch.stack(
+                    [
+                        value.expand(b) if value.ndim == 0 else value
+                        for value in effective_sve_mixes
+                    ],
+                ).mean().item()
+            ),
             "search_model_error_ema": float(self._model_error_ema),
             **(
                 {
@@ -3153,6 +3817,12 @@ class NativeResearchImZero(CustomAlgorithm):
             env_actions: list[Any] = []
             action_flats: list[np.ndarray] = []
             policy_targets: list[np.ndarray] = []
+            policy_target_valids: list[bool] = []
+            search_budgets: list[int] = []
+            model_expansion_counts: list[int] = []
+            behavior_policies: list[np.ndarray] = []
+            audit_types: list[str] = []
+            behavior_metadata: list[dict[str, Any]] = []
             searched_root_caches: list[_TransformerCache] | None = None
             if num_timesteps < self.learning_starts:
                 for _ in range(n_envs):
@@ -3170,6 +3840,12 @@ class NativeResearchImZero(CustomAlgorithm):
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
                     policy_targets.append(policy_target)
+                    policy_target_valids.append(True)
+                    search_budgets.append(0)
+                    model_expansion_counts.append(0)
+                    behavior_policies.append(policy_target)
+                    audit_types.append("none")
+                    behavior_metadata.append({})
             else:
                 # `self._lane_cache[lane]` is each lane's own persistent
                 # real-history cache, carried over from the *previous*
@@ -3187,6 +3863,52 @@ class NativeResearchImZero(CustomAlgorithm):
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
                     policy_targets.append(result["policy_target"])
+                    policy_target_valids.append(bool(result.get("policy_target_valid", True)))
+                    search_budgets.append(int(result.get("search_budget", self._last_search_num_simulations)))
+                    model_expansion_counts.append(int(result.get("model_expansions", self._last_search_num_simulations)))
+                    behavior_policies.append(
+                        np.asarray(result.get("behavior_policy", result["policy_target"]), dtype=np.float32),
+                    )
+                    audit_types.append(str(result.get("audit_type", "none")))
+                    behavior_metadata.append(
+                        {
+                            "stage_index": int(result.get("stage_index", -1)),
+                            "stage_id": str(result.get("stage_id", "none")),
+                            "nominal_stage_budget": int(
+                                result.get("nominal_stage_budget", search_budgets[-1])
+                            ),
+                            "requested_budget": int(
+                                result.get("requested_budget", search_budgets[-1])
+                            ),
+                            "predicted_stage_index": int(
+                                result.get("predicted_stage_index", -1)
+                            ),
+                            "predicted_stage_id": str(
+                                result.get("predicted_stage_id", "none")
+                            ),
+                            "predicted_requested_budget": int(
+                                result.get(
+                                    "predicted_requested_budget",
+                                    search_budgets[-1],
+                                )
+                            ),
+                            "executed_search_expansions": int(
+                                result.get(
+                                    "executed_search_expansions",
+                                    search_budgets[-1],
+                                )
+                            ),
+                            "common_evaluator_expansions": int(
+                                result.get("common_evaluator_expansions", 0)
+                            ),
+                            "total_model_calls": int(
+                                result.get("total_model_calls", model_expansion_counts[-1])
+                            ),
+                            "termination_reason": str(
+                                result.get("termination_reason", "budget_exhausted")
+                            ),
+                        }
+                    )
 
             next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
             dones = terminated | truncated
@@ -3226,6 +3948,12 @@ class NativeResearchImZero(CustomAlgorithm):
                 self.buffer.add(
                     obs_arr[lane], action_flats[lane], float(total_reward[lane]), transition_next_obs_arr[lane],
                     policy_targets[lane], bool(dones[lane]), lane=lane,
+                    policy_target_valid=policy_target_valids[lane],
+                    search_budget=search_budgets[lane],
+                    model_expansions=model_expansion_counts[lane],
+                    behavior_policy=behavior_policies[lane],
+                    audit_type=audit_types[lane],
+                    **behavior_metadata[lane],
                 )
             if num_timesteps >= self.learning_starts:
                 done_lanes = np.flatnonzero(dones)
@@ -3266,8 +3994,10 @@ class NativeResearchImZero(CustomAlgorithm):
                     # crossed; multiplying by its count here and scaling
                     # again in `__init__` was the 144-updates/iteration
                     # regression diagnosed on the real NetHack runs.
-                    for _ in range(self.train_steps_per_iter):
+                    effective_train_steps = self._effective_train_steps_per_iter()
+                    for _ in range(effective_train_steps):
                         self._last_metrics = self._train_step()
+                    self._last_metrics["effective_train_steps"] = float(effective_train_steps)
 
                 reanalyze_boundaries = num_timesteps // self.reanalyze_freq - effective_prev // self.reanalyze_freq
                 if reanalyze_boundaries > 0:
@@ -3280,6 +4010,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 if not dones[lane]:
                     continue
                 any_done = True
+                self._episode_reward_rolling.append(float(ep_reward[lane]))
                 lane_metrics = (
                     {
                         **self._last_metrics,
@@ -3289,6 +4020,7 @@ class NativeResearchImZero(CustomAlgorithm):
                     if self.rnd
                     else self._last_metrics
                 )
+                lane_metrics = {**lane_metrics, **self._rolling_reward_metrics()}
                 keep_going = callback.on_step(
                     num_timesteps, float(ep_reward[lane]), int(ep_length[lane]), lane_metrics,
                 )
@@ -3296,7 +4028,10 @@ class NativeResearchImZero(CustomAlgorithm):
                 if not keep_going:
                     return
             if not any_done:
-                keep_going = callback.on_step(num_timesteps, metrics=self._last_metrics)
+                keep_going = callback.on_step(
+                    num_timesteps,
+                    metrics={**self._last_metrics, **self._rolling_reward_metrics()},
+                )
                 if not keep_going:
                     return
 
@@ -3330,6 +4065,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 "target_heads_state_dict": self.target_heads.state_dict(),
                 "loss_log_vars": self.loss_log_vars.detach().cpu(),
                 "hyperparams": self.hyperparams,
+                "replay_buffer_state": self.buffer.state_dict(),
                 **({"rnd_state": self.rnd.checkpoint_state()} if self.rnd else {}),
             },
             path,
@@ -3355,6 +4091,8 @@ class NativeResearchImZero(CustomAlgorithm):
             algo.target_heads.load_state_dict(payload["target_heads_state_dict"])
         if algo.rnd and payload.get("rnd_state"):
             algo.rnd.load_checkpoint_state(payload["rnd_state"])
+        if "replay_buffer_state" in payload:
+            algo.buffer.load_state_dict(payload["replay_buffer_state"])
         if "loss_log_vars" in payload:
             saved = payload["loss_log_vars"]
             if saved.shape == algo.loss_log_vars.shape:
