@@ -117,7 +117,7 @@ export function SettingsPage() {
           <CardTitle className="text-sm">Система</CardTitle>
         </CardHeader>
         <CardContent className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
-          <InfoRow label="Приложение" value={version || '—'} />
+          <InfoRow label="Приложение" value={version || sysInfo?.version || '—'} />
           <InfoRow label="Платформа" value={platform || sysInfo?.platform || '—'} />
           <InfoRow label="CPU cores" value={String(sysInfo?.cpu_count ?? '—')} />
           <InfoRow label="CUDA" value={sysInfo?.torch_cuda_available ? 'доступна' : 'нет'} />

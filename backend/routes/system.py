@@ -7,12 +7,14 @@ import subprocess
 
 from fastapi import APIRouter
 
+from backend import __version__ as APP_VERSION
+
 router = APIRouter()
 
 
 @router.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @router.get("/info")
@@ -58,6 +60,7 @@ async def info():
         pass
 
     return {
+        "version": APP_VERSION,
         "platform": platform.platform(),
         "cpu_count": os.cpu_count(),
         "torch_cuda_available": torch_cuda,

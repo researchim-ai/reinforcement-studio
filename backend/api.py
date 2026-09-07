@@ -13,11 +13,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import asyncio
 
-from backend import sweep_manager
+from backend import __version__, sweep_manager
 from backend.routes import alphazero, environments, models, networks, plugins, scenes, sweeps, system, training, world_models
 from backend.ws import router as ws_router
 
-app = FastAPI(title="Reinforcement Studio API", version="0.1.0")
+app = FastAPI(title="Reinforcement Studio API", version=__version__)
 
 app.add_middleware(
     CORSMiddleware,

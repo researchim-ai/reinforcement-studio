@@ -829,6 +829,7 @@ export interface ArenaState {
 }
 
 export interface SystemInfo {
+  version?: string
   platform: string
   cpu_count: number
   torch_cuda_available: boolean
