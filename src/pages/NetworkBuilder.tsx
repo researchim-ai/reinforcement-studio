@@ -27,12 +27,14 @@ import {
   defaultCompositeSpec,
   isCompositeFamily,
   isCompositeSpec,
+  isFlatSpec,
   reconcileHeadsForFamily,
 } from '@/lib/networkBuilder'
 import type {
   AnyNetworkSpec,
   CompositeNetworkSpec,
   FlatNetworkFamily,
+  CompositeNetworkFamily,
   NetworkFamily,
   NetworkHead,
   NetworkLayer,
@@ -64,7 +66,30 @@ interface GraphHandlers {
   addHeadLayer: (headIdx: number, index: number) => void
 }
 
-function buildGraph(
+function previewFitsFamily(family: NetworkFamily, preview: NetworkPreviewResult | undefined): preview is NetworkPreviewResult {
+  if (!preview) return false
+  if (isCompositeFamily(family)) return Array.isArray(preview.components)
+  return preview.components === undefined && preview.heads != null && typeof preview.heads === 'object'
+}
+
+function applyLoadedNetwork(doc: { name: string; description: string; family: NetworkFamily; spec: AnyNetworkSpec }) {
+  if (isCompositeFamily(doc.family) || isCompositeSpec(doc.spec)) {
+    const spec = isCompositeSpec(doc.spec)
+      ? doc.spec
+      : defaultCompositeSpec(doc.family as CompositeNetworkFamily)
+    return { family: doc.family, spec, composite: true as const }
+  }
+  if (isFlatSpec(doc.spec)) {
+    return { family: doc.family, spec: doc.spec, composite: false as const }
+  }
+  return {
+    family: doc.family,
+    spec: defaultSpecForFamily(isCompositeFamily(doc.family) ? 'actor_critic' : doc.family as FlatNetworkFamily),
+    composite: false as const,
+  }
+}
+
+export function buildGraph(
   spec: NetworkSpec,
   preview: NetworkPreviewResult | undefined,
   handlers: GraphHandlers,
@@ -81,9 +106,10 @@ function buildGraph(
   })
 
   let lastTrunkId = 'input'
-  spec.trunk.forEach((layer, i) => {
+  const trunk = spec.trunk ?? []
+  trunk.forEach((layer, i) => {
     const id = `trunk-${i}`
-    const built = i < (preview?.trunk.length ?? 0)
+    const built = i < (preview?.trunk?.length ?? 0)
     const failed = preview?.trunk_error_index === i
     nodes.push({
       id,
@@ -97,18 +123,18 @@ function buildGraph(
         onChange: (l: NetworkLayer) => handlers.updateTrunkLayer(i, l),
         onRemove: () => handlers.removeTrunkLayer(i),
         onMoveUp: i > 0 ? () => handlers.moveTrunkLayer(i, -1) : undefined,
-        onMoveDown: i < spec.trunk.length - 1 ? () => handlers.moveTrunkLayer(i, 1) : undefined,
+        onMoveDown: i < trunk.length - 1 ? () => handlers.moveTrunkLayer(i, 1) : undefined,
       } satisfies LayerNodeData,
     })
     edges.push({ id: `e-${lastTrunkId}-${id}`, source: lastTrunkId, target: id })
     lastTrunkId = id
   })
 
-  const headStartY = (spec.trunk.length + 2) * ROW_H
-  const heads = spec.heads
+  const headStartY = (trunk.length + 2) * ROW_H
+  const heads = spec.heads ?? []
   heads.forEach((head: NetworkHead, hi) => {
     const headX = CENTER_X + (hi - (heads.length - 1) / 2) * HEAD_GAP
-    const headPreview = preview?.heads[head.name]
+    const headPreview = preview?.heads?.[head.name]
     const labelId = `head-label-${hi}`
     nodes.push({
       id: labelId,
@@ -169,7 +195,8 @@ function buildAddNodes(
   const nodes: Node[] = []
 
   let prevPos = at('input', { x: CENTER_X, y: 0 })
-  spec.trunk.forEach((_, i) => {
+  const trunk = spec.trunk ?? []
+  trunk.forEach((_, i) => {
     const curPos = at(`trunk-${i}`, { x: CENTER_X, y: (i + 1) * ROW_H })
     nodes.push({
       id: `add-trunk-${i}`,
@@ -183,12 +210,13 @@ function buildAddNodes(
     id: 'add-trunk-end',
     type: 'add',
     position: { x: prevPos.x + 190, y: prevPos.y },
-    data: { onAdd: () => handlers.addTrunkLayer(spec.trunk.length) } satisfies AddLayerNodeData,
+    data: { onAdd: () => handlers.addTrunkLayer(trunk.length) } satisfies AddLayerNodeData,
   })
 
-  const headStartY = (spec.trunk.length + 2) * ROW_H
-  spec.heads.forEach((head, hi) => {
-    const headX = CENTER_X + (hi - (spec.heads.length - 1) / 2) * HEAD_GAP
+  const headStartY = (trunk.length + 2) * ROW_H
+  const heads = spec.heads ?? []
+  heads.forEach((head, hi) => {
+    const headX = CENTER_X + (hi - (heads.length - 1) / 2) * HEAD_GAP
     let prevHeadPos = at(`head-label-${hi}`, { x: headX, y: headStartY })
     const nonFinalCount = head.layers.length - 1
     head.layers.forEach((_, li) => {
@@ -256,19 +284,27 @@ export function NetworkBuilderPage() {
 
   useEffect(() => {
     if (!selected || selected.isNew) return
+    let cancelled = false
     setLoading(true)
     api
       .getNetwork(selected.slug)
       .then((doc) => {
+        if (cancelled) return
         setName(doc.name)
         setDescription(doc.description)
         setFamily(doc.family)
-        if (isCompositeSpec(doc.spec)) setCompositeSpec(doc.spec)
-        else setSpec(doc.spec)
-        setSavedSnapshot(JSON.stringify({ name: doc.name, description: doc.description, family: doc.family, spec: doc.spec }))
+        const loaded = applyLoadedNetwork(doc)
+        if (loaded.composite) setCompositeSpec(loaded.spec)
+        else setSpec(loaded.spec)
+        setSavedSnapshot(JSON.stringify({ name: doc.name, description: doc.description, family: doc.family, spec: loaded.spec }))
       })
-      .catch((err) => toast.error(err instanceof Error ? err.message : 'Не удалось загрузить архитектуру'))
-      .finally(() => setLoading(false))
+      .catch((err) => {
+        if (!cancelled) toast.error(err instanceof Error ? err.message : 'Не удалось загрузить архитектуру')
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => { cancelled = true }
   }, [selected])
 
   const activeSpec: AnyNetworkSpec = isCompositeFamily(family) ? compositeSpec : spec
@@ -284,7 +320,7 @@ export function NetworkBuilderPage() {
         }
       : null,
   )
-  const previewResult = preview.data
+  const previewResult = previewFitsFamily(family, preview.data) ? preview.data : undefined
 
   const openNewDialog = useCallback(() => {
     setNewSlug('')
@@ -342,7 +378,7 @@ export function NetworkBuilderPage() {
     if (isCompositeFamily(next)) {
       setCompositeSpec((prev) => (prev.family === next ? prev : defaultCompositeSpec(next)))
     } else {
-      setSpec((prev) => reconcileHeadsForFamily(prev, next as FlatNetworkFamily))
+      setSpec((prev) => (isFlatSpec(prev) ? reconcileHeadsForFamily(prev, next as FlatNetworkFamily) : defaultSpecForFamily(next as FlatNetworkFamily)))
     }
   }, [])
 
@@ -409,24 +445,26 @@ export function NetworkBuilderPage() {
   }, [])
 
   const { applyPositions, onNodesChange, positions } = useNodePositions()
-  const flatPreviewResult = isCompositeFamily(family) ? undefined : previewResult
+  const showFlatGraph = !isCompositeFamily(family) && isFlatSpec(spec)
+  const flatPreviewResult = showFlatGraph ? previewResult : undefined
   const { nodes: rawNodes, edges } = useMemo(
-    () =>
-      buildGraph(spec, flatPreviewResult, {
-        updateTrunkLayer,
-        removeTrunkLayer,
-        moveTrunkLayer,
-        addTrunkLayer,
-        updateHeadLayer,
-        removeHeadLayer,
-        moveHeadLayer,
-        addHeadLayer,
-      }),
-    [spec, flatPreviewResult, updateTrunkLayer, removeTrunkLayer, moveTrunkLayer, addTrunkLayer, updateHeadLayer, removeHeadLayer, moveHeadLayer, addHeadLayer],
+    () => showFlatGraph
+      ? buildGraph(spec, flatPreviewResult, {
+          updateTrunkLayer,
+          removeTrunkLayer,
+          moveTrunkLayer,
+          addTrunkLayer,
+          updateHeadLayer,
+          removeHeadLayer,
+          moveHeadLayer,
+          addHeadLayer,
+        })
+      : { nodes: [] as Node[], edges: [] as Edge[] },
+    [showFlatGraph, spec, flatPreviewResult, updateTrunkLayer, removeTrunkLayer, moveTrunkLayer, addTrunkLayer, updateHeadLayer, removeHeadLayer, moveHeadLayer, addHeadLayer],
   )
   const addNodes = useMemo(
-    () => buildAddNodes(spec, positions, { addTrunkLayer, addHeadLayer }),
-    [spec, positions, addTrunkLayer, addHeadLayer],
+    () => showFlatGraph ? buildAddNodes(spec, positions, { addTrunkLayer, addHeadLayer }) : [],
+    [showFlatGraph, spec, positions, addTrunkLayer, addHeadLayer],
   )
   const nodes = applyPositions([...rawNodes, ...addNodes])
 

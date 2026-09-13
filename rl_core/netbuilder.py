@@ -314,16 +314,19 @@ class SpecDuelingQNetwork(nn.Module):
 
 class SpecAlphaZeroNet(nn.Module):
     """Drop-in replacement for `rl_core.alphazero.network.AlphaZeroNet`.
-    Input is the game's own `(3, rows, cols)` board encoding (already
+    Input is the game's own `(in_planes, rows, cols)` board encoding (already
     normalized, unlike Gym pixels) — no preprocessing needed. Requires a
     "policy" head (`action_size` logits) and a "value" head (1, tanh'd)."""
 
-    def __init__(self, rows: int, cols: int, action_size: int, spec: dict[str, Any]) -> None:
+    def __init__(
+        self, rows: int, cols: int, action_size: int, spec: dict[str, Any], in_planes: int = 3,
+    ) -> None:
         super().__init__()
         self.rows = rows
         self.cols = cols
         self.action_size = action_size
-        built = build_network(spec, [3, rows, cols], head_out_features={"policy": action_size, "value": 1})
+        self.in_planes = in_planes
+        built = build_network(spec, [in_planes, rows, cols], head_out_features={"policy": action_size, "value": 1})
         require_heads(built, "alphazero")
         self.net = SpecNet(built)
 

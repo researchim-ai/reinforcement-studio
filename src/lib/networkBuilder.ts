@@ -19,7 +19,7 @@ export const FAMILY_LABELS: Record<NetworkFamily, string> = {
   efficientzero: 'EfficientZero (representation + dynamics + prediction)',
   unizero: 'UniZero (tokenizer + Transformer + heads)',
   researchimzero: 'ResearchImZero (Transformer + SimSiam)',
-  latentimzero: 'LatentImZero (stochastic imagination actor-critic)',
+  latentimzero: 'LatentImZero (Transformer + SimSiam + uncertainty probe)',
 }
 
 export const FAMILY_HEADS: Record<FlatNetworkFamily, string[]> = {
@@ -241,6 +241,12 @@ export function isCompositeSpec(spec: unknown): spec is CompositeNetworkSpec {
   return !!spec && typeof spec === 'object' && (spec as { format?: string }).format === 'composite_v1'
 }
 
+export function isFlatSpec(spec: unknown): spec is NetworkSpec {
+  return !!spec && typeof spec === 'object'
+    && Array.isArray((spec as NetworkSpec).trunk)
+    && Array.isArray((spec as NetworkSpec).heads)
+}
+
 export function defaultCompositeSpec(family: CompositeNetworkFamily): CompositeNetworkSpec {
   if (family === 'efficientzero') {
     return {
@@ -257,36 +263,7 @@ export function defaultCompositeSpec(family: CompositeNetworkFamily): CompositeN
       },
     }
   }
-  if (family === 'latentimzero') {
-    return {
-      format: 'composite_v1',
-      family,
-      dimensions: {
-        embed_dim: 64,
-        hidden_dim: 128,
-        num_layers: 2,
-        num_heads: 4,
-        ffn_multiplier: 4,
-        dropout: 0,
-        rotary_emb: 1,
-        stoch_variables: 16,
-        stoch_classes: 16,
-      },
-      encoder: { kind: 'auto', layers: [] },
-      components: {
-        tokenizer: compositeMlp([128]),
-        stochastic_prior: compositeMlp([]),
-        stochastic_posterior: compositeMlp([128]),
-        state_feature: compositeMlp([128]),
-        reward: compositeMlp([]),
-        continue: compositeMlp([]),
-        actor: compositeMlp([128, 128]),
-        critic: compositeMlp([128]),
-        ensemble_prior: compositeMlp([]),
-        ensemble_reward: compositeMlp([]),
-      },
-    }
-  }
+  const withSimSiam = family === 'researchimzero' || family === 'latentimzero'
   return {
     format: 'composite_v1',
     family,
@@ -297,13 +274,13 @@ export function defaultCompositeSpec(family: CompositeNetworkFamily): CompositeN
       ffn_multiplier: 4,
       dropout: family === 'unizero' ? 0.1 : 0,
       rotary_emb: 1,
-      ...(family === 'researchimzero' ? { proj_dim: 64 } : {}),
+      ...(withSimSiam ? { proj_dim: 64 } : {}),
     },
     encoder: { kind: 'auto', layers: [] },
     components: {
       tokenizer: compositeMlp([256]),
       heads: compositeMlp([]),
-      ...(family === 'researchimzero'
+      ...(withSimSiam
         ? { projector: compositeMlp([64], true), predictor: compositeMlp([64], true) }
         : {}),
     },

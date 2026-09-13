@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from rl_core import netbuilder_store as store
 from rl_core.composite_netbuilder import COMPOSITE_FAMILIES, validate_composite_spec
-from rl_core.netbuilder import FAMILY_HEADS, preview_network
+from rl_core.netbuilder import FAMILY_HEADS, NetworkSpecError, preview_network
 
 router = APIRouter()
 
@@ -120,7 +120,8 @@ def _shape_for_alphazero(game_id: str) -> tuple[list[int], dict[str, int]]:
     from rl_core.games import make_game
 
     game = make_game(game_id)
-    return [3, game.rows, game.cols], {"policy": int(game.action_size), "value": 1}
+    encoded = game.encode()
+    return list(encoded.shape), {"policy": int(game.action_size), "value": 1}
 
 
 @router.post("/preview")
@@ -161,6 +162,10 @@ async def preview(req: PreviewRequest):
                 "total_params": network.get("total_params"),
                 "trainable_params": network.get("trainable_params"),
                 "fixed_outputs": _composite_fixed_outputs(req.environment_id, req.wrappers, req.family, req.hyperparams),
+                "trunk": [],
+                "trunk_error": None,
+                "trunk_error_index": None,
+                "heads": {},
             }
         if req.family == "alphazero":
             if not req.game_id:
@@ -172,6 +177,18 @@ async def preview(req: PreviewRequest):
             input_shape, head_out_features = _shape_for_gym(req.environment_id, req.wrappers, req.family)
     except HTTPException:
         raise
+    except NetworkSpecError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "components": [],
+            "total_params": None,
+            "trainable_params": None,
+            "trunk": [],
+            "trunk_error": None,
+            "trunk_error_index": None,
+            "heads": {},
+        }
     except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not a crash
         return {
             "ok": False,

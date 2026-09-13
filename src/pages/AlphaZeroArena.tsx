@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { Loader2, Swords, RotateCcw } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -13,11 +14,12 @@ import type { ArenaState } from '@/api/types'
 import { cn } from '@/lib/utils'
 
 export function AlphaZeroArena() {
+  const [searchParams] = useSearchParams()
   const { data: gamesData } = useGames()
   const games = gamesData?.games ?? []
 
-  const [gameId, setGameId] = useState('')
-  const [opponentKey, setOpponentKey] = useState('')
+  const [gameId, setGameId] = useState(searchParams.get('game') ?? '')
+  const [opponentKey, setOpponentKey] = useState(searchParams.get('opponent') ?? '')
   const [humanFirst, setHumanFirst] = useState(true)
   const [session, setSession] = useState<ArenaState | null>(null)
   const [loading, setLoading] = useState(false)

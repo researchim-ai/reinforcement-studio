@@ -34,14 +34,16 @@ class AlphaZeroNet(nn.Module):
         action_size: int,
         channels: int = 48,
         num_blocks: int = 3,
+        in_planes: int = 3,
     ) -> None:
         super().__init__()
         self.rows = rows
         self.cols = cols
         self.action_size = action_size
+        self.in_planes = in_planes
 
         self.stem = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1),
+            nn.Conv2d(in_planes, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU(),
         )

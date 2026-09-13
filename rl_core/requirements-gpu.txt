@@ -86,3 +86,4 @@ lbforaging>=2.0
 # setuptools as of 81.0.0 (Nov 2025); see requirements.txt's matching
 # comment for the full story. Uncomment alongside the two lines above.
 # setuptools<81
+open_spiel>=1.6.15; python_version >= "3.11"

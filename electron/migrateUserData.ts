@@ -35,7 +35,7 @@ import path from 'path'
 // no reliable way to enumerate "past productNames" at runtime.
 const LEGACY_USER_DATA_NAMES = ['reinforcement-studio', 'Reinforcement Studio', 'rl-studio', 'RL Studio']
 
-const MIGRATED_ITEMS = ['pyenv', 'rl_data', 'config.json']
+const MIGRATED_ITEMS = ['pyenv', 'python-runtime', 'rl_data', 'config.json']
 
 function hasInstalledEnv(userDataDir: string): boolean {
   return fs.existsSync(path.join(userDataDir, 'pyenv', '.deps-hash'))
@@ -79,7 +79,7 @@ export function migrateLegacyUserData(): void {
         // caught that). Never do this for `config.json`/`rl_data` though —
         // those might hold genuine user choices/data already written
         // under the new name.
-        if (item !== 'pyenv') continue
+        if (item !== 'pyenv' && item !== 'python-runtime') continue
         try {
           fs.rmSync(dst, { recursive: true, force: true })
         } catch (err) {

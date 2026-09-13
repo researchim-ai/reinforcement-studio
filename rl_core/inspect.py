@@ -430,7 +430,7 @@ def inspect_alphazero(env_id: str, algo_id: str, hyperparams: dict[str, Any]) ->
     except Exception as exc:  # noqa: BLE001
         return {"environment": None, "network": None, "error": f"Не удалось создать игру: {exc}"}
 
-    space = {"type": "Box", "shape": [3, game.rows, game.cols]}
+    space = {"type": "Box", "shape": list(game.encode().shape)}
     action_space = {"type": "Discrete", "shape": [], "n": game.action_size}
     environment = {
         "raw_observation_space": space,

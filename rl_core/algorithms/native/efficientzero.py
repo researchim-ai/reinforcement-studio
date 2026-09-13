@@ -158,6 +158,18 @@ import gymnasium as gym
 
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
 from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_flat_dim, obs_to_array
+from rl_core.algorithms.native.zero_selfplay import (
+    attach_two_player,
+    chosen_discrete_action,
+    discrete_expand_slots,
+    discrete_policy_target,
+    interior_max_children,
+    mask_from_unwrapped_env,
+    masks_from_infos,
+    maybe_enable_two_player_from_infos,
+    sample_masked_action,
+    uniform_legal_policy,
+)
 from rl_core.algorithms.vec_env import (
     action_space as venv_action_space,
     num_envs_of,
@@ -979,6 +991,7 @@ class NativeEfficientZero(CustomAlgorithm):
         self.optimizer = torch.optim.Adam(self._params, lr=float(hyperparams.get("learning_rate", 2e-4)))
 
         self.gamma = float(hyperparams.get("gamma", 0.99))
+        attach_two_player(self, env)
         self.batch_size = int(hyperparams.get("batch_size", 64))
         self.unroll_steps = max(1, int(hyperparams.get("unroll_steps", 5)))
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
@@ -1045,7 +1058,12 @@ class NativeEfficientZero(CustomAlgorithm):
         log_probs = -0.5 * (((candidates - mean_np) ** 2) / var + np.log(2 * np.pi * var)).sum(axis=-1)
         return list(candidates), log_probs.astype(np.float64)
 
-    def search(self, obs_batch: np.ndarray, deterministic: np.ndarray | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        obs_batch: np.ndarray,
+        deterministic: np.ndarray | None = None,
+        action_masks: np.ndarray | None = None,
+    ) -> list[dict[str, Any]]:
         """Batched Gumbel search - `obs_batch`: `(B, *obs_shape)`. ALL B
         lanes' trees are searched together: one shared root
         representation/prediction pass, then `num_simulations` rounds
@@ -1068,13 +1086,22 @@ class NativeEfficientZero(CustomAlgorithm):
 
         n_slots = self.n_actions if self.discrete else self.num_sampled_actions
         num_top_actions = max(2, min(self.num_top_actions, n_slots))
+        discount = self.search_discount
+        interior_k = interior_max_children(int(self.n_actions or 0)) if self.discrete else None
         roots: list[_SearchNode] = []
         for i in range(batch_size):
             root = _SearchNode(prior=1.0)
             lstm0 = self.dynamics.initial_lstm_state(1, self.device)
             if self.discrete:
                 priors = root_logits[i].detach().cpu().numpy().astype(np.float64)
-                root.expand(priors, s0[i], 0.0, lstm0, True)
+                mask = None if action_masks is None else action_masks[i]
+                if mask is not None:
+                    child_priors, action_ids = discrete_expand_slots(
+                        priors, action_mask=mask, max_children=None, as_logits=True,
+                    )
+                    root.expand(child_priors, s0[i], 0.0, lstm0, True, candidate_actions=action_ids)
+                else:
+                    root.expand(priors, s0[i], 0.0, lstm0, True)
             else:
                 candidates, priors = self._sample_continuous_candidates(root_mean[i : i + 1], root_std[i : i + 1])
                 root.expand(priors, s0[i], 0.0, lstm0, True, candidate_actions=candidates)
@@ -1083,7 +1110,10 @@ class NativeEfficientZero(CustomAlgorithm):
             roots.append(root)
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
-        gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature
+        gumbel = [
+            np.random.gumbel(size=len(root.children)) * self.policy_target_temperature
+            for root in roots
+        ]
         schedule = _HalvingSchedule(self.num_simulations, num_top_actions)
         lstm_horizon = self.unroll_steps
 
@@ -1096,11 +1126,12 @@ class NativeEfficientZero(CustomAlgorithm):
                 root = roots[lane]
                 if sim_idx == 0:
                     scores = gumbel[lane] + np.array([c.prior for c in root.children])
-                    root.selected_children_idx = list(np.argsort(-scores)[:num_top_actions])
+                    keep = min(num_top_actions, len(root.children))
+                    root.selected_children_idx = list(np.argsort(-scores)[:keep])
                 node = root
                 path = [node]
                 while node.expanded():
-                    idx = _select_action(node, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
+                    idx = _select_action(node, minmax_list[lane], discount, self.c_visit, self.c_scale)
                     node = node.children[idx]
                     path.append(node)
                 parent = path[-2]
@@ -1108,7 +1139,9 @@ class NativeEfficientZero(CustomAlgorithm):
                 parent_states.append(parent.state)
                 parent_lstm_h.append(parent.lstm_state[0])
                 parent_lstm_c.append(parent.lstm_state[1])
-                chosen_actions.append(node.candidate_action if not self.discrete else parent.children.index(node))
+                chosen_actions.append(
+                    node.candidate_action if not self.discrete else chosen_discrete_action(node, parent)
+                )
                 search_paths.append(path)
 
             parent_states_t = torch.stack(parent_states, dim=0)
@@ -1137,28 +1170,37 @@ class NativeEfficientZero(CustomAlgorithm):
                 vp = float(value_prefix_scalar[lane].item())
                 if self.discrete:
                     priors = next_logits[lane].detach().cpu().numpy().astype(np.float64)
-                    leaf.expand(priors, next_s[lane], vp, (lh, lc), bool(reset_mask[lane]))
+                    if interior_k is not None:
+                        child_priors, action_ids = discrete_expand_slots(
+                            priors, max_children=interior_k, as_logits=True,
+                        )
+                        leaf.expand(
+                            child_priors, next_s[lane], vp, (lh, lc), bool(reset_mask[lane]),
+                            candidate_actions=action_ids,
+                        )
+                    else:
+                        leaf.expand(priors, next_s[lane], vp, (lh, lc), bool(reset_mask[lane]))
                 else:
                     candidates, priors = self._sample_continuous_candidates(
                         next_mean[lane : lane + 1], next_std[lane : lane + 1],
                     )
                     leaf.expand(priors, next_s[lane], vp, (lh, lc), bool(reset_mask[lane]), candidate_actions=candidates)
-                _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], self.gamma)
+                _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], discount)
 
             if schedule.maybe_advance(sim_idx):
                 for lane in range(batch_size):
                     _sequential_halving(
-                        roots[lane], gumbel[lane], minmax_list[lane], schedule.current_top, self.gamma, self.c_visit, self.c_scale,
+                        roots[lane], gumbel[lane], minmax_list[lane], schedule.current_top, discount, self.c_visit, self.c_scale,
                     )
 
         results: list[dict[str, Any]] = []
         for lane in range(batch_size):
             root = roots[lane]
-            transformed = _transformed_completed_qs(root, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
+            transformed = _transformed_completed_qs(root, minmax_list[lane], discount, self.c_visit, self.c_scale)
             improved = root.improved_policy(transformed)
             best_idx = int(root.selected_children_idx[0]) if root.selected_children_idx else int(np.argmax(improved))
             if self.discrete:
-                policy_target = improved.astype(np.float32)
+                policy_target = discrete_policy_target(root, improved, int(self.n_actions))
                 if det[lane]:
                     env_action: Any = int(np.argmax(policy_target))
                 else:
@@ -1204,7 +1246,7 @@ class NativeEfficientZero(CustomAlgorithm):
     # Training
     # ------------------------------------------------------------------
     def _train_step(self) -> dict[str, float]:
-        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.gamma)
+        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.search_discount)
         obs0 = torch.as_tensor(batch["obs0"], dtype=torch.float32, device=self.device)
         action = torch.as_tensor(batch["action"], dtype=torch.float32, device=self.device)
         reward = torch.as_tensor(batch["reward"], dtype=torch.float32, device=self.device)
@@ -1333,8 +1375,10 @@ class NativeEfficientZero(CustomAlgorithm):
     # ------------------------------------------------------------------
     def learn(self, total_timesteps: int, callback: TrainingCallback) -> None:
         n_envs = num_envs_of(self.env)
-        obs_list = vec_reset(self.env, seed=self.seed)
+        obs_list, infos = vec_reset(self.env, seed=self.seed, return_info=True)
+        maybe_enable_two_player_from_infos(self, infos)
         obs_arr = obs_batch_to_array(obs_list, self._obs_space)
+        action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
         ep_reward = np.zeros(n_envs, dtype=np.float64)
         ep_length = np.zeros(n_envs, dtype=np.int64)
         num_timesteps = 0
@@ -1344,13 +1388,14 @@ class NativeEfficientZero(CustomAlgorithm):
             action_flats: list[np.ndarray] = []
             policy_targets: list[np.ndarray] = []
             if num_timesteps < self.learning_starts:
-                for _ in range(n_envs):
-                    raw_action = self._action_space.sample()
-                    policy_target = (
-                        np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
-                        if self.discrete
-                        else np.asarray(raw_action, dtype=np.float32).reshape(-1)
-                    )
+                for lane in range(n_envs):
+                    mask = None if action_masks is None else action_masks[lane]
+                    if self.discrete:
+                        raw_action = sample_masked_action(self._action_space, mask)
+                        policy_target = uniform_legal_policy(int(self.n_actions), mask)
+                    else:
+                        raw_action = self._action_space.sample()
+                        policy_target = np.asarray(raw_action, dtype=np.float32).reshape(-1)
                     env_action = action_to_env(raw_action, self._action_space)
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
@@ -1359,16 +1404,18 @@ class NativeEfficientZero(CustomAlgorithm):
                 # One shared, batched `search()` call plans all `n_envs`
                 # lanes' trees together this real step (see module
                 # docstring) - not a Python loop over independent searches.
-                results = self.search(obs_arr, deterministic=None)
+                results = self.search(obs_arr, deterministic=None, action_masks=action_masks)
                 for result in results:
                     env_action = action_to_env(result["env_action"], self._action_space)
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
                     policy_targets.append(result["policy_target"])
 
-            next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, env_actions)
+            next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
+            maybe_enable_two_player_from_infos(self, infos)
             dones = terminated | truncated
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
             for lane in range(n_envs):
                 self.buffer.add(
                     obs_arr[lane], action_flats[lane], float(rewards[lane]), next_obs_arr[lane],
@@ -1425,7 +1472,9 @@ class NativeEfficientZero(CustomAlgorithm):
 
     def predict(self, obs: Any, deterministic: bool = True) -> tuple[Any, Any]:
         obs_arr = obs_to_array(obs, self._obs_space)
-        results = self.search(obs_arr[None], deterministic=np.array([deterministic]))
+        mask = mask_from_unwrapped_env(self.env, int(self.n_actions)) if self.discrete else None
+        action_masks = None if mask is None else mask[None]
+        results = self.search(obs_arr[None], deterministic=np.array([deterministic]), action_masks=action_masks)
         return action_to_env(results[0]["env_action"], self._action_space), None
 
     def save(self, path: Path) -> None:

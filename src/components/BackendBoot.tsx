@@ -30,10 +30,12 @@ function phaseLabel(phase: BootPhase): { title: string; detail: string; icon: Re
       return { title: 'Запуск контейнера', detail: 'Поднимаю контейнер бэкенда', icon: <PlayCircle className="h-6 w-6" /> }
     case 'waiting-container-health':
       return { title: 'Ожидание готовности', detail: `FastAPI внутри контейнера запускается (попытка ${phase.attempt})`, icon: <Heart className="h-6 w-6" /> }
+    case 'installing-python':
+      return { title: 'Установка Python', detail: phase.line ?? 'Скачиваю встроенный интерпретатор — системный Python не нужен', icon: <Package className="h-6 w-6" /> }
     case 'creating-venv':
       return { title: 'Настройка Python-окружения', detail: phase.line ?? 'Создаю изолированное виртуальное окружение (первый запуск)', icon: <Package className="h-6 w-6" /> }
     case 'installing-dependencies':
-      return { title: 'Установка зависимостей', detail: phase.line ?? 'Ставлю gymnasium / stable-baselines3 / torch — это может занять несколько минут при первом запуске', icon: <Package className="h-6 w-6" /> }
+      return { title: 'Установка зависимостей', detail: phase.line ?? 'Ставлю gymnasium / torch — это может занять несколько минут при первом запуске', icon: <Package className="h-6 w-6" /> }
     case 'starting-python':
       return { title: 'Запуск Python', detail: 'Нативный режим — запускаю uvicorn', icon: <Cpu className="h-6 w-6" /> }
     case 'python-starting':
@@ -95,14 +97,14 @@ export function BackendBoot({ children }: BackendBootProps) {
   useEffect(() => {
     if (backendOnline) return
     setTimeout20(false)
-    const isLongRunning = ['installing-dependencies', 'creating-venv', 'building-image', 'waiting-container-health'].includes(bootPhase.phase)
+    const isLongRunning = ['installing-python', 'installing-dependencies', 'creating-venv', 'building-image', 'waiting-container-health'].includes(bootPhase.phase)
     const timer = setTimeout(() => setTimeout20(true), isLongRunning ? 45_000 : 20_000)
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bootPhase, backendOnline])
 
   useEffect(() => {
-    if ((bootPhase.phase === 'building-image' || bootPhase.phase === 'creating-venv' || bootPhase.phase === 'installing-dependencies') && bootPhase.line) {
+    if ((bootPhase.phase === 'building-image' || bootPhase.phase === 'installing-python' || bootPhase.phase === 'creating-venv' || bootPhase.phase === 'installing-dependencies') && bootPhase.line) {
       setBuildLog((prev) => [...prev.slice(-200), bootPhase.line!])
     }
   }, [bootPhase])
@@ -116,7 +118,7 @@ export function BackendBoot({ children }: BackendBootProps) {
     return <SetupChoice gpus={bootPhase.gpus} busy={choosingSetup} onChoose={chooseSetupDevice} />
   }
 
-  const isBuilding = ['building-image', 'creating-venv', 'installing-dependencies'].includes(bootPhase.phase)
+  const isBuilding = ['building-image', 'installing-python', 'creating-venv', 'installing-dependencies'].includes(bootPhase.phase)
   const isDocker = ['checking-docker', 'docker-no-image', 'building-image', 'starting-container', 'waiting-container-health'].includes(bootPhase.phase)
 
   return (

@@ -1,26 +1,177 @@
 // Bootstraps a private virtual environment for the Native backend mode so
 // the app can genuinely "install everything it needs" on first run, instead
 // of assuming the user's system Python already has fastapi/gymnasium/torch.
-import { spawn, spawnSync } from 'child_process'
+//
+// The interpreter itself is resolved in this order:
+//   1. A real CPython 3.10+ already on the machine (PATH, Windows `py -3`
+//      launcher, common install dirs). The Microsoft Store `python.exe` stub
+//      is skipped — it opens the Store and is not a working interpreter.
+//   2. If nothing usable is found, a portable CPython from
+//      python-build-standalone is downloaded into `userData/python-runtime`
+//      and reused on later boots. That is what makes a Windows .exe install
+//      work without asking the user to install Python first.
+import { spawn, spawnSync, type SpawnSyncOptions } from 'child_process'
 import crypto from 'crypto'
 import fs from 'fs'
 import https from 'https'
 import path from 'path'
 
-export type PythonEnvPhase = 'creating-venv' | 'installing-dependencies'
+export type PythonEnvPhase = 'installing-python' | 'creating-venv' | 'installing-dependencies'
 
-function candidatePythonCommands(): string[] {
-  return process.platform === 'win32' ? ['python', 'py', 'python3'] : ['python3', 'python']
+/** Pinned portable CPython used when the machine has no usable interpreter. */
+export const MANAGED_CPYTHON_VERSION = '3.12.13'
+export const MANAGED_PYTHON_RELEASE = '20260325'
+
+const PROBE_CODE = 'import sys; assert sys.version_info >= (3, 10); print(sys.executable)'
+const DOWNLOAD_UA = 'reinforcement-studio'
+
+export function isWindowsStorePython(executable: string): boolean {
+  return /\\WindowsApps\\/i.test(executable)
 }
 
-export function resolveSystemPython(): string | null {
-  for (const cmd of candidatePythonCommands()) {
-    try {
-      const result = spawnSync(cmd, ['--version'], { stdio: 'pipe' })
-      if (result.status === 0) return cmd
-    } catch {
-      // try next candidate
+export function managedPythonTriple(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string | null {
+  if (platform === 'win32' && arch === 'x64') return 'x86_64-pc-windows-msvc'
+  if (platform === 'win32' && arch === 'arm64') return 'aarch64-pc-windows-msvc'
+  if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-gnu'
+  if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu'
+  if (platform === 'darwin' && arch === 'x64') return 'x86_64-apple-darwin'
+  if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin'
+  return null
+}
+
+export function managedPythonDownloadUrl(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string {
+  const triple = managedPythonTriple(platform, arch)
+  if (!triple) {
+    throw new Error(`Нет встроенного Python для ${platform}/${arch}`)
+  }
+  const name = `cpython-${MANAGED_CPYTHON_VERSION}+${MANAGED_PYTHON_RELEASE}-${triple}-install_only_stripped.tar.gz`
+  return `https://github.com/astral-sh/python-build-standalone/releases/download/${MANAGED_PYTHON_RELEASE}/${name}`
+}
+
+export function managedPythonInterpreterPath(
+  runtimeDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32'
+    ? path.join(runtimeDir, 'python', 'python.exe')
+    : path.join(runtimeDir, 'python', 'bin', 'python3')
+}
+
+function spawnDefaults(): SpawnSyncOptions {
+  return {
+    encoding: 'utf8',
+    timeout: 8_000,
+    windowsHide: true,
+    env: process.env,
+  }
+}
+
+function probePython(command: string, extraArgs: string[] = []): string | null {
+  if (path.isAbsolute(command) && !fs.existsSync(command)) return null
+  try {
+    const result = spawnSync(command, [...extraArgs, '-c', PROBE_CODE], spawnDefaults())
+    if (result.status !== 0) return null
+    const executable = String(result.stdout ?? '').trim().split(/\r?\n/).filter(Boolean).pop()
+    if (!executable) return null
+    if (isWindowsStorePython(executable)) return null
+    return executable
+  } catch {
+    return null
+  }
+}
+
+/** Windows packaged Electron often has a stripped PATH — call tar/where by
+ *  absolute System32 path so first-run Python extract still works. */
+export function tarExecutable(
+  platform: NodeJS.Platform = process.platform,
+  systemRoot: string = process.env.SystemRoot || 'C:\\Windows',
+  exists: (filePath: string) => boolean = fs.existsSync,
+): string {
+  if (platform === 'win32') {
+    const exe = path.join(systemRoot, 'System32', 'tar.exe')
+    if (exists(exe)) return exe
+  }
+  return 'tar'
+}
+
+function windowsWhereBin(): string {
+  const exe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'where.exe')
+  return fs.existsSync(exe) ? exe : 'where'
+}
+
+function unique(items: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of items) {
+    const key = item.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(item)
+  }
+  return out
+}
+
+function windowsWhere(name: string): string[] {
+  try {
+    const result = spawnSync(windowsWhereBin(), [name], spawnDefaults())
+    if (result.status !== 0 || !result.stdout) return []
+    return String(result.stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function windowsCandidateExecutables(): string[] {
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows'
+  const localAppData = process.env.LOCALAPPDATA
+  const programFiles = process.env.ProgramFiles
+  const userProfile = process.env.USERPROFILE
+  const versions = ['314', '313', '312', '311', '310']
+  const candidates: string[] = [
+    path.join(systemRoot, 'py.exe'),
+    path.join(systemRoot, 'System32', 'py.exe'),
+    ...windowsWhere('py'),
+    ...windowsWhere('python'),
+    ...windowsWhere('python3'),
+  ]
+  for (const root of [localAppData && path.join(localAppData, 'Programs', 'Python'), programFiles, 'C:\\']) {
+    if (!root) continue
+    for (const version of versions) {
+      candidates.push(path.join(root, `Python${version}`, 'python.exe'))
     }
+  }
+  if (userProfile) {
+    for (const distro of ['miniconda3', 'anaconda3', 'miniforge3']) {
+      candidates.push(path.join(userProfile, distro, 'python.exe'))
+    }
+  }
+  return unique(candidates.filter((item) => !isWindowsStorePython(item)))
+}
+
+/** Returns an absolute path to a working CPython 3.10+, or null. */
+export function resolveSystemPython(): string | null {
+  if (process.platform === 'win32') {
+    for (const candidate of windowsCandidateExecutables()) {
+      const extra = /(?:^|\\|\/)py(?:\.exe)?$/i.test(candidate) ? ['-3'] : []
+      const found = probePython(candidate, extra)
+      if (found) return found
+    }
+    return null
+  }
+
+  for (const command of ['python3', 'python']) {
+    const found = probePython(command)
+    if (found) return found
+  }
+  for (const candidate of ['/usr/bin/python3', '/usr/local/bin/python3']) {
+    const found = probePython(candidate)
+    if (found) return found
   }
   return null
 }
@@ -33,7 +184,7 @@ export function venvPythonPath(venvDir: string): string {
 
 function run(cmd: string, args: string[]): Promise<number> {
   return new Promise((resolve) => {
-    const proc = spawn(cmd, args, { stdio: 'ignore' })
+    const proc = spawn(cmd, args, { stdio: 'ignore', windowsHide: true })
     proc.on('error', () => resolve(1))
     proc.on('exit', (code) => resolve(code ?? 1))
   })
@@ -46,14 +197,26 @@ async function hasPip(pyExe: string): Promise<boolean> {
   return code === 0
 }
 
+function formatMb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`
+}
+
 /** Downloads a URL to a local file, following redirects. */
-function downloadFile(url: string, destPath: string, redirectsLeft = 5): Promise<void> {
+function downloadFile(
+  url: string,
+  destPath: string,
+  onProgress?: (received: number, total: number | null) => void,
+  redirectsLeft = 8,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: 30_000 }, (res) => {
+    const req = https.get(url, {
+      timeout: 30_000,
+      headers: { 'User-Agent': DOWNLOAD_UA, Accept: '*/*' },
+    }, (res) => {
       const status = res.statusCode ?? 0
       if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
         res.resume()
-        downloadFile(res.headers.location, destPath, redirectsLeft - 1).then(resolve, reject)
+        downloadFile(res.headers.location, destPath, onProgress, redirectsLeft - 1).then(resolve, reject)
         return
       }
       if (status !== 200) {
@@ -61,7 +224,13 @@ function downloadFile(url: string, destPath: string, redirectsLeft = 5): Promise
         reject(new Error(`HTTP ${status} while downloading ${url}`))
         return
       }
+      const total = Number(res.headers['content-length'] || 0) || null
+      let received = 0
       const file = fs.createWriteStream(destPath)
+      res.on('data', (chunk: Buffer) => {
+        received += chunk.length
+        onProgress?.(received, total)
+      })
       res.pipe(file)
       file.on('finish', () => file.close(() => resolve()))
       file.on('error', reject)
@@ -123,7 +292,7 @@ function runStreaming(
   timeoutMs = 120_000,
 ): Promise<number> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
     const forward = (buf: Buffer) => {
       const text = buf.toString()
       for (const line of text.split(/\r?\n/)) {
@@ -146,6 +315,73 @@ function runStreaming(
   })
 }
 
+function runtimeId(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
+  return `cpython-${MANAGED_CPYTHON_VERSION}+${MANAGED_PYTHON_RELEASE}-${managedPythonTriple(platform, arch) ?? 'unknown'}`
+}
+
+async function ensureManagedPython(
+  runtimeDir: string,
+  onProgress: (phase: PythonEnvPhase, line?: string) => void,
+): Promise<string> {
+  const pyExe = managedPythonInterpreterPath(runtimeDir)
+  const markerPath = path.join(runtimeDir, '.runtime-id')
+  const expectedId = runtimeId()
+  const installedId = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf-8').trim() : ''
+  if (installedId === expectedId && probePython(pyExe)) return pyExe
+
+  const triple = managedPythonTriple()
+  if (!triple) {
+    throw new Error(
+      `Python 3.10+ не найден, а для ${process.platform}/${process.arch} нет встроенного интерпретатора. ` +
+      'Установите Python с python.org и перезапустите приложение.',
+    )
+  }
+
+  onProgress('installing-python', `Скачиваю встроенный Python ${MANAGED_CPYTHON_VERSION}…`)
+  const stagingDir = `${runtimeDir}.staging`
+  fs.rmSync(stagingDir, { recursive: true, force: true })
+  fs.mkdirSync(stagingDir, { recursive: true })
+  const archivePath = path.join(stagingDir, 'python.tar.gz')
+  try {
+    let lastReported = 0
+    await downloadFile(managedPythonDownloadUrl(), archivePath, (received, total) => {
+      if (received - lastReported < 1024 * 1024 && !(total && received === total)) return
+      lastReported = received
+      const suffix = total ? ` из ${formatMb(total)}` : ''
+      onProgress('installing-python', `Скачиваю встроенный Python ${MANAGED_CPYTHON_VERSION}… ${formatMb(received)}${suffix}`)
+    })
+    onProgress('installing-python', 'Распаковываю интерпретатор…')
+    const tarCode = await runStreaming(tarExecutable(), ['-xf', archivePath, '-C', stagingDir], (line) => onProgress('installing-python', line), 60_000)
+    fs.rmSync(archivePath, { force: true })
+    if (tarCode !== 0) {
+      throw new Error('Не удалось распаковать встроенный Python (tar вернул ошибку).')
+    }
+    const stagedPython = managedPythonInterpreterPath(stagingDir)
+    if (!probePython(stagedPython)) {
+      throw new Error('Встроенный Python скачался, но не запускается.')
+    }
+    fs.rmSync(runtimeDir, { recursive: true, force: true })
+    fs.renameSync(stagingDir, runtimeDir)
+    fs.writeFileSync(path.join(runtimeDir, '.runtime-id'), expectedId)
+    return managedPythonInterpreterPath(runtimeDir)
+  } catch (err) {
+    fs.rmSync(stagingDir, { recursive: true, force: true })
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      `Не удалось установить встроенный Python (${detail}). Проверьте интернет и перезапустите приложение.`,
+    )
+  }
+}
+
+async function resolveBasePython(
+  runtimeDir: string,
+  onProgress: (phase: PythonEnvPhase, line?: string) => void,
+): Promise<string> {
+  const existing = resolveSystemPython()
+  if (existing) return existing
+  return ensureManagedPython(runtimeDir, onProgress)
+}
+
 export interface EnsurePythonEnvResult {
   pythonPath: string
 }
@@ -156,6 +392,9 @@ export interface EnsurePythonEnvResult {
  * files' content nor `extraPipArgs` (e.g. which CUDA wheel channel to pull
  * torch from) have changed since the last successful install (tracked via
  * a content hash).
+ *
+ * A working system Python is no longer required: if none is found, a
+ * portable CPython is downloaded next to the venv (`../python-runtime`).
  */
 export async function ensurePythonEnv(
   venvDir: string,
@@ -163,13 +402,6 @@ export async function ensurePythonEnv(
   onProgress: (phase: PythonEnvPhase, line?: string) => void,
   extraPipArgs: string[] = [],
 ): Promise<EnsurePythonEnvResult> {
-  const systemPython = resolveSystemPython()
-  if (!systemPython) {
-    throw new Error(
-      'Python 3 не найден в PATH. Установите Python 3.10+ (python.org) и перезапустите приложение.',
-    )
-  }
-
   const pyExe = venvPythonPath(venvDir)
   const existingFiles = requirementFiles.filter((f) => fs.existsSync(f))
   // extraPipArgs folded into the hash too: switching CUDA wheel channel
@@ -178,6 +410,7 @@ export async function ensurePythonEnv(
   // didn't change a single byte.
   const currentHash = requirementsHash(existingFiles) + ':' + extraPipArgs.join(' ')
   const markerPath = path.join(venvDir, '.deps-hash')
+  const runtimeDir = path.join(path.dirname(venvDir), 'python-runtime')
 
   // A previous run may have been interrupted (crash, force-quit, killed
   // process) partway through venv creation, leaving a `python3` binary in
@@ -191,6 +424,7 @@ export async function ensurePythonEnv(
   }
 
   if (!fs.existsSync(pyExe)) {
+    const basePython = await resolveBasePython(runtimeDir, onProgress)
     onProgress('creating-venv')
     fs.mkdirSync(path.dirname(venvDir), { recursive: true })
     // --system-site-packages lets the venv fall back to the base Python's
@@ -202,7 +436,7 @@ export async function ensurePythonEnv(
     // "clean" system Python, since pip still installs our packages into the
     // venv's own (isolated) site-packages, not the base one.
     await runStreaming(
-      systemPython,
+      basePython,
       ['-m', 'venv', '--system-site-packages', venvDir],
       (line) => onProgress('creating-venv', line),
       60_000,

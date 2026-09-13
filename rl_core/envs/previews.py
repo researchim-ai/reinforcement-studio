@@ -124,6 +124,8 @@ BUNDLED_SVG_PREVIEWS: dict[str, Path] = {
     "tic_tac_toe": PACKAGE_DIR / "envs" / "previews" / "tic_tac_toe.svg",
     "connect_four": PACKAGE_DIR / "envs" / "previews" / "connect_four.svg",
     "gomoku": PACKAGE_DIR / "envs" / "previews" / "gomoku.svg",
+    "chess": PACKAGE_DIR / "envs" / "previews" / "chess.svg",
+    "go_9x9": PACKAGE_DIR / "envs" / "previews" / "go_9x9.svg",
     "MemoryCorridor-v0": PACKAGE_DIR / "envs" / "previews" / "memory_corridor.svg",
     # Same task, just a longer delay — the static preview card doesn't need
     # to look different to be an accurate illustration.

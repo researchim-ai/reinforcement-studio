@@ -184,11 +184,19 @@ def validate_composite_spec(spec: dict[str, Any], expected_family: str | None = 
             raise NetworkSpecError("Для RoPE размер одной attention-head должен быть чётным")
         required = ("tokenizer", "heads")
         if family in {"researchimzero", "latentimzero"}:
-            dimensions["proj_dim"] = _positive_int(dimensions.get("proj_dim"), "proj_dim")
+            proj_dim = dimensions.get("proj_dim", 64)
+            if proj_dim is None:
+                proj_dim = 64
+            dimensions["proj_dim"] = _positive_int(proj_dim, "proj_dim")
             required += ("projector", "predictor")
 
     for name in required:
-        cfg = components.setdefault(name, _default_mlp([]))
+        default = (
+            _default_mlp([int(dimensions["proj_dim"])], batch_norm=True)
+            if name in ("projector", "predictor")
+            else _default_mlp([])
+        )
+        cfg = components.setdefault(name, default)
         hidden_sizes = cfg.setdefault("hidden_sizes", [])
         if not isinstance(hidden_sizes, list):
             raise NetworkSpecError(f"{name}.hidden_sizes должен быть списком")

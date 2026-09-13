@@ -28,6 +28,8 @@ class TestHasPreview:
 
     def test_true_for_bundled_svg_env(self):
         assert previews.has_preview("tic_tac_toe") is True
+        assert previews.has_preview("chess") is True
+        assert previews.has_preview("go_9x9") is True
 
     def test_true_for_custom_env_with_no_dedicated_asset(self):
         # None of this app's own from-scratch/wrapped envs have a Farama or

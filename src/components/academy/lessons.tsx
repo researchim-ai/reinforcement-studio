@@ -1,29 +1,29 @@
-import type { ReactNode } from 'react'
-import type { LucideIcon } from 'lucide-react'
 import {
-  Aperture, Brain, Combine, Compass, Crosshair, Database, Dices, Dna, Eye, GitBranch, GitFork,
-  GraduationCap, History, Layers, ListChecks, Moon, Network, Orbit, RefreshCw, Scale, Shuffle,
+  Aperture, Brain, Combine, Compass, Crosshair, Database, Dices, Dna, Eye, Gauge, GitBranch, GitFork,
+  History, Layers, ListChecks, Moon, Network, Orbit, RefreshCw, Scale, Shuffle,
   SlidersHorizontal, Sparkles, Split, Swords, Target, TrendingUp, Users, Waves, Zap,
 } from 'lucide-react'
 import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
+import { START_LESSONS } from '@/components/academy/tracks/start'
+import { FOUNDATION_LESSONS } from '@/components/academy/tracks/foundations'
+import { TABULAR_LESSONS } from '@/components/academy/tracks/tabular'
+import { POLICY_INTRO_LESSONS } from '@/components/academy/tracks/policyIntro'
+import { PRACTICE_LESSONS } from '@/components/academy/tracks/practice'
+import { LessonLink, type Lesson, lessonPath } from '@/components/academy/lessonShared'
 import {
-  AgentEnvLoopDiagram, Callout, DiscountChart, EpsilonDecayChart, Formula, FlowRow, GumbelHalvingDiagram,
-  ImaginationDiagram, LatentChainDiagram, MCTSTreeDiagram, MemoryTimelineDiagram, PaperLink, PomdpCompareDiagram,
-  PPOClipChart, Section, TokenAttentionDiagram, TwoHotBinsChart,
+  Callout, ClosedLoopDiagram, EpsilonDecayChart, Formula, FlowRow,
+  GumbelHalvingDiagram, ImaginationDiagram, LatentChainDiagram, MCTSTreeDiagram, MemoryTimelineDiagram,
+  PaperLink, PomdpCompareDiagram, PPOClipChart, Section, TokenAttentionDiagram, TwoHotBinsChart,
+  VocBudgetDiagram,
 } from './visuals'
 
-export interface Lesson {
-  id: string
-  title: string
-  tagline: string
-  icon: LucideIcon
-  group: string
-  badges: string[]
-  content: ReactNode
-}
+export type { Lesson }
+export { lessonPath }
 
 export const LESSON_GROUPS = [
+  'Старт',
   'Основы',
+  'Табличные методы',
   'Value-based (дискретные действия)',
   'Policy-gradient (актор-критик)',
   'Continuous control',
@@ -31,106 +31,9 @@ export const LESSON_GROUPS = [
   'World Models',
   'Multi-agent',
   'Продвинутое',
+  'Практика',
   'Итог',
 ] as const
-
-// ---------------------------------------------------------------------------
-// 1. Основы RL
-// ---------------------------------------------------------------------------
-
-const fundamentals: Lesson = {
-  id: 'fundamentals',
-  title: 'Основы RL: как агент учится',
-  tagline: 'MDP, ценность, скидка на будущее, разведка vs эксплуатация — на этом стоит всё остальное в курсе',
-  icon: GraduationCap,
-  group: 'Основы',
-  badges: ['MDP', 'Value function', 'Discount factor', 'Exploration'],
-  content: (
-    <>
-      <Section title="Цикл агент ↔ среда">
-        <p>
-          Всё в RL сводится к одному циклу: агент видит состояние sₜ, выбирает действие aₜ по своей
-          <b> политике</b> π(a|s), среда отвечает наградой rₜ₊₁ и новым состоянием sₜ₊₁. Повторить.
-          Всё, что отличает алгоритмы друг от друга — <i>что именно</i> они запоминают из этого потока
-          и <i>как</i> используют это, чтобы политика становилась лучше.
-        </p>
-        <AgentEnvLoopDiagram />
-      </Section>
-
-      <Section title="Марковский процесс принятия решений (MDP)">
-        <p>
-          Формально среда — это MDP: набор состояний S, действий A, функция переходов P(s'|s,a) и
-          функция награды R(s,a). «Марковость» значит одно важное допущение: sₜ содержит{' '}
-          <b>всё</b>, что нужно для принятия решения — прошлое не добавляет информации сверх текущего
-          состояния. Когда это не так (агент видит меньше, чем полное состояние), получается{' '}
-          <b>POMDP</b> — этому посвящён отдельный урок дальше в курсе. Каноническое изложение всей
-          этой математики — учебник{' '}
-          <PaperLink url="http://incompleteideas.net/book/RLbook2020.pdf">Sutton &amp; Barto, «Reinforcement Learning: An Introduction», 2018</PaperLink>{' '}
-          — почти всё в этом курсе в каком-то виде восходит к нему.
-        </p>
-      </Section>
-
-      <Section title="Ценность: почему одной награды недостаточно">
-        <p>
-          Награда за один шаг — слишком шумный сигнал: действие может быть плохим сейчас, но отличным
-          в перспективе (жертва фигурой в шахматах). Поэтому вводят <b>функцию ценности</b> — ожидаемую
-          сумму будущих наград:
-        </p>
-        <Formula caption="V(s) — «насколько хорошо быть в состоянии s»; Q(s,a) — «насколько хорошо выбрать действие a в состоянии s»">
-{`V(s) = E[ rₜ₊₁ + γrₜ₊₂ + γ²rₜ₊₃ + ... | sₜ = s ]
-Q(s,a) = E[ rₜ₊₁ + γrₜ₊₂ + ... | sₜ = s, aₜ = a ]`}
-        </Formula>
-        <p>Уравнение Беллмана переписывает это рекурсивно — ценность сейчас = награда + ценность потом:</p>
-        <Formula>{`Q(s,a) = E[ r + γ · max_a' Q(s',a') ]`}</Formula>
-        <p>
-          Это уравнение — фундамент DQN и всех его потомков (следующие два урока). Policy-gradient
-          методы (A2C, PPO, SAC) идут другим путём — учат V(s) как «подсказку», а саму политику π
-          двигают напрямую по градиенту награды.
-        </p>
-      </Section>
-
-      <Section title="Discount factor γ: насколько агент «терпелив»">
-        <p>
-          γ ∈ [0,1) определяет, сколько значит награда через t шагов: её вес — γᵗ. γ близкое к 1 —
-          агент почти не дисконтирует далёкое будущее («стратег»); γ близкое к 0 — считает только
-          немедленную награду («импульсивный»).
-        </p>
-        <DiscountChart />
-      </Section>
-
-      <Section title="Разведка vs эксплуатация (exploration vs exploitation)">
-        <p>
-          Если агент всегда выбирает действие, которое считает лучшим прямо сейчас, он никогда не
-          узнает, что где-то есть действие лучше — оценка Q/V ещё не точна на старте обучения. Каждый
-          алгоритм в этом курсе решает эту дилемму по-своему:
-        </p>
-        <ul className="ml-4 list-disc space-y-1">
-          <li><b>DQN / Rainbow DQN</b> — ε-greedy: с вероятностью ε действие случайное, иначе жадное по Q.</li>
-          <li><b>PPO / A2C</b> — политика сама по себе стохастическая (распределение над действиями) + entropy-бонус, который штрафует за слишком «уверенную» (детерминированную) политику.</li>
-          <li><b>SAC</b> — разведка встроена в саму цель обучения: максимизируется награда <i>и</i> энтропия политики одновременно.</li>
-          <li><b>AlphaZero</b> — MCTS с UCB-подобным бонусом за редко посещённые ходы (см. урок про AlphaZero).</li>
-        </ul>
-      </Section>
-
-      <Section title="On-policy vs off-policy — почему это важно для дизайна эксперимента">
-        <p>
-          <b>Off-policy</b> (DQN, Rainbow DQN, SAC) может учиться на старых данных из replay-буфера —
-          собранных давно устаревшей политикой — поэтому обычно сэмпл-эффективнее. <b>On-policy</b> (PPO,
-          A2C) должен использовать данные, собранные (примерно) текущей политикой — буфер каждый раз
-          собирается заново и выбрасывается после обновления, зато обучение стабильнее и проще
-          настраивать.
-        </p>
-      </Section>
-
-      <Callout tone="tip" title="Как проходить курс">
-        Дальше — по одному уроку на алгоритм, от простого DQN до AlphaZero, а в конце — отдельные уроки
-        про память (LSTM/GRU) и про POMDP-среды, где эта память реально нужна. Каждый урок содержит ту
-        же схему «как учится», что вы видите в Дизайнере экспериментов и в Мониторинге — она не
-        абстрактная иллюстрация, а буквально то, что происходит в вашем запуске.
-      </Callout>
-    </>
-  ),
-}
 
 // ---------------------------------------------------------------------------
 // 2. DQN
@@ -151,6 +54,14 @@ const dqn: Lesson = {
         hyperparams={{ exploration_fraction: 0.2, buffer_size: 50_000, batch_size: 64, gamma: 0.99, target_update_interval: 1_000 }}
         show={{ network: false }}
       />
+
+      <Callout tone="tip" title="Если это первый глубокий алгоритм в курсе">
+        DQN — нейросетевой <LessonLink id="td_learning">Q-learning</LessonLink>
+        {' '}плюс replay и target-сеть. Имеет смысл уже знать{' '}
+        <LessonLink id="value_functions">Беллмана</LessonLink>,{' '}
+        <LessonLink id="explore_exploit">ε-greedy</LessonLink>
+        {' '}и <LessonLink id="on_off_policy">off-policy</LessonLink>. Иначе трюки ниже кажутся произвольными.
+      </Callout>
 
       <Section title="Идея">
         <p>
@@ -353,6 +264,12 @@ const a2c: Lesson = {
         hyperparams={{ n_steps: 5, gamma: 0.99, ent_coef: 0.01 }}
         show={{ network: false }}
       />
+
+      <Callout tone="tip" title="Откуда берётся этот градиент">
+        A2C — практичный наследник <LessonLink id="reinforce">REINFORCE</LessonLink>:
+        вместо полного возврата G критик даёт advantage, rollout короткий. Если log π · A ещё не
+        читали, начните с того урока.
+      </Callout>
 
       <Section title="Идея: двигаем политику напрямую">
         <p>
@@ -884,7 +801,7 @@ const worldModelsOverview: Lesson = {
   tagline: 'Учим модель динамики среды, чтобы «репетировать» внутри неё вместо того, чтобы каждый раз идти в настоящую среду',
   icon: Orbit,
   group: 'World Models',
-  badges: ['Model-based RL', 'Dreamer', 'MBPO/PETS', 'World Models (Ha)', 'EfficientZero V2'],
+  badges: ['Model-based RL', 'Dreamer', 'MBPO/PETS', 'World Models (Ha)', 'MuZero-family'],
   content: (
     <>
       <Section title="Model-free vs. model-based: чем world model отличается от всего курса до сих пор">
@@ -909,7 +826,7 @@ const worldModelsOverview: Lesson = {
         </p>
       </Section>
 
-      <Section title="Три семейства world models в этом приложении — один и тот же конструктор «World Models», разные архитектуры">
+      <Section title="Три архитектуры в конструкторе World Models — и отдельно линейка поиска">
         <p>
           На странице <b>World Models</b> (отдельный раздел навигации, аналог Network Builder) можно
           создать спецификацию одного из трёх типов и обучить её как самостоятельный артефакт —
@@ -945,13 +862,16 @@ const worldModelsOverview: Lesson = {
           </li>
         </ul>
         <p>
-          Четвёртый алгоритм этой группы, <b>EfficientZero V2</b> (
+          Четвёртое семейство живёт не в World Model Builder, а внутри самих алгоритмов поиска.
+          <b> EfficientZero V2</b> (
           <PaperLink url="https://arxiv.org/abs/2403.00564">Wang et al., ICML 2024</PaperLink>),
-          не подключается к World Model Builder — у него нет отдельно переиспользуемого артефакта
-          «модель мира»: representation/dynamics/prediction сети настолько тесно связаны с его
-          собственными policy/value-головами и поиском, что переиспользовать их отдельно (как
-          RSSM/ансамбль/VAE+MDN-RNN переиспользуются между несколькими алгоритмами выше) не имеет
-          смысла — см. отдельный урок.
+          <b>UniZero</b> (
+          <PaperLink url="https://arxiv.org/abs/2406.10667">Pu et al., ICLR 2025</PaperLink>),
+          наша <b>ResearchImZero</b> и <b>LatentImZero</b> не отдают переиспользуемый артефакт
+          «модель мира»: representation/динамика/головы слишком тесно связаны с поиском, чтобы
+          подставить RSSM от Dreamer. Смысл тот же — дешёвое воображение вместо лишнего
+          <code>env.step()</code> — но механизм другой: на каждом реальном шаге строится маленькое
+          дерево по выученной модели, и действие берётся из improved policy этого дерева.
         </p>
       </Section>
 
@@ -975,10 +895,10 @@ const worldModelsOverview: Lesson = {
         Network Builder подключаются к любому алгоритму.
       </Callout>
 
-      <Callout tone="tip" title="Дальше — по одному уроку на каждый из пяти алгоритмов">
-        Следующие четыре урока разбирают Dreamer, MBPO+PETS, World Models (Ha) и EfficientZero V2
-        детально — что именно внутри каждого world model, как он обучается и как именно его
-        воображение (или поиск) превращается в поведение агента.
+      <Callout tone="tip" title="Дальше — по одному уроку на каждый алгоритм этой группы">
+        Сначала три «классических» world model, которые живут в конструкторе World Models: Dreamer,
+        MBPO+PETS, World Models (Ha). Затем линейка поиска по выученной модели: EfficientZero V2,
+        UniZero, наша ResearchImZero и LatentImZero (ядро Research + learned compute).
       </Callout>
     </>
   ),
@@ -1110,6 +1030,20 @@ const mbpoPets: Lesson = {
         <PaperLink url="https://arxiv.org/abs/1906.08253">Janner et al., 2019</PaperLink>) как
         источник дополнительных данных для SAC, и PETS напрямую для планирования без всякой политики.
       </p>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <AlgorithmDiagram
+          algorithmId="mbpo"
+          kind="gym"
+          hyperparams={{ model_train_freq: 250, rollout_length: 1, real_ratio: 0.1, train_freq: 1 }}
+          show={{ network: false }}
+        />
+        <AlgorithmDiagram
+          algorithmId="pets"
+          kind="gym"
+          hyperparams={{ model_train_freq: 250, cem_horizon: 15, cem_candidates: 400 }}
+          show={{ network: false }}
+        />
+      </div>
 
       <Section title="Ансамбль вероятностных моделей — откуда берётся неопределённость">
         <p>
@@ -1636,6 +1570,246 @@ const unizero: Lesson = {
         сэмплированным переходом) — эпизоды и так хранятся целиком, так что это просто срез массива, а не
         отдельное хранилище.
       </Callout>
+
+      <Callout tone="tip" title="Дальше — наша версия этой линейки">
+        UniZero в приложении — близкий к статье рецепт. Следующий урок, <LessonLink id="researchimzero">ResearchImZero</LessonLink>,
+        берёт ту же Transformer-модель мира и добавляет то, чего в оригинале нет: closed-loop
+        overshooting, streaming replay и адаптивный бюджет поиска. Ещё через урок —{' '}
+        <LessonLink id="latentimzero">LatentImZero</LessonLink>, который учится, <i>сколько</i> поиска
+        вообще стоит тратить.
+      </Callout>
+    </>
+  ),
+}
+
+// ---------------------------------------------------------------------------
+// 7f3. ResearchImZero — наша версия UniZero
+// ---------------------------------------------------------------------------
+
+const researchimzero: Lesson = {
+  id: 'researchimzero',
+  title: 'ResearchImZero (наша версия UniZero)',
+  tagline: 'Архитектура UniZero + тренировочный рецепт EfficientZero, плюс closed-loop overshooting, streaming replay и адаптивный бюджет поиска',
+  icon: Compass,
+  group: 'World Models',
+  badges: ['Наш алгоритм', 'Transformer world model', 'Gumbel search', 'Дискретные и continuous'],
+  content: (
+    <>
+      <AlgorithmDiagram
+        algorithmId="researchimzero"
+        kind="gym"
+        hyperparams={{
+          context_length: 6, num_simulations: 32, num_simulations_initial: 8,
+          unroll_steps: 5, closed_loop_horizon: 3, reanalyze_freq: 200,
+        }}
+        show={{ network: false }}
+      />
+
+      <p className="text-[13px] text-muted-foreground">
+        ResearchImZero — не третья статья из линейки MuZero, а <b>наш</b> алгоритм в Дизайнере.
+        Каркас тот же, что у <LessonLink id="unizero">UniZero</LessonLink>: causal Transformer над
+        токенами <code>[obs, act, obs, act, …]</code>, RoPE, персистентный KV-cache, SimSiam
+        consistency, Gumbel-поиск. Рецепт обучения ближе к{' '}
+        <LessonLink id="efficientzero">EfficientZero</LessonLink>: PER, reanalyze, категориальные
+        value/reward-головы. Сверху — то, чего нет ни в одной из двух статей.
+      </p>
+
+      <Section title="Что взято как есть, а что добавлено">
+        <div className="overflow-x-auto rounded-lg border border-border/70">
+          <table className="w-full min-w-[560px] text-left text-[12px]">
+            <thead className="bg-muted/50 text-[11px] uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2">Ось</th>
+                <th className="px-3 py-2">EfficientZero</th>
+                <th className="px-3 py-2">UniZero</th>
+                <th className="px-3 py-2">ResearchImZero</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ['Динамика', 'LSTM/MLP, один вектор s', 'Transformer, явные токены', 'как UniZero'],
+                ['Поиск', 'Gumbel, фиксированный B', 'Gumbel, фиксированный B', 'Gumbel, B растёт с качеством модели'],
+                ['Обучение unroll', 'только teacher forcing', 'teacher forcing по всей траектории', 'teacher forcing + closed-loop на своих ẑ'],
+                ['Replay', 'PER + reanalyze', 'PER + reanalyze + контекст', 'то же + recent window + success pool'],
+                ['Value target', 'max(TD, search)', 'max(TD, search)', 'смесь (1−λ)TD + λ·search, λ ≤ 0.25'],
+              ].map(([axis, ez, uni, riz]) => (
+                <tr key={axis} className="border-t border-border/50">
+                  <td className="px-3 py-2 font-medium">{axis}</td>
+                  <td className="px-3 py-2 text-muted-foreground">{ez}</td>
+                  <td className="px-3 py-2 text-muted-foreground">{uni}</td>
+                  <td className="px-3 py-2 text-muted-foreground">{riz}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="Closed-loop overshooting: учить тот путь, которым ходит поиск">
+        <p>
+          Teacher forcing видит настоящие следующие наблюдения. Поиск — нет: раскрывая узел, он
+          подставляет <i>свой</i> предсказанный latent-токен и идёт дальше. Если учить только
+          teacher-forced путь, голова <code>latent</code> хорошо работает, пока следующий obs уже
+          есть во входе, и разваливается в дереве. Closed-loop на доле батча (по умолчанию 25%)
+          прогоняет <code>_step_imagine</code> на горизонт 3–5 и считает reward/value/latent loss
+          уже на собственных ẑ. Вес шага затухает как <code>0.8ᵏ</code>, горизонт растёт, когда
+          EMA ошибки латента низкая.
+        </p>
+        <ClosedLoopDiagram />
+        <Formula caption="closed_loop_loss_coef = 0.5; это отдельный сигнал, consistency на teacher-forced пути остаётся">
+{`ẑₖ₊₁ = latent(h_actₖ)          # нет настоящего next_obs
+loss_cl = CE(reward, ẑ) + CE(value, ẑ) + SimSiam(ẑ, tokenizer(next_obs).detach())`}
+        </Formula>
+      </Section>
+
+      <Section title="Адаптивный бюджет поиска">
+        <p>
+          В начале обучения модель мира ещё врёт — глубокий Gumbel-поиск по ней хуже, чем сам актор.
+          Поэтому старт с <code>num_simulations_initial = 8</code>, выход на полный
+          <code>num_simulations = 32</code> за <code>search_ramp_steps</code>, и отдельно — гейт по
+          ошибке модели: если EMA consistency/latent-error высокая, бюджет режется к минимуму.
+          Это не VoC из следующего урока: расписание и ошибка модели, без обученного классификатора
+          «стоит ли ещё один чекпоинт».
+        </p>
+      </Section>
+
+      <Section title="Streaming replay и value target без max(TD, search)">
+        <p>
+          Батч собирается не из одного PER. По умолчанию половина — свежее окно на каждую среду
+          (512 переходов), часть — success pool (верхний квантиль return), остальное — PER с
+          α=1 и β, который аннилится 0.4→1. Приоритет: |V − V_target| плюс вклад ошибки политики.
+          Reanalyze каждые 200 шагов пересчитывает policy target и search value; search value
+          старше 5 поколений в TD-цель не берётся.
+        </p>
+        <Formula caption="Convex mix вместо max(TD, search): max давал всплеск value и потом деградацию">
+{`V_TD  = R_{t:t+n} + γⁿ · V_EMA(s_{t+n} | context)
+V_tgt = (1 − λ) · V_TD + λ · V_search     λ ≤ 0.25, и только если search value свежий`}
+        </Formula>
+        <Callout tone="info" title="Bootstrap видит тот же контекст, что и голова">
+          EMA-копия сети (Polyak θ) оценивает landing state не голым одним токеном, а в том же
+          окне истории, в котором учится online-голова. Иначе n-step target смотрит на другое
+          представление, чем value-loss — и TD «плывёт».
+        </Callout>
+      </Section>
+
+      <Callout tone="good" title="Когда брать ResearchImZero, а не UniZero/EfficientZero">
+        Дефолт в этой линейке приложения, если нужен Transformer-world-model с поиском и вы готовы
+        платить compute поиска. EfficientZero — если хочется рекуррентную динамику и value-prefix
+        LSTM. UniZero — если нужен более «бумажный» рецепт без closed-loop и adaptive budget.
+        Картинки и векторы, discrete и continuous — все четыре Zero-алгоритма это умеют.
+      </Callout>
+
+      <Callout tone="tip" title="Следующий урок — сколько поиска вообще нужно">
+        ResearchImZero всё ещё крутит (адаптивно, но принудительно) поиск на каждом шаге после
+        разгона. <LessonLink id="latentimzero">LatentImZero</LessonLink> оставляет это ядро как есть
+        и добавляет изолированный контроллер: остановиться на акторе, на 4, на 16 или идти до 32.
+      </Callout>
+    </>
+  ),
+}
+
+// ---------------------------------------------------------------------------
+// 7f4. LatentImZero — optional learned search
+// ---------------------------------------------------------------------------
+
+const latentimzero: Lesson = {
+  id: 'latentimzero',
+  title: 'LatentImZero: поиск как learned compute',
+  tagline: 'То же ядро ResearchImZero, плюс изолированные sidecar’ы: uncertainty-зонд и VoC, который решает, сколько симуляций потратить',
+  icon: Gauge,
+  group: 'World Models',
+  badges: ['Наш алгоритм', 'Value of Computation', 'Sidecar isolation', 'Дискретные и continuous'],
+  content: (
+    <>
+      <AlgorithmDiagram
+        algorithmId="latentimzero"
+        kind="gym"
+        hyperparams={{ context_length: 6, num_simulations: 32 }}
+        show={{ network: false }}
+      />
+
+      <p className="text-[13px] text-muted-foreground">
+        LatentImZero — наследник <LessonLink id="researchimzero">ResearchImZero</LessonLink>, не
+        отдельная модель мира. Transformer, Gumbel, teacher forcing, closed-loop — те же. Поверх
+        три изолированных расширения: uncertainty-зонд, path consistency и контроллер ширины поиска
+        (value-of-computation). Ядро не получает градиентов от sidecar-оптимизаторов.
+        <code> force_research_mode=1</code> выключает все три и даёт побитово тот же ResearchImZero.
+      </p>
+
+      <Section title="Изоляция: sidecar видит только detach()">
+        <FlowRow
+          items={[
+            { icon: History, title: 'Ядро Research', detail: 'Transformer + heads + SimSiam, свой Adam' },
+            { icon: Sparkles, title: 'Uncertainty probe', detail: '2 bootstrap-головы на detach(h)' },
+            { icon: Gauge, title: 'VoC-классификатор', detail: 'P(CONTINUE), свой Adam' },
+          ]}
+        />
+        <p>
+          Зонд и VoC читают скрытые состояния с <code>.detach()</code>. Их Adam не пересекается с
+          Adam ядра. Единственный <i>дополнительный</i> лосс, который трогает value-голову ядра —
+          path consistency вдоль unroll: <code>V(sₖ) ≈ rₖ + γ V(sₖ₊₁)</code>. Это не «ещё один
+          world model» и не стохастический prior/actor/critic — старый выдуманный каркас из
+          ранних черновиков приложения сюда не относится.
+        </p>
+      </Section>
+
+      <Section title="Один планировщик, четыре чекпоинта — не четыре поиска">
+        <p>
+          Gumbel-шум, корневые кандидаты и расписание Sequential Halving сэмплируются <b>один раз</b>{' '}
+          на потолок 32 симуляций. Чекпоинт B ∈ {'{0, 4, 16, 32}'} — состояние <i>того же</i> дерева
+          после B expansion. Стадия 0 — чистый актор, без модели. VoC на каждом ребре stage →
+          stage+1 выдаёт P(CONTINUE); порог 0.5. Действие в среду берётся с <i>исполненного</i>
+          чекпоинта, не с предсказанного.
+        </p>
+        <VocBudgetDiagram />
+        <Formula caption="Вход VoC: concat(root_hidden.detach(), 7 скаляров) — энтропия актора, индекс стадии, spent/max, эпистемическая неопределённость корня, ambiguity политики">
+{`requested = STOP, если P(CONTINUE | stage → stage+1) < 0.5
+permitted = max(requested, safety_floor)     # нельзя ниже открытой стадии
+executed  = сколько expansion реально сделали`}
+        </Formula>
+      </Section>
+
+      <Section title="Shadow, audit, safety floor — почему поиск не схлопывается в актора">
+        <ul className="ml-4 list-disc space-y-1">
+          <li>
+            <b>Shadow</b> (старт): всегда <code>executed = 32</code>, VoC только предсказывает.
+            После первого успешного unlock shadow выключается навсегда.
+          </li>
+          <li>
+            <b>Audit</b> (5% случайных + 5% по uncertainty): форсирует полный бюджет, чтобы собрать
+            честные метки CONTINUE/STOP. Eval и reanalyze всегда идут на полном бюджете, VoC там
+            не учится и не двигает safety.
+          </li>
+          <li>
+            <b>Unlock</b> ребра (actor→small, small→medium, medium→max) требует серию безопасных
+            проверок: достаточно меток и аудитов, precision STOP ≥ 0.8, premature exceedance ниже
+            порога. Relock, если уже открытая стадия регрессирует.
+          </li>
+        </ul>
+        <Callout tone="warning" title="Не ждите экономии compute в первые десятки тысяч шагов">
+          Пока shadow включён, стоимость поиска равна ResearchImZero на полном бюджете. Экономия
+          появляется только после unlock — и только на тех стадиях, где классификатор доказал, что
+          ранняя остановка не хуже полного дерева. Если кривая награды должна совпасть с Research —
+          включите <code>force_research_mode</code>.
+        </Callout>
+      </Section>
+
+      <Section title="Uncertainty-зонд: недоверие модели, не второй world model">
+        <p>
+          Два bootstrap-члена с reward- и value-головами на <code>detach(h)</code>. Расхождение
+          членов — оценка эпистемической неопределённости, она же попадает в скаляры VoC как
+          <code>root_epistemic</code>. Зонд <b>не</b> пишет в replay reward и <b>не</b> даёт
+          градиент в ядро. Может консервативно добавить search-only бонус к ребру дерева
+          (warmup → ramp → anneal) или чуть расширить число симуляций на Research-пути; на VoC-пути
+          ширину задаёт только VoC.
+        </p>
+      </Section>
+
+      <Callout tone="good" title="Когда брать LatentImZero, а не ResearchImZero">
+        Когда один шаг Gumbel-поиска дорогой (длинный контекст, картинки, большой support), а актор
+        уже часто прав — имеет смысл учить, <i>когда</i> дерево не нужно. Для воспроизведения
+        Research и для коротких прогонов, где shadow не успеет сняться, берите ResearchImZero.
+      </Callout>
     </>
   ),
 }
@@ -1804,6 +1978,13 @@ const ippo: Lesson = {
   badges: ['Multi-agent', 'On-policy', 'Только Scene Builder'],
   content: (
     <>
+      <AlgorithmDiagram
+        algorithmId="ippo"
+        kind="gym"
+        hyperparams={{ n_steps: 512, batch_size: 64, gamma: 0.99 }}
+        show={{ network: false }}
+      />
+
       <Section title="Independent Learning — самый простой рецепт MARL">
         <p>
           IPPO не вводит ничего принципиально нового поверх PPO (см. соответствующий урок) — он
@@ -1872,6 +2053,13 @@ const qmix: Lesson = {
   badges: ['Multi-agent', 'Off-policy', 'Value decomposition', 'Только discrete + Scene Builder'],
   content: (
     <>
+      <AlgorithmDiagram
+        algorithmId="qmix"
+        kind="gym"
+        hyperparams={{ exploration_final_eps: 0.05, buffer_size: 50_000, mixing_embed_dim: 32, target_update_interval: 200 }}
+        show={{ network: false }}
+      />
+
       <Section title="Идея: общая Q-сеть на команду + монотонный mixer">
         <p>
           QMIX (<PaperLink url="https://arxiv.org/abs/1803.11485">Rashid et al., 2018</PaperLink>) —
@@ -2491,6 +2679,7 @@ const wrappers: Lesson = {
 
 interface CheatRow {
   name: string
+  lessonId: string
   kind: string
   policy: string
   actions: string
@@ -2499,22 +2688,25 @@ interface CheatRow {
 }
 
 const CHEAT_ROWS: CheatRow[] = [
-  { name: 'DQN', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'Простой бейзлайн на дискретных действиях' },
-  { name: 'Rainbow DQN', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'То же, что DQN, но почти всегда лучше; +QR-DQN для полного Rainbow' },
-  { name: 'A2C', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Быстрый дёшевый бейзлайн' },
-  { name: 'PPO', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Рекомендуемый дефолт почти всегда' },
-  { name: 'SAC', kind: 'Actor-Critic', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Continuous-задачи, нужна сэмпл-эффективность' },
-  { name: 'DDPG', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Простой бейзлайн для сравнения с TD3/SAC' },
-  { name: 'TD3', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Надёжный дефолт для (почти) детерминированной динамики' },
-  { name: 'Evolution Strategies', kind: 'Gradient-free (чёрный ящик)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Разреженная/недифференцируемая награда, нужна простота' },
-  { name: 'AlphaZero', kind: 'Planning + self-play', policy: '—', actions: 'Дискретные (доска)', memory: 'нет', when: 'Настольные игры с полной информацией' },
-  { name: 'Dreamer', kind: 'Model-based (RSSM)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Дорогой/медленный env.step() — учим actor-critic в воображении' },
-  { name: 'MBPO', kind: 'Model-based (Ensemble) + SAC', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'SAC + короткие модельные rollouts для сэмпл-эффективности' },
-  { name: 'PETS', kind: 'Model-based (Ensemble) + планирование', policy: '—', actions: 'Только continuous', memory: 'нет', when: 'Прямое CEM-планирование без обучаемой политики' },
-  { name: 'World Models (Ha)', kind: 'Model-based (VAE+MDN-RNN) + ES', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Классический рецепт: сжать → предсказать → крошечный ES-контроллер' },
-  { name: 'EfficientZero V2', kind: 'Model-based (MuZero-family) + Gumbel search', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Планирование бюджетированным поиском на каждом шаге, без готового World Model артефакта' },
-  { name: 'IPPO', kind: 'Actor-Critic (multi-agent)', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Многокомандные сцены Scene Builder или бенчмарки PettingZoo' },
-  { name: 'QMIX', kind: 'Value decomposition (multi-agent)', policy: 'Off-policy', actions: 'Только дискретные', memory: 'нет', when: 'Кооперация 2+ агентов (1 команда или больше), дискретное движение; единственный вариант для SMAC(lite)' },
+  { name: 'DQN', lessonId: 'dqn', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'Простой бейзлайн на дискретных действиях' },
+  { name: 'Rainbow DQN', lessonId: 'rainbow_dqn', kind: 'Value-based', policy: 'Off-policy', actions: 'Дискретные', memory: 'да', when: 'То же, что DQN, но почти всегда лучше; +QR-DQN для полного Rainbow' },
+  { name: 'A2C', lessonId: 'a2c', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Быстрый дёшевый бейзлайн' },
+  { name: 'PPO', lessonId: 'ppo', kind: 'Actor-Critic', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Рекомендуемый дефолт почти всегда' },
+  { name: 'SAC', lessonId: 'sac', kind: 'Actor-Critic', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Continuous-задачи, нужна сэмпл-эффективность' },
+  { name: 'DDPG', lessonId: 'ddpg', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Простой бейзлайн для сравнения с TD3/SAC' },
+  { name: 'TD3', lessonId: 'td3', kind: 'Actor-Critic (детерминир.)', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'Надёжный дефолт для (почти) детерминированной динамики' },
+  { name: 'Evolution Strategies', lessonId: 'es', kind: 'Gradient-free (чёрный ящик)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Разреженная/недифференцируемая награда, нужна простота' },
+  { name: 'AlphaZero', lessonId: 'alphazero', kind: 'Planning + self-play', policy: '—', actions: 'Дискретные (доска)', memory: 'нет', when: 'Настольные игры с полной информацией' },
+  { name: 'Dreamer', lessonId: 'dreamer', kind: 'Model-based (RSSM)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Дорогой/медленный env.step() — учим actor-critic в воображении' },
+  { name: 'MBPO', lessonId: 'mbpo_pets', kind: 'Model-based (Ensemble) + SAC', policy: 'Off-policy', actions: 'Только continuous', memory: 'нет', when: 'SAC + короткие модельные rollouts для сэмпл-эффективности' },
+  { name: 'PETS', lessonId: 'mbpo_pets', kind: 'Model-based (Ensemble) + планирование', policy: '—', actions: 'Только continuous', memory: 'нет', when: 'Прямое CEM-планирование без обучаемой политики' },
+  { name: 'World Models (Ha)', lessonId: 'world_models_ha', kind: 'Model-based (VAE+MDN-RNN) + ES', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Классический рецепт: сжать → предсказать → крошечный ES-контроллер' },
+  { name: 'EfficientZero V2', lessonId: 'efficientzero', kind: 'Model-based (MuZero-family) + Gumbel search', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Планирование бюджетированным поиском на каждом шаге, рекуррентная динамика' },
+  { name: 'UniZero', lessonId: 'unizero', kind: 'Model-based (Transformer) + Gumbel search', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'То же, но явная история токенов вместо одного вектора состояния' },
+  { name: 'ResearchImZero', lessonId: 'researchimzero', kind: 'Наш MuZero-family (Transformer)', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Дефолт Zero-линейки: UniZero + closed-loop + adaptive search' },
+  { name: 'LatentImZero', lessonId: 'latentimzero', kind: 'ResearchImZero + learned compute', policy: '—', actions: 'Discrete + continuous', memory: 'нет', when: 'Дорогой поиск: учить, когда дерево не нужно (после shadow-разгона)' },
+  { name: 'IPPO', lessonId: 'ippo', kind: 'Actor-Critic (multi-agent)', policy: 'On-policy', actions: 'Discrete + continuous', memory: 'да', when: 'Многокомандные сцены Scene Builder или бенчмарки PettingZoo' },
+  { name: 'QMIX', lessonId: 'qmix', kind: 'Value decomposition (multi-agent)', policy: 'Off-policy', actions: 'Только дискретные', memory: 'нет', when: 'Кооперация 2+ агентов (1 команда или больше), дискретное движение; единственный вариант для SMAC(lite)' },
 ]
 
 const cheatsheet: Lesson = {
@@ -2542,7 +2734,7 @@ const cheatsheet: Lesson = {
             <tbody>
               {CHEAT_ROWS.map((row) => (
                 <tr key={row.name} className="border-t border-border/50">
-                  <td className="px-3 py-2 font-medium">{row.name}</td>
+                  <td className="px-3 py-2"><LessonLink id={row.lessonId}>{row.name}</LessonLink></td>
                   <td className="px-3 py-2 text-muted-foreground">{row.kind}</td>
                   <td className="px-3 py-2 text-muted-foreground">{row.policy}</td>
                   <td className="px-3 py-2 text-muted-foreground">{row.actions}</td>
@@ -2557,6 +2749,7 @@ const cheatsheet: Lesson = {
 
       <Section title="Быстрое дерево решений">
         <ul className="ml-4 list-disc space-y-1">
+          <li>Вы ещё не запускали ничего → <b>CartPole + PPO</b> (урок «Первый эксперимент»), потом читайте основы, не наоборот.</li>
           <li>Настольная игра, полная информация → <b>AlphaZero</b>.</li>
           <li>Continuous-действия, нужна сэмпл-эффективность и стабильная (не строго детерминированная) динамика → <b>SAC</b>.</li>
           <li>Continuous-действия, динамика близка к детерминированной (MuJoCo-locomotion, Car Racing) → <b>TD3</b> (DDPG — для сравнения/учебных целей).</li>
@@ -2564,22 +2757,31 @@ const cheatsheet: Lesson = {
           <li>Дискретные действия, важен off-policy replay → <b>Rainbow DQN</b> (или DQN для простоты); включите <b>distributional (QR-DQN)</b> для полного набора из 6 ингредиентов Rainbow.</li>
           <li>Награда разреженная/недифференцируемая, или хочется вообще без backprop через среду → <b>Evolution Strategies</b>.</li>
           <li>Наблюдение может быть неполным (POMDP) → любой из вышеперечисленных Gym-алгоритмов (кроме ES) + <b>память (LSTM/GRU)</b>.</li>
-          <li>env.step() дорогой/медленный, важна сэмпл-эффективность любой ценой → <b>World Models</b>: Dreamer (дискретные/continuous), MBPO или PETS (continuous), World Models (Ha) — см. отдельную группу уроков.</li>
+          <li>env.step() дорогой/медленный, важна сэмпл-эффективность любой ценой → <b>World Models</b>: Dreamer (дискретные/continuous), MBPO или PETS (continuous), World Models (Ha) — см. группу уроков.</li>
+          <li>Планировать маленьким деревом на каждом шаге, без отдельного артефакта World Model → <b>EfficientZero</b> (рекуррентная динамика), <b>UniZero</b> (токены), наш дефолт <b>ResearchImZero</b>; если поиск дорогой и актор уже часто прав → <b>LatentImZero</b>.</li>
           <li>Многокомандная сцена в Scene Builder или бенчмарк PettingZoo (категория «MARL» в галерее сред) → <b>IPPO</b> (policy gradient, discrete/continuous) или, для дискретного движения и кооперации внутри команды, <b>QMIX</b> (value decomposition).</li>
         </ul>
       </Section>
 
-      <Callout tone="tip" title="Дальше — практика">
-        Откройте Дизайнер экспериментов, соберите граф среда → алгоритм → training, взгляните на живую
-        схему архитектуры сети (та же, что и в этом курсе) и запустите первый эксперимент. Курс никуда
-        не убежит — к нему можно вернуться в любой момент через раздел «Учебный центр» в навигации.
+      <Callout tone="tip" title="Дальше — практика в приложении">
+        Как читать <code>episode_reward_mean</code>, какие ручки крутить и что делать, если не учится —
+        три урока блока «Практика», сразу перед этой шпаргалкой. Новый запуск — Дизайнер, граф
+        среда → алгоритм → training.
       </Callout>
     </>
   ),
 }
 
 export const LESSONS: Lesson[] = [
-  fundamentals, dqn, rainbow, a2c, ppo, sac, ddpg, td3, continuousTechniques, alphazero,
-  worldModelsOverview, dreamer, mbpoPets, worldModelsHa, efficientzero, unizero, marlOverview, ippo, qmix,
-  memory, pomdp, exploration, es, wrappers, cheatsheet,
+  ...START_LESSONS,
+  ...FOUNDATION_LESSONS,
+  ...TABULAR_LESSONS,
+  dqn, rainbow,
+  ...POLICY_INTRO_LESSONS, a2c, ppo,
+  sac, ddpg, td3, continuousTechniques, alphazero,
+  worldModelsOverview, dreamer, mbpoPets, worldModelsHa, efficientzero, unizero, researchimzero, latentimzero,
+  marlOverview, ippo, qmix,
+  memory, pomdp, exploration, es, wrappers,
+  ...PRACTICE_LESSONS,
+  cheatsheet,
 ]

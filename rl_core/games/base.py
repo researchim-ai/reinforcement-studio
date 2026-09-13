@@ -52,6 +52,11 @@ class BoardGame(ABC):
     def action_size(self) -> int:
         return self.rows * self.cols
 
+    @property
+    def input_planes(self) -> int:
+        """Channels in `encode()`. Built-in stone games use 3; OpenSpiel chess is 20."""
+        return 3
+
     def reset(self) -> np.ndarray:
         self.board = np.zeros((self.rows, self.cols), dtype=np.int8)
         self.current_player = 1

@@ -606,3 +606,333 @@ export function TwoHotBinsChart() {
     </div>
   )
 }
+
+/** Teacher-forced unroll vs closed-loop overshooting — the extra training
+ * signal ResearchImZero adds on top of UniZero. Solid tokens are real
+ * observations from replay; dashed ẑ tokens are the model's own latent
+ * predictions, fed back in so the search-time imagination path is trained
+ * rather than only the teacher-forced one. */
+export function ClosedLoopDiagram() {
+  const real = ['obs₀', 'act₀', 'obs₁', 'act₁', 'obs₂']
+  const imagined = ['obs₀', 'act₀', 'ẑ₁', 'act₁', 'ẑ₂']
+  return (
+    <div className="space-y-3 py-1">
+      <div>
+        <div className="mb-1 text-[10px] font-medium text-muted-foreground">Teacher forcing — настоящие токены из replay</div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {real.map((label, i) => (
+            <Fragment key={`tf-${label}-${i}`}>
+              {i > 0 && <ArrowRight className="h-3 w-3 text-muted-foreground/50" />}
+              <div className={cn(
+                'rounded-md border px-2 py-1 font-mono text-[10px]',
+                label.startsWith('act') ? 'border-amber-500/40 bg-amber-500/10' : 'border-primary/40 bg-primary/10',
+              )}>
+                {label}
+              </div>
+            </Fragment>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 text-[10px] font-medium text-muted-foreground">Closed-loop — после act₀ дальше идут свои ẑ, как при поиске</div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {imagined.map((label, i) => (
+            <Fragment key={`cl-${label}-${i}`}>
+              {i > 0 && <ArrowRight className="h-3 w-3 text-muted-foreground/50" />}
+              <div className={cn(
+                'rounded-md border px-2 py-1 font-mono text-[10px]',
+                label.startsWith('ẑ')
+                  ? 'border-dashed border-emerald-500/50 bg-emerald-500/10'
+                  : label.startsWith('act')
+                    ? 'border-amber-500/40 bg-amber-500/10'
+                    : 'border-primary/40 bg-primary/10',
+              )}>
+                {label}
+              </div>
+            </Fragment>
+          ))}
+        </div>
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        Consistency на teacher-forced пути учит «угадать следующий obs, когда он уже есть во входе».
+        Closed-loop заставляет ту же голову угадывать его, когда следующего настоящего токена нет —
+        ровно то, что делает Gumbel-поиск, раскрывая узел вглубь.
+      </p>
+    </div>
+  )
+}
+
+/** LatentImZero's one-tree budget checkpoints. Sequential Halving is
+ * sampled once for the max budget (32); 0/4/16 are snapshots of that same
+ * tree, not four independent searches. VoC decides CONTINUE vs STOP. */
+export function VocBudgetDiagram() {
+  const stages: { b: string; title: string; detail: string; x: number }[] = [
+    { b: '0', title: 'актор', detail: 'π_θ, без поиска', x: 8 },
+    { b: '4', title: 'small', detail: 'мало expansion', x: 90 },
+    { b: '16', title: 'medium', detail: 'половина дерева', x: 172 },
+    { b: '32', title: 'max', detail: 'полный бюджет', x: 254 },
+  ]
+  return (
+    <svg viewBox="0 0 336 132" className="h-36 w-full max-w-xl">
+      <text x={168} y={12} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        один Gumbel-планировщик, четыре чекпоинта того же дерева
+      </text>
+      {stages.map((s, i) => (
+        <g key={s.b}>
+          {i < stages.length - 1 && (
+            <>
+              <line x1={s.x + 56} y1={48} x2={stages[i + 1].x} y2={48} stroke="oklch(0.7 0.15 260)" strokeWidth={1.4} />
+              <text x={(s.x + 56 + stages[i + 1].x) / 2} y={42} textAnchor="middle" className="fill-primary text-[7.5px]">CONTINUE</text>
+            </>
+          )}
+          <rect
+            x={s.x} y={28} width={72} height={40} rx={6}
+            className={i === 0 ? 'fill-background' : 'fill-primary/10'}
+            stroke={i === stages.length - 1 ? 'oklch(0.75 0.18 150)' : 'oklch(0.7 0.15 260)'}
+            strokeWidth={i === stages.length - 1 ? 2 : 1.3}
+          />
+          <text x={s.x + 36} y={44} textAnchor="middle" className="fill-foreground text-[10px] font-semibold">B = {s.b}</text>
+          <text x={s.x + 36} y={57} textAnchor="middle" className="fill-muted-foreground text-[8px]">{s.title}</text>
+          <text x={s.x + 36} y={82} textAnchor="middle" className="fill-muted-foreground text-[7.5px]">{s.detail}</text>
+        </g>
+      ))}
+      <text x={168} y={108} textAnchor="middle" className="fill-amber-500 text-[8px]">
+        VoC: P(CONTINUE) &lt; 0.5 → STOP на текущем чекпоинте · safety floor не даёт откатиться ниже открытой стадии
+      </text>
+      <text x={168} y={124} textAnchor="middle" className="fill-muted-foreground text-[8px]">
+        shadow-старт: всегда executed = 32, пока VoC не докажет, что ранняя остановка безопасна
+      </text>
+    </svg>
+  )
+}
+
+/** Supervised learning vs RL — the first distinction a newcomer needs. */
+export function SupervisedVsRlDiagram() {
+  const cols = [
+    { title: 'Обучение с учителем', detail: 'датасет (x, y*) заранее', signal: 'правильный ответ y*' },
+    { title: 'Обучение с подкреплением', detail: 'ответа нет, есть только r', signal: 'скаляр награды, часто позже' },
+  ]
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {cols.map((col) => (
+        <div key={col.title} className="rounded-xl border border-border/70 bg-background/60 p-3">
+          <div className="text-[12px] font-semibold text-foreground">{col.title}</div>
+          <div className="mt-1 text-[11px] text-muted-foreground">{col.detail}</div>
+          <div className="mt-2 rounded-md bg-muted/50 px-2 py-1.5 font-mono text-[10px] text-foreground/80">{col.signal}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Discounted return as a weighted sum of future rewards. */
+export function ReturnTimelineDiagram() {
+  const steps = [
+    { r: 'r₁ = 1', w: 'γ⁰ = 1' },
+    { r: 'r₂ = 1', w: 'γ¹ = 0.99' },
+    { r: 'r₃ = 1', w: 'γ² ≈ 0.98' },
+    { r: '…', w: 'γᵗ' },
+    { r: 'r₅₀₀', w: 'γ⁴⁹⁹ ≈ 0.007' },
+  ]
+  return (
+    <div className="space-y-2 py-1">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {steps.map((step, i) => (
+          <Fragment key={step.w}>
+            {i > 0 && <span className="text-[11px] text-muted-foreground/60">+</span>}
+            <div className="rounded-md border border-border/70 bg-background/60 px-2 py-1.5 text-center">
+              <div className="font-mono text-[11px] text-foreground">{step.r}</div>
+              <div className="text-[9px] text-muted-foreground">× {step.w}</div>
+            </div>
+          </Fragment>
+        ))}
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        Для CartPole каждый шаг даёт +1. При γ=0.99 пятисотый шаг почти ничего не стоит в возврате —
+        агент всё равно может его «хотеть», потому что без него эпизод уже давно упал бы.
+      </p>
+    </div>
+  )
+}
+
+/** One-step Bellman backup: value now = reward + discounted value later. */
+export function BellmanBackupDiagram() {
+  return (
+    <svg viewBox="0 0 336 128" className="h-32 w-full max-w-xl">
+      <rect x={8} y={36} width={64} height={40} rx={6} className="fill-primary/10" stroke="oklch(0.7 0.15 260)" strokeWidth={1.4} />
+      <text x={40} y={54} textAnchor="middle" className="fill-foreground text-[11px] font-semibold">s</text>
+      <text x={40} y={68} textAnchor="middle" className="fill-muted-foreground text-[8px]">V(s), Q(s,a)</text>
+      <line x1={72} y1={56} x2={118} y2={56} stroke="oklch(0.45 0 0)" strokeWidth={1.4} />
+      <text x={95} y={48} textAnchor="middle" className="fill-muted-foreground text-[8px]">a</text>
+      <rect x={122} y={18} width={72} height={32} rx={6} className="fill-amber-500/10" stroke="oklch(0.75 0.15 70)" strokeWidth={1.3} />
+      <text x={158} y={38} textAnchor="middle" className="fill-foreground text-[10px]">награда r</text>
+      <rect x={122} y={62} width={72} height={32} rx={6} className="fill-background" stroke="oklch(0.45 0 0)" strokeWidth={1.3} />
+      <text x={158} y={82} textAnchor="middle" className="fill-foreground text-[10px]">s′</text>
+      <line x1={194} y1={78} x2={236} y2={78} stroke="oklch(0.45 0 0)" strokeWidth={1.4} />
+      <rect x={240} y={58} width={88} height={40} rx={6} className="fill-emerald-500/10" stroke="oklch(0.75 0.18 150)" strokeWidth={1.4} />
+      <text x={284} y={76} textAnchor="middle" className="fill-foreground text-[10px] font-semibold">γ · V(s′)</text>
+      <text x={284} y={90} textAnchor="middle" className="fill-muted-foreground text-[8px]">или γ max Q(s′,·)</text>
+      <text x={168} y={118} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        backup: оценка «сейчас» подтягивается к r + оценка «потом»
+      </text>
+    </svg>
+  )
+}
+
+/** Three bandit arms — visit counts vs mean reward, the explore/exploit cartoon. */
+export function BanditArmsDiagram() {
+  const arms = [
+    { x: 24, n: 40, mu: '0.2', label: 'A', dim: true },
+    { x: 132, n: 8, mu: '?', label: 'B', dim: false },
+    { x: 240, n: 31, mu: '0.7', label: 'C', best: true },
+  ]
+  return (
+    <svg viewBox="0 0 336 118" className="h-32 w-full max-w-xl">
+      <text x={168} y={14} textAnchor="middle" className="fill-muted-foreground text-[9px]">
+        три автомата: среднее известно только у тех, что уже крутили
+      </text>
+      {arms.map((arm) => (
+        <g key={arm.label} opacity={arm.dim ? 0.55 : 1}>
+          <rect
+            x={arm.x} y={28} width={72} height={52} rx={6}
+            className={arm.best ? 'fill-emerald-500/15' : 'fill-background'}
+            stroke={arm.best ? 'oklch(0.75 0.18 150)' : 'oklch(0.7 0.15 260)'}
+            strokeWidth={arm.best ? 2 : 1.3}
+          />
+          <text x={arm.x + 36} y={48} textAnchor="middle" className="fill-foreground text-[12px] font-semibold">рука {arm.label}</text>
+          <text x={arm.x + 36} y={64} textAnchor="middle" className="fill-muted-foreground text-[8px]">N={arm.n} · μ={arm.mu}</text>
+        </g>
+      ))}
+      <text x={168} y={102} textAnchor="middle" className="fill-muted-foreground text-[8px]">
+        жадно брать C — упускаете, что B (8 попыток) может быть лучше. ε-greedy иногда берёт случайную руку.
+      </text>
+    </svg>
+  )
+}
+
+/** Monte-Carlo waits for the episode; TD bootstraps after one step. */
+export function TdMcCompareDiagram() {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      <div className="rounded-xl border border-border/70 p-3">
+        <div className="text-[11px] font-semibold text-foreground">Monte Carlo</div>
+        <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px]">
+          {['s', 'a', 'r', 's′', 'a′', '…', 'конец'].map((tok) => (
+            <span key={tok} className="rounded border border-border/60 px-1.5 py-0.5 font-mono">{tok}</span>
+          ))}
+        </div>
+        <p className="mt-2 text-[10px] text-muted-foreground">Обновление только когда эпизод закончился: цель = полный возврат G. Несмещённо, очень шумно.</p>
+      </div>
+      <div className="rounded-xl border border-primary/30 bg-primary/5 p-3">
+        <div className="text-[11px] font-semibold text-foreground">TD(0) / Q-learning</div>
+        <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px]">
+          {['s', 'a', 'r', 's′'].map((tok) => (
+            <span key={tok} className="rounded border border-primary/40 px-1.5 py-0.5 font-mono">{tok}</span>
+          ))}
+          <span className="text-muted-foreground">+ bootstrap V(s′) или max Q</span>
+        </div>
+        <p className="mt-2 text-[10px] text-muted-foreground">Обновление после одного перехода. Смещённо (опирается на текущую оценку), зато можно учиться онлайн.</p>
+      </div>
+    </div>
+  )
+}
+
+/** Designer graph as three named nodes — matches Experiment Designer. */
+export function DesignerPipelineDiagram() {
+  const nodes = [
+    { title: 'Среда', detail: 'CartPole-v1' },
+    { title: 'Алгоритм', detail: 'PPO' },
+    { title: 'Training', detail: '50 000 шагов' },
+  ]
+  return (
+    <div className="flex flex-wrap items-center gap-2 py-1">
+      {nodes.map((node, i) => (
+        <Fragment key={node.title}>
+          {i > 0 && <ArrowRight className="h-4 w-4 text-muted-foreground/50" />}
+          <div className="min-w-[7.5rem] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-center">
+            <div className="text-[12px] font-semibold text-foreground">{node.title}</div>
+            <div className="text-[10px] text-muted-foreground">{node.detail}</div>
+          </div>
+        </Fragment>
+      ))}
+    </div>
+  )
+}
+
+/** Worked numerical example — same callout chrome, but for “посчитаем руками”. */
+export function WorkedExample({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-2.5 rounded-lg border border-primary/25 bg-primary/5 px-3.5 py-3">
+      <div className="text-xs font-semibold text-foreground">{title}</div>
+      <div className="space-y-2.5 text-[13px] leading-relaxed text-foreground/85">{children}</div>
+    </div>
+  )
+}
+
+export function MiniTable({
+  headers,
+  rows,
+  caption,
+}: {
+  headers: string[]
+  rows: string[][]
+  caption?: string
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="overflow-x-auto rounded-lg border border-border/70">
+        <table className="w-full text-left text-[12px]">
+          <thead className="bg-muted/50 text-[11px] text-muted-foreground">
+            <tr>
+              {headers.map((header) => (
+                <th key={header} className="px-2.5 py-1.5 font-medium">{header}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, rowIndex) => (
+              <tr key={rowIndex} className="border-t border-border/50">
+                {row.map((cell, cellIndex) => (
+                  <td key={cellIndex} className="px-2.5 py-1.5 font-mono text-foreground/90">{cell}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {caption && <p className="text-[11px] text-muted-foreground">{caption}</p>}
+    </div>
+  )
+}
+
+/** Tiny deterministic chain used in Bellman / DP / TD numerical examples. */
+export function ChainMdpDiagram() {
+  const cells = [
+    { title: 'A', detail: 'старт' },
+    { title: 'B', detail: 'середина' },
+    { title: 'цель', detail: 'терминал, V = 0' },
+  ]
+  return (
+    <div className="space-y-2 py-1">
+      <div className="flex flex-wrap items-center gap-2">
+        {cells.map((cell, i) => (
+          <Fragment key={cell.title}>
+            {i > 0 && (
+              <div className="flex flex-col items-center text-muted-foreground">
+                <ArrowRight className="h-4 w-4" />
+                <span className="text-[9px]">{i === 1 ? 'Right, r = 0' : 'Right, r = 1'}</span>
+              </div>
+            )}
+            <div className="min-w-[5.5rem] rounded-lg border border-border/70 bg-background/60 px-3 py-2 text-center">
+              <div className="text-[12px] font-semibold text-foreground">{cell.title}</div>
+              <div className="text-[10px] text-muted-foreground">{cell.detail}</div>
+            </div>
+          </Fragment>
+        ))}
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        Одна действие — Right. γ = 0,9. Из цели шагов нет. Это не FrozenLake: лёд не скользит, P детерминирована.
+      </p>
+    </div>
+  )
+}

@@ -30,11 +30,30 @@ import type {
  * layered on top — e.g. Gomoku ships a much bigger MCTS/network budget than
  * Tic-Tac-Toe so AlphaZero actually has a chance to learn within a
  * reasonable number of iterations instead of sitting at a near-uniform
- * policy the whole run. */
+ * policy the whole run. Zero-family algos on the same board games only
+ * inherit `num_simulations` (and a smaller buffer / learning_starts):
+ * AlphaZero's `buffer_size` is replay *positions*, EfficientZero's is
+ * *episodes*. */
+const ZERO_SELFPLAY_IDS = new Set(['efficientzero', 'unizero', 'researchimzero', 'latentimzero'])
+
 function buildDefaultHyperparams(spec: AlgorithmSpec | undefined, env: EnvSpec | undefined): Record<string, number> {
   const defaults: Record<string, number> = {}
   for (const hp of spec?.hyperparams ?? []) defaults[hp.key] = hp.default
-  if (env?.default_hyperparams) Object.assign(defaults, env.default_hyperparams)
+  const overlay = env?.default_hyperparams
+  if (!overlay) return defaults
+  if (spec?.kind === 'alphazero') {
+    Object.assign(defaults, overlay)
+    return defaults
+  }
+  if (spec && ZERO_SELFPLAY_IDS.has(spec.id) && env?.kind === 'alphazero') {
+    if (overlay.num_simulations != null && 'num_simulations' in defaults) {
+      defaults.num_simulations = overlay.num_simulations
+    }
+    if ('learning_starts' in defaults) defaults.learning_starts = Math.min(defaults.learning_starts, 32)
+    if ('buffer_size' in defaults) defaults.buffer_size = Math.min(defaults.buffer_size, 256)
+    return defaults
+  }
+  Object.assign(defaults, overlay)
   return defaults
 }
 
@@ -121,7 +140,7 @@ export function ExperimentDesigner() {
   }, [resumeRunId, resumeCheckpointName, resumeRunConfig, resumeCheckpointConfig, resumeApplied, setSearchParams])
 
   const selectedEnv = environments.find((e) => e.id === environmentId)
-  const kind: EnvKind = selectedEnv?.kind ?? 'gym'
+  const envKind: EnvKind = selectedEnv?.kind ?? 'gym'
   // Memoized — this ran fresh on *every* render before (including every
   // pointer-move frame while dragging a node), which handed the `nodes`
   // useMemo below a brand-new array reference each time and forced it to
@@ -131,18 +150,18 @@ export function ExperimentDesigner() {
   const compatibleAlgorithms = useMemo(
     () =>
       allAlgorithms.filter((a) => {
-        if (a.kind !== kind) return false
         if (!a.is_custom) return !selectedEnv || selectedEnv.compatible_algorithms.includes(a.id)
         // Custom algorithms don't appear in any built-in env's compatible_algorithms
         // list — for the Gym track, match on action kind instead (declared by the
         // plugin's SUPPORTED_ACTION_KINDS); AlphaZero board games have no action
         // kind concept, so custom AlphaZero trainers are always considered compatible.
+        if (envKind === 'alphazero') return a.kind === 'alphazero'
         if (a.kind === 'gym') {
           return !selectedEnv || !a.supported_action_kinds || a.supported_action_kinds.includes(selectedEnv.action_kind)
         }
-        return true
+        return a.kind === envKind
       }),
-    [allAlgorithms, kind, selectedEnv],
+    [allAlgorithms, envKind, selectedEnv],
   )
 
   // Auto-pick a default env once the catalog loads — prefer whatever was
@@ -254,6 +273,12 @@ export function ExperimentDesigner() {
   // plain MLP trunk, so it's scoped to the same families as a hand-designed
   // `network_spec` (ppo/a2c/dqn/rainbow_dqn) — see `requiredFamilyFor`.
   const selectedAlgorithm = allAlgorithms.find((a) => a.id === algorithmId)
+  // Board games stay `kind: alphazero` in the catalog (AlphaZero talks to
+  // BoardGame directly), but EfficientZero & friends are Gym-track: the
+  // run/inspect `kind` follows the selected algorithm so the runner hits
+  // the self-play Gym wrapper instead of `train_alphazero`.
+  const kind: EnvKind = selectedAlgorithm?.kind === 'alphazero' ? 'alphazero' : selectedAlgorithm ? 'gym' : envKind
+  const showGymWrappers = envKind === 'gym' && !resumeFrom
   const quickFamily = selectedAlgorithm ? requiredFamilyFor(selectedAlgorithm.id, selectedAlgorithm.kind) : null
   const quickNetworkSpec = useMemo(
     () => (quickFamily && quickHiddenLayers ? quickSpecForFamily(quickFamily, quickHiddenLayers) : null),
@@ -273,7 +298,7 @@ export function ExperimentDesigner() {
     if (!environmentId || !algorithmId) return null
     return {
       kind,
-      environment: { id: environmentId, wrappers: kind === 'gym' ? wrappers : undefined },
+      environment: { id: environmentId, wrappers: envKind === 'gym' ? wrappers : undefined },
       algorithm: { id: algorithmId, hyperparams, network_spec_id: effectiveNetworkSpecId, network_spec: effectiveNetworkSpec },
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -289,7 +314,7 @@ export function ExperimentDesigner() {
       const config = {
         kind,
         name,
-        environment: { id: environmentId, wrappers: kind === 'gym' ? wrappers : [] },
+        environment: { id: environmentId, wrappers: envKind === 'gym' ? wrappers : [] },
         algorithm: {
           id: algorithmId, hyperparams, network_spec_id: effectiveNetworkSpecId, network_spec: effectiveNetworkSpec,
           world_model_id: effectiveWorldModelId,
@@ -311,7 +336,7 @@ export function ExperimentDesigner() {
     } finally {
       setStarting(false)
     }
-  }, [canRun, kind, name, environmentId, wrappers, algorithmId, hyperparams, effectiveNetworkSpecId, effectiveNetworkSpec, effectiveWorldModelId, totalTimesteps, numEnvs, numIterations, seed, useGpu, resumeFrom, navigate])
+  }, [canRun, kind, envKind, name, environmentId, wrappers, algorithmId, hyperparams, effectiveNetworkSpecId, effectiveNetworkSpec, effectiveWorldModelId, totalTimesteps, numEnvs, numIterations, seed, useGpu, resumeFrom, navigate])
 
   const algoColumnIndex = 2
   const trainingColumnIndex = 3
@@ -319,8 +344,8 @@ export function ExperimentDesigner() {
   const { applyPositions, onNodesChange, positions } = useNodePositions()
 
   const algoX = useMemo(
-    () => (kind === 'gym' ? wrapperColumnBase + wrappers.length * WRAPPER_GAP + (wrappers.length ? 40 : 0) : COL_X[algoColumnIndex]),
-    [kind, wrapperColumnBase, wrappers.length],
+    () => (showGymWrappers ? wrapperColumnBase + wrappers.length * WRAPPER_GAP + (wrappers.length ? 40 : 0) : COL_X[algoColumnIndex]),
+    [showGymWrappers, wrapperColumnBase, wrappers.length],
   )
 
   const rawNodes: Node[] = useMemo(() => {
@@ -340,20 +365,22 @@ export function ExperimentDesigner() {
       } satisfies EnvNodeData,
     })
 
-    wrappers.forEach((w, i) => {
-      list.push({
-        id: `wrapper-${i}`,
-        type: 'wrapper',
-        position: { x: wrapperColumnBase + i * WRAPPER_GAP, y: ROW_Y },
-        data: {
-          catalog: wrapperCatalog,
-          type: w.type,
-          onChange: (type: string) => changeWrapperType(i, type),
-          onRemove: () => removeWrapper(i),
-          disabled: !!resumeFrom,
-        } satisfies WrapperNodeData,
+    if (showGymWrappers) {
+      wrappers.forEach((w, i) => {
+        list.push({
+          id: `wrapper-${i}`,
+          type: 'wrapper',
+          position: { x: wrapperColumnBase + i * WRAPPER_GAP, y: ROW_Y },
+          data: {
+            catalog: wrapperCatalog,
+            type: w.type,
+            onChange: (type: string) => changeWrapperType(i, type),
+            onRemove: () => removeWrapper(i),
+            disabled: !!resumeFrom,
+          } satisfies WrapperNodeData,
+        })
       })
-    })
+    }
 
     list.push({
       id: 'algorithm',
@@ -433,7 +460,7 @@ export function ExperimentDesigner() {
   }, [
     environments, environmentId, wrappers, wrapperCatalog, compatibleAlgorithms, algorithmId,
     hyperparams, networks, networkSpecId, quickHiddenLayers, worldModels, worldModelId,
-    kind, name, totalTimesteps, numEnvs, numIterations, seed, useGpu, starting, canRun, algoX, resumeFrom, inspectData,
+    kind, showGymWrappers, name, totalTimesteps, numEnvs, numIterations, seed, useGpu, starting, canRun, algoX, resumeFrom, inspectData,
   ])
 
   // The "+" insertion buttons must track wherever the env/wrapper/algorithm
@@ -444,7 +471,7 @@ export function ExperimentDesigner() {
   // `positions` without forcing the whole node list — env/wrapper/algorithm/
   // training, each with a bunch of callbacks — to rebuild every drag frame.
   const addNodes: Node[] = useMemo(() => {
-    if (kind !== 'gym' || resumeFrom) return []
+    if (!showGymWrappers) return []
     const at = (id: string, fallback: { x: number; y: number }) => positions[id] ?? fallback
     const chain = [
       at('env', { x: COL_X[0], y: ROW_Y }),
@@ -463,7 +490,7 @@ export function ExperimentDesigner() {
       })
     }
     return list
-  }, [kind, resumeFrom, wrappers, wrapperColumnBase, algoX, addWrapper, positions])
+  }, [showGymWrappers, wrappers, wrapperColumnBase, algoX, addWrapper, positions])
 
   const nodes = applyPositions([...rawNodes, ...addNodes])
 
@@ -487,7 +514,7 @@ export function ExperimentDesigner() {
   return (
     <div className="relative h-full w-full">
       <div className="absolute left-4 top-4 z-10 flex gap-2">
-        {kind === 'gym' && !resumeFrom && (
+        {showGymWrappers && (
           <Button size="sm" variant="outline" onClick={() => addWrapper(wrappers.length)} disabled={wrapperCatalog.length === 0}>
             <Plus className="h-3.5 w-3.5" />
             Добавить wrapper
@@ -549,7 +576,7 @@ export function ExperimentDesigner() {
           onClose={() => setSweepOpen(false)}
           kind={kind}
           environmentId={environmentId}
-          wrappers={kind === 'gym' ? wrappers : []}
+          wrappers={envKind === 'gym' ? wrappers : []}
           algorithm={selectedAlgorithm}
           baseHyperparams={hyperparams}
           training={{ total_timesteps: totalTimesteps, num_envs: numEnvs, use_gpu: useGpu, seed }}

@@ -59,6 +59,18 @@ def test_default_composite_specs_validate(family: str) -> None:
     assert validate_composite_spec(default_composite_spec(family), family)["family"] == family
 
 
+def test_latentimzero_fills_missing_simsiam_slots() -> None:
+    spec = default_composite_spec("unizero")
+    spec["family"] = "latentimzero"
+    spec["dimensions"].pop("proj_dim", None)
+    spec["components"].pop("projector", None)
+    spec["components"].pop("predictor", None)
+    normalized = validate_composite_spec(spec, "latentimzero")
+    assert normalized["dimensions"]["proj_dim"] == 64
+    assert normalized["components"]["projector"]["batch_norm"] is True
+    assert normalized["components"]["predictor"]["hidden_sizes"] == [64]
+
+
 def test_validation_rejects_cross_family_and_unsafe_shapes() -> None:
     with pytest.raises(NetworkSpecError, match="несовместима"):
         validate_composite_spec(default_composite_spec("unizero"), "researchimzero")

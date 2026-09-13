@@ -1,10 +1,15 @@
-import { ArrowDown, ArrowRight, ArrowUp, Plus, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Background, Controls, ReactFlow } from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
+import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react'
 
-import { AlgorithmDiagram } from '@/components/AlgorithmDiagram'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
+import { CompositeGraphNode } from '@/components/networkbuilder/CompositeGraphNode'
+import { useNodePositions } from '@/lib/useNodePositions'
+import { buildCompositeGraph, selectableGraphNode } from '@/lib/compositeGraph'
 import type {
   CompositeEncoderSpec,
   CompositeMlpSpec,
@@ -20,6 +25,8 @@ interface Props {
   preview?: NetworkPreviewResult
   onChange: (spec: CompositeNetworkSpec) => void
 }
+
+const nodeTypes = { composite: CompositeGraphNode }
 
 const DIMENSION_LABELS: Record<string, string> = {
   latent_dim: 'Размер latent',
@@ -100,7 +107,7 @@ function LayerFields({
     </label>
   )
   return (
-    <div className="grid flex-1 grid-cols-2 gap-2 lg:grid-cols-4">
+    <div className="grid flex-1 grid-cols-2 gap-2">
       {layer.type === 'linear' && numberField('out_features', 'Выход', 1)}
       {layer.type === 'conv2d' && (
         <>
@@ -153,13 +160,7 @@ function EncoderEditor({
     onChange({ ...encoder, layers })
   }
   return (
-    <section className="space-y-3 rounded-lg border bg-card p-3">
-      <div>
-        <h3 className="text-sm font-semibold">Входной энкодер</h3>
-        <p className="text-[11px] text-muted-foreground">
-          Вход задаёт среда. Здесь настраивается преобразование изображения/вектора в latent-признаки.
-        </p>
-      </div>
+    <div className="space-y-3">
       <Select
         value={encoder.kind}
         onChange={(event) => setKind(event.target.value as CompositeEncoderSpec['kind'])}
@@ -180,7 +181,7 @@ function EncoderEditor({
                 options={Object.entries(LAYER_LABELS)
                   .filter(([value]) => value !== 'batchnorm')
                   .map(([value, label]) => ({ value, label }))}
-                className="h-7 w-32 text-xs"
+                className="h-7 w-28 text-xs"
               />
               <LayerFields layer={layer} onChange={(next) => updateLayer(index, next)} />
               <div className="flex flex-col">
@@ -222,7 +223,78 @@ function EncoderEditor({
           </Button>
         </div>
       )}
-    </section>
+    </div>
+  )
+}
+
+function formatHiddenSizes(sizes: number[]): string {
+  return sizes.join(', ')
+}
+
+/** Parses a live "128, 64," draft. Returns null while a token is incomplete
+ * (trailing comma, empty slot, non-integer) so the input can keep the comma
+ * instead of snapping back to the last committed list. */
+export function parseHiddenSizesDraft(text: string): number[] | null {
+  const trimmed = text.trim()
+  if (trimmed === '') return []
+  if (/[^\d,\s]/.test(text) || /,\s*,/.test(text) || /,\s*$/.test(text)) return null
+  const sizes: number[] = []
+  for (const token of text.split(',').map((part) => part.trim()).filter(Boolean)) {
+    if (!/^\d+$/.test(token)) return null
+    const size = Number(token)
+    if (!Number.isFinite(size) || size <= 0) return null
+    sizes.push(size)
+  }
+  return sizes
+}
+
+function HiddenSizesInput({
+  value,
+  onChange,
+}: {
+  value: number[]
+  onChange: (value: number[]) => void
+}) {
+  const [focused, setFocused] = useState(false)
+  const [draft, setDraft] = useState(() => formatHiddenSizes(value))
+
+  useEffect(() => {
+    if (!focused) setDraft(formatHiddenSizes(value))
+  }, [value, focused])
+
+  return (
+    <Input
+      value={focused ? draft : formatHiddenSizes(value)}
+      onFocus={() => {
+        setFocused(true)
+        setDraft(formatHiddenSizes(value))
+      }}
+      onChange={(event) => {
+        const next = event.target.value
+        if (/[^\d,\s]/.test(next)) return
+        setDraft(next)
+        const parsed = parseHiddenSizesDraft(next)
+        if (parsed !== null) onChange(parsed)
+      }}
+      onBlur={() => {
+        setFocused(false)
+        const parsed = parseHiddenSizesDraft(draft)
+        if (parsed !== null) {
+          onChange(parsed)
+          setDraft(formatHiddenSizes(parsed))
+        } else {
+          const committed = parseHiddenSizesDraft(draft.replace(/,+\s*$/, ''))
+          if (committed !== null) {
+            onChange(committed)
+            setDraft(formatHiddenSizes(committed))
+          } else {
+            setDraft(formatHiddenSizes(value))
+          }
+        }
+      }}
+      className="h-8 text-xs"
+      placeholder="128, 128"
+    />
   )
 }
 
@@ -236,22 +308,13 @@ function MlpEditor({
   onChange: (config: CompositeMlpSpec) => void
 }) {
   return (
-    <section className="space-y-2 rounded-lg border bg-card p-3">
-      <h3 className="text-sm font-semibold">{COMPONENT_LABELS[name] ?? name}</h3>
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+    <div className="space-y-2">
+      <div className="grid grid-cols-1 gap-2">
         <label className="space-y-1">
           <Label className="text-[10px]">Hidden sizes через запятую</Label>
-          <Input
-            value={config.hidden_sizes.join(', ')}
-            onChange={(event) => onChange({
-              ...config,
-              hidden_sizes: event.target.value
-                .split(',')
-                .map((value) => Number(value.trim()))
-                .filter((value) => Number.isFinite(value) && value > 0),
-            })}
-            className="h-8 text-xs"
-            placeholder="128, 128"
+          <HiddenSizesInput
+            value={config.hidden_sizes}
+            onChange={(hidden_sizes) => onChange({ ...config, hidden_sizes })}
           />
         </label>
         <label className="space-y-1">
@@ -279,120 +342,192 @@ function MlpEditor({
           />
         </label>
         {(name === 'projector' || name === 'predictor') && (
-          <label className="flex items-end gap-2 pb-1 text-xs">
+          <label className="flex items-center gap-2 pb-1 text-xs">
             <input type="checkbox" checked disabled />
             BatchNorm (обязательно)
           </label>
         )}
       </div>
-    </section>
+    </div>
+  )
+}
+
+function DimensionFields({
+  spec,
+  keys,
+  onChange,
+}: {
+  spec: CompositeNetworkSpec
+  keys: string[]
+  onChange: (spec: CompositeNetworkSpec) => void
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-2">
+      {keys.filter((key) => key in spec.dimensions).map((key) => (
+        <label key={key} className="space-y-1">
+          <Label className="text-[10px]">{DIMENSION_LABELS[key] ?? key}</Label>
+          {key === 'rotary_emb' ? (
+            <Select
+              value={String(spec.dimensions[key])}
+              onChange={(event) => onChange({
+                ...spec,
+                dimensions: { ...spec.dimensions, [key]: Number(event.target.value) },
+              })}
+              options={[{ value: '1', label: 'Включён' }, { value: '0', label: 'Выключен' }]}
+              className="h-8 text-xs"
+            />
+          ) : (
+            <Input
+              type="number"
+              min={key === 'dropout' ? 0 : 1}
+              max={key === 'dropout' ? 0.99 : undefined}
+              step={key === 'dropout' ? 0.05 : 1}
+              value={spec.dimensions[key]}
+              onChange={(event) => onChange({
+                ...spec,
+                dimensions: { ...spec.dimensions, [key]: Number(event.target.value) },
+              })}
+              className="h-8 text-xs"
+            />
+          )}
+        </label>
+      ))}
+    </div>
+  )
+}
+
+function Inspector({
+  spec,
+  selectedId,
+  onChange,
+}: {
+  spec: CompositeNetworkSpec
+  selectedId: string | null
+  onChange: (spec: CompositeNetworkSpec) => void
+}) {
+  const selected = selectedId ? selectableGraphNode(selectedId, spec.family) : undefined
+  if (!selected) {
+    return (
+      <div className="space-y-3 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">Каркас алгоритма</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Кликните блок на графе, чтобы настроить его. Связи, search-протокол и размеры выходов
+            зафиксированы — меняются только безопасные внутренние блоки.
+          </p>
+        </div>
+        <DimensionFields spec={spec} keys={Object.keys(spec.dimensions)} onChange={onChange} />
+      </div>
+    )
+  }
+
+  if (selected.kind === 'encoder') {
+    return (
+      <div className="space-y-3 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">Входной энкодер</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Вход задаёт среда. Здесь — преобразование изображения или вектора в признаки.
+          </p>
+        </div>
+        <EncoderEditor encoder={spec.encoder} onChange={(encoder) => onChange({ ...spec, encoder })} />
+      </div>
+    )
+  }
+
+  if (selected.componentKey && spec.components[selected.componentKey]) {
+    return (
+      <div className="space-y-3 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">{COMPONENT_LABELS[selected.componentKey] ?? selected.title}</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">Внутренний MLP этого блока. Выход алгоритма по-прежнему auto.</p>
+        </div>
+        {selected.dimKeys && selected.dimKeys.length > 0 && (
+          <DimensionFields spec={spec} keys={selected.dimKeys} onChange={onChange} />
+        )}
+        <MlpEditor
+          name={selected.componentKey}
+          config={spec.components[selected.componentKey]}
+          onChange={(next) => onChange({
+            ...spec,
+            components: { ...spec.components, [selected.componentKey!]: next },
+          })}
+        />
+      </div>
+    )
+  }
+
+  if (selected.dimKeys && selected.dimKeys.length > 0) {
+    return (
+      <div className="space-y-3 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">{selected.title}</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">Размерности этого блока. Топология графа не меняется.</p>
+        </div>
+        <DimensionFields spec={spec} keys={selected.dimKeys} onChange={onChange} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3 p-4">
+      <div>
+        <h3 className="text-sm font-semibold">{selected.title}</h3>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Этот блок зафиксирован алгоритмом: его выход и связи нельзя разобрать, не сломав search/train.
+        </p>
+      </div>
+    </div>
   )
 }
 
 export function CompositeNetworkBuilder({ spec, preview, onChange }: Props) {
-  const skeleton = spec.family === 'efficientzero'
-    ? ['Observation encoder', 'Representation', 'Dynamics + value-prefix LSTM', 'Prediction heads']
-    : spec.family === 'latentimzero'
-      ? [
-          'Observation tokenizer',
-          'Causal Transformer memory',
-          'Categorical prior / posterior',
-          'Continue-aware imagination actor-critic',
-          'Uncertainty-gated Gumbel planner',
-        ]
-    : ['Observation tokenizer + Action embedding', 'Causal Transformer + KV-cache', 'Reward / Value / Policy / Latent heads', 'EMA target']
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const onSelect = useCallback((id: string) => {
+    setSelectedId((current) => (current === id ? null : id))
+  }, [])
+  const { nodes: rawNodes, edges } = useMemo(
+    () => buildCompositeGraph(spec, preview, selectedId, onSelect),
+    [spec, preview, selectedId, onSelect],
+  )
+  const { applyPositions, onNodesChange } = useNodePositions()
+  const nodes = applyPositions(rawNodes)
+
   return (
-    <div className="h-full overflow-auto p-4">
-      <div className="mx-auto max-w-6xl space-y-4">
-        <section className="rounded-lg border border-dashed bg-muted/20 p-3">
-          <h3 className="mb-2 text-sm font-semibold">Фиксированный корректный каркас</h3>
-          <div className="flex flex-wrap items-center gap-2">
-            {skeleton.map((label, index) => (
-              <div key={label} className="contents">
-                <span className="rounded-md border bg-background px-2 py-1 text-[11px]">{label}</span>
-                {index < skeleton.length - 1 && <ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />}
-              </div>
-            ))}
-          </div>
-          <p className="mt-2 text-[10px] text-muted-foreground">
-            Связи, search-протокол и auto-sized выходы защищены от редактирования; меняются только безопасные внутренние блоки.
-          </p>
-        </section>
-        <section className="rounded-lg border bg-card p-3">
-          <h3 className="mb-3 text-sm font-semibold">Размерности каркаса</h3>
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-            {Object.entries(spec.dimensions).map(([key, value]) => (
-              <label key={key} className="space-y-1">
-                <Label className="text-[10px]">{DIMENSION_LABELS[key] ?? key}</Label>
-                {key === 'rotary_emb' ? (
-                  <Select
-                    value={String(value)}
-                    onChange={(event) => onChange({
-                      ...spec,
-                      dimensions: { ...spec.dimensions, [key]: Number(event.target.value) },
-                    })}
-                    options={[{ value: '1', label: 'Включён' }, { value: '0', label: 'Выключен' }]}
-                    className="h-8 text-xs"
-                  />
-                ) : (
-                  <Input
-                    type="number"
-                    min={key === 'dropout' ? 0 : 1}
-                    max={key === 'dropout' ? 0.99 : undefined}
-                    step={key === 'dropout' ? 0.05 : 1}
-                    value={value}
-                    onChange={(event) => onChange({
-                      ...spec,
-                      dimensions: { ...spec.dimensions, [key]: Number(event.target.value) },
-                    })}
-                    className="h-8 text-xs"
-                  />
-                )}
-              </label>
-            ))}
-          </div>
-        </section>
-
-        <EncoderEditor encoder={spec.encoder} onChange={(encoder) => onChange({ ...spec, encoder })} />
-        {Object.entries(spec.components).map(([name, config]) => (
-          <MlpEditor
-            key={name}
-            name={name}
-            config={config}
-            onChange={(next) => onChange({ ...spec, components: { ...spec.components, [name]: next } })}
-          />
-        ))}
-
+    <div className="flex h-full min-h-0">
+      <div className="min-w-0 flex-1">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onPaneClick={() => setSelectedId(null)}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          minZoom={0.25}
+          fitView
+          fitViewOptions={{ padding: 0.25 }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
+      <aside className="w-80 shrink-0 overflow-auto border-l border-border bg-card">
+        <Inspector spec={spec} selectedId={selectedId} onChange={onChange} />
         {preview?.fixed_outputs && (
-          <section className="rounded-lg border border-dashed p-3">
-            <h3 className="text-sm font-semibold">Фиксированные выходы алгоритма</h3>
-            <div className="mt-2 flex flex-wrap gap-2">
+          <div className="border-t border-border p-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Фиксированные выходы</h3>
+            <div className="mt-2 flex flex-wrap gap-1.5">
               {Object.entries(preview.fixed_outputs).map(([name, shape]) => (
                 <span key={name} className="rounded-md bg-muted px-2 py-1 font-mono text-[10px]">
-                  {name} → [{shape.join('×')}] · auto
+                  {name} → [{shape.join('×')}]
                 </span>
               ))}
             </div>
-          </section>
+          </div>
         )}
-
-        {preview?.components && preview.components.length > 0 && (
-          <section className="rounded-lg border p-3">
-            <h3 className="mb-3 text-sm font-semibold">Реальная собранная архитектура</h3>
-            <AlgorithmDiagram
-              show={{ loop: false, network: true }}
-              hideTitles
-              network={{
-                components: preview.components,
-                totalParams: preview.total_params ?? undefined,
-                trainableParams: preview.trainable_params ?? undefined,
-                inputShape: preview.input_shape,
-                outputShape: preview.output_shape,
-              }}
-            />
-          </section>
-        )}
-      </div>
+      </aside>
     </div>
   )
 }

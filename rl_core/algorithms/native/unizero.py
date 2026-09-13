@@ -274,6 +274,18 @@ import gymnasium as gym
 
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
 from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_flat_dim, obs_to_array
+from rl_core.algorithms.native.zero_selfplay import (
+    attach_two_player,
+    chosen_discrete_action,
+    discrete_expand_slots,
+    discrete_policy_target,
+    interior_max_children,
+    mask_from_unwrapped_env,
+    masks_from_infos,
+    maybe_enable_two_player_from_infos,
+    sample_masked_action,
+    uniform_legal_policy,
+)
 from rl_core.algorithms.vec_env import (
     action_space as venv_action_space,
     num_envs_of,
@@ -1500,6 +1512,7 @@ class NativeUniZero(CustomAlgorithm):
         )
 
         self.gamma = float(hyperparams.get("gamma", 0.997))
+        attach_two_player(self, env)
         self.batch_size = int(hyperparams.get("batch_size", 256))
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
         self.num_sampled_actions = max(2, int(hyperparams.get("num_sampled_actions", 8)))
@@ -1745,7 +1758,11 @@ class NativeUniZero(CustomAlgorithm):
         return list(candidates), log_probs.astype(np.float64)
 
     def search(
-        self, obs_batch: np.ndarray, root_caches: list[_TransformerCache | None], deterministic: np.ndarray | None = None,
+        self,
+        obs_batch: np.ndarray,
+        root_caches: list[_TransformerCache | None],
+        deterministic: np.ndarray | None = None,
+        action_masks: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
         """Batched, classic PUCT search (`_puct_select_child`) with root
         Dirichlet noise - reference's own default UniZero search
@@ -1784,11 +1801,21 @@ class NativeUniZero(CustomAlgorithm):
                 root_mean, root_std = self.heads.policy_gaussian(h_root)
 
         roots: list[_SearchNode] = []
+        discount = self.search_discount
+        interior_k = interior_max_children(int(self.n_actions or 0)) if self.discrete else None
         for i in range(batch_size):
             root = _SearchNode(prior=1.0)
             if self.discrete:
-                priors = _softmax(root_logits[i].detach().cpu().numpy().astype(np.float64))
-                candidates = None
+                logits = root_logits[i].detach().cpu().numpy().astype(np.float64)
+                mask = None if action_masks is None else action_masks[i]
+                if mask is not None:
+                    priors, action_ids = discrete_expand_slots(
+                        logits, action_mask=mask, max_children=None, as_logits=False,
+                    )
+                    candidates = action_ids
+                else:
+                    priors = _softmax(logits)
+                    candidates = None
             else:
                 candidates, log_probs = self._sample_continuous_candidates(root_mean[i : i + 1], root_std[i : i + 1])
                 priors = _softmax(log_probs)
@@ -1810,13 +1837,15 @@ class NativeUniZero(CustomAlgorithm):
                 node = roots[lane]
                 path = [node]
                 while node.expanded():
-                    idx = _puct_select_child(node, minmax_list[lane], self.gamma, self.pb_c_base, self.pb_c_init)
+                    idx = _puct_select_child(node, minmax_list[lane], discount, self.pb_c_base, self.pb_c_init)
                     node = node.children[idx]
                     path.append(node)
                 parent = path[-2]
                 leaf_nodes.append(node)
                 parent_states.append(parent.cache)
-                chosen_actions.append(node.candidate_action if not self.discrete else parent.children.index(node))
+                chosen_actions.append(
+                    node.candidate_action if not self.discrete else chosen_discrete_action(node, parent)
+                )
                 search_paths.append(path)
 
             if self.discrete:
@@ -1837,22 +1866,29 @@ class NativeUniZero(CustomAlgorithm):
                 leaf = leaf_nodes[lane]
                 rv = float(reward_scalar[lane].item())
                 if self.discrete:
-                    priors = _softmax(next_logits[lane].detach().cpu().numpy().astype(np.float64))
-                    leaf.expand(priors, child_states[lane], rv)
+                    logits = next_logits[lane].detach().cpu().numpy().astype(np.float64)
+                    if interior_k is not None:
+                        priors, action_ids = discrete_expand_slots(
+                            logits, max_children=interior_k, as_logits=False,
+                        )
+                        leaf.expand(priors, child_states[lane], rv, candidate_actions=action_ids)
+                    else:
+                        leaf.expand(_softmax(logits), child_states[lane], rv)
                 else:
                     candidates, log_probs = self._sample_continuous_candidates(next_mean[lane : lane + 1], next_std[lane : lane + 1])
                     leaf.expand(_softmax(log_probs), child_states[lane], rv, candidate_actions=candidates)
-                _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], self.gamma)
+                _backpropagate(search_paths[lane], float(next_value[lane].item()), minmax_list[lane], discount)
 
         results: list[dict[str, Any]] = []
         for lane in range(batch_size):
             root = roots[lane]
             visits = np.array([c.visit_count for c in root.children], dtype=np.float64)
-            policy_target = (visits / max(float(visits.sum()), 1e-8)).astype(np.float32)
+            child_policy = (visits / max(float(visits.sum()), 1e-8)).astype(np.float32)
             best_idx = int(np.argmax(visits))
             if self.discrete:
+                policy_target = discrete_policy_target(root, child_policy, int(self.n_actions))
                 if det[lane]:
-                    env_action: Any = best_idx
+                    env_action: Any = int(np.argmax(policy_target))
                 else:
                     env_action = int(np.random.choice(len(policy_target), p=policy_target))
             else:
@@ -1865,7 +1901,7 @@ class NativeUniZero(CustomAlgorithm):
                 # continuous policy loss fits a genuine importance-
                 # weighted NLL against this, not an MSE point-estimate
                 # regression toward a mean.
-                policy_target = np.concatenate([candidates_arr.reshape(-1), policy_target]).astype(np.float32)
+                policy_target = np.concatenate([candidates_arr.reshape(-1), child_policy]).astype(np.float32)
             results.append({"env_action": env_action, "policy_target": policy_target, "value_target": root.value()})
         return results
 
@@ -1931,7 +1967,7 @@ class NativeUniZero(CustomAlgorithm):
     # teacher forcing" bullet).
     # ------------------------------------------------------------------
     def _train_step(self) -> dict[str, float]:
-        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.gamma)
+        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.search_discount)
         device = self.device
         b, k_steps = self.batch_size, self.unroll_steps
         length = self.context_length
@@ -2184,8 +2220,10 @@ class NativeUniZero(CustomAlgorithm):
     # ------------------------------------------------------------------
     def learn(self, total_timesteps: int, callback: TrainingCallback) -> None:
         n_envs = num_envs_of(self.env)
-        obs_list = vec_reset(self.env, seed=self.seed)
+        obs_list, infos = vec_reset(self.env, seed=self.seed, return_info=True)
+        maybe_enable_two_player_from_infos(self, infos)
         obs_arr = obs_batch_to_array(obs_list, self._obs_space)
+        action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
         ep_reward = np.zeros(n_envs, dtype=np.float64)
         ep_length = np.zeros(n_envs, dtype=np.int64)
         num_timesteps = 0
@@ -2195,11 +2233,13 @@ class NativeUniZero(CustomAlgorithm):
             action_flats: list[np.ndarray] = []
             policy_targets: list[np.ndarray] = []
             if num_timesteps < self.learning_starts:
-                for _ in range(n_envs):
-                    raw_action = self._action_space.sample()
+                for lane in range(n_envs):
+                    mask = None if action_masks is None else action_masks[lane]
                     if self.discrete:
-                        policy_target = np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
+                        raw_action = sample_masked_action(self._action_space, mask)
+                        policy_target = uniform_legal_policy(int(self.n_actions), mask)
                     else:
+                        raw_action = self._action_space.sample()
                         # No real search yet during random warmup - repeat
                         # the one sampled action across all
                         # `num_sampled_actions` "candidate" slots with a
@@ -2226,16 +2266,18 @@ class NativeUniZero(CustomAlgorithm):
                 # no replay from `self.buffer` needed, unlike the
                 # (removed) cold-start-every-step approach this file used
                 # to take.
-                results = self.search(obs_arr, self._lane_cache, deterministic=None)
+                results = self.search(obs_arr, self._lane_cache, deterministic=None, action_masks=action_masks)
                 for result in results:
                     env_action = action_to_env(result["env_action"], self._action_space)
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
                     policy_targets.append(result["policy_target"])
 
-            next_obs_list, rewards, terminated, truncated, _infos = vec_step(self.env, env_actions)
+            next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
+            maybe_enable_two_player_from_infos(self, infos)
             dones = terminated | truncated
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
             for lane in range(n_envs):
                 self.buffer.add(
                     obs_arr[lane], action_flats[lane], float(rewards[lane]), next_obs_arr[lane],
@@ -2283,10 +2325,16 @@ class NativeUniZero(CustomAlgorithm):
         if episode_start:
             self._eval_cache = None
         obs_arr = obs_to_array(obs, self._obs_space)
+        mask = mask_from_unwrapped_env(self.env, int(self.n_actions)) if self.discrete else None
         # Same persistent-cache strategy `learn()` uses for its own real
         # steps (module docstring's "Persistent, incrementally-extended
         # per-lane root cache" section) - just one lane.
-        results = self.search(obs_arr[None], [self._eval_cache], deterministic=np.array([deterministic]))
+        results = self.search(
+            obs_arr[None],
+            [self._eval_cache],
+            deterministic=np.array([deterministic]),
+            action_masks=None if mask is None else mask[None],
+        )
         env_action = action_to_env(results[0]["env_action"], self._action_space)
         action_flat = obs_to_array(env_action, self._action_space)
         self._eval_cache = self._advance_lane_caches([self._eval_cache], obs_arr[None], action_flat[None])[0]

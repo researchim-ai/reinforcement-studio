@@ -265,6 +265,18 @@ import gymnasium as gym
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
 from rl_core.algorithms.native.exploration import RNDModule, uses_rnd
 from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_flat_dim, obs_to_array
+from rl_core.algorithms.native.zero_selfplay import (
+    attach_two_player,
+    chosen_discrete_action,
+    discrete_expand_slots,
+    discrete_policy_target,
+    interior_max_children,
+    mask_from_unwrapped_env,
+    masks_from_infos,
+    maybe_enable_two_player_from_infos,
+    sample_masked_action,
+    uniform_legal_policy,
+)
 from rl_core.algorithms.vec_env import (
     action_space as venv_action_space,
     num_envs_of,
@@ -2398,6 +2410,7 @@ class NativeResearchImZero(CustomAlgorithm):
         self._grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self._amp_dtype is torch.float16)
 
         self.gamma = float(hyperparams.get("gamma", 0.99))
+        attach_two_player(self, env)
         self.batch_size = int(hyperparams.get("batch_size", 64))
         self.td_steps = max(1, int(hyperparams.get("td_steps", 5)))
         self.num_sampled_actions = max(2, int(hyperparams.get("num_sampled_actions", 8)))
@@ -2803,7 +2816,11 @@ class NativeResearchImZero(CustomAlgorithm):
         return list(candidates), log_probs.astype(np.float64)
 
     def search(
-        self, obs_batch: np.ndarray, root_caches: list[_TransformerCache | None], deterministic: np.ndarray | None = None,
+        self,
+        obs_batch: np.ndarray,
+        root_caches: list[_TransformerCache | None],
+        deterministic: np.ndarray | None = None,
+        action_masks: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
         """Batched Gumbel-Top-k + Sequential Halving search
         (`efficientzero.py`'s own search algorithm, see module docstring's
@@ -2874,6 +2891,8 @@ class NativeResearchImZero(CustomAlgorithm):
         num_top_actions = max(
             2, min(self.num_top_actions, n_slots, max(2, current_num_simulations // 2)),
         )
+        discount = self.search_discount
+        interior_k = interior_max_children(int(self.n_actions or 0)) if self.discrete else None
         roots: list[_SearchNode] = []
         for i in range(batch_size):
             root = _SearchNode(prior=1.0)
@@ -2884,7 +2903,14 @@ class NativeResearchImZero(CustomAlgorithm):
                 # `argmax(logit + Gumbel noise)` sampling identity only
                 # holds in log-space).
                 priors = root_logits_np[i]
-                candidates = None
+                mask = None if action_masks is None else action_masks[i]
+                if mask is not None:
+                    priors, action_ids = discrete_expand_slots(
+                        priors, action_mask=mask, max_children=None, as_logits=True,
+                    )
+                    candidates = action_ids
+                else:
+                    candidates = None
             else:
                 candidates, priors = self._sample_continuous_candidates(root_mean_np[i], root_std_np[i])
             root.expand(priors, root_state_out[i], 0.0, candidate_actions=candidates)
@@ -2893,7 +2919,10 @@ class NativeResearchImZero(CustomAlgorithm):
             roots.append(root)
 
         minmax_list = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
-        gumbel = np.random.gumbel(size=(batch_size, n_slots)) * self.policy_target_temperature * self._current_exploration_scale()
+        gumbel = [
+            np.random.gumbel(size=len(root.children)) * self.policy_target_temperature * self._current_exploration_scale()
+            for root in roots
+        ]
         schedule = _HalvingSchedule(current_num_simulations, num_top_actions)
 
         for sim_idx in range(current_num_simulations):
@@ -2905,17 +2934,20 @@ class NativeResearchImZero(CustomAlgorithm):
                 root = roots[lane]
                 if sim_idx == 0:
                     scores = gumbel[lane] + np.array([c.prior for c in root.children])
-                    root.selected_children_idx = list(np.argsort(-scores)[:num_top_actions])
+                    keep = min(num_top_actions, len(root.children))
+                    root.selected_children_idx = list(np.argsort(-scores)[:keep])
                 node = root
                 path = [node]
                 while node.expanded():
-                    idx = _select_action(node, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
+                    idx = _select_action(node, minmax_list[lane], discount, self.c_visit, self.c_scale)
                     node = node.children[idx]
                     path.append(node)
                 parent = path[-2]
                 leaf_nodes.append(node)
                 parent_caches.append(parent.cache)
-                chosen_actions.append(node.candidate_action if not self.discrete else parent.children.index(node))
+                chosen_actions.append(
+                    node.candidate_action if not self.discrete else chosen_discrete_action(node, parent)
+                )
                 search_paths.append(path)
 
             if self.discrete:
@@ -2954,26 +2986,32 @@ class NativeResearchImZero(CustomAlgorithm):
                 leaf = leaf_nodes[lane]
                 rv = float(reward_np[lane])
                 if self.discrete:
-                    leaf.expand(next_logits_np[lane], child_caches[lane], rv)
+                    if interior_k is not None:
+                        child_priors, action_ids = discrete_expand_slots(
+                            next_logits_np[lane], max_children=interior_k, as_logits=True,
+                        )
+                        leaf.expand(child_priors, child_caches[lane], rv, candidate_actions=action_ids)
+                    else:
+                        leaf.expand(next_logits_np[lane], child_caches[lane], rv)
                 else:
                     candidates, priors = self._sample_continuous_candidates(next_mean_np[lane], next_std_np[lane])
                     leaf.expand(priors, child_caches[lane], rv, candidate_actions=candidates)
-                _backpropagate(search_paths[lane], float(value_np[lane]), minmax_list[lane], self.gamma)
+                _backpropagate(search_paths[lane], float(value_np[lane]), minmax_list[lane], discount)
 
             if schedule.maybe_advance(sim_idx):
                 for lane in range(batch_size):
                     _sequential_halving(
-                        roots[lane], gumbel[lane], minmax_list[lane], schedule.current_top, self.gamma, self.c_visit, self.c_scale,
+                        roots[lane], gumbel[lane], minmax_list[lane], schedule.current_top, discount, self.c_visit, self.c_scale,
                     )
 
         results: list[dict[str, Any]] = []
         for lane in range(batch_size):
             root = roots[lane]
-            transformed = _transformed_completed_qs(root, minmax_list[lane], self.gamma, self.c_visit, self.c_scale)
+            transformed = _transformed_completed_qs(root, minmax_list[lane], discount, self.c_visit, self.c_scale)
             improved = root.improved_policy(transformed)
             best_idx = int(root.selected_children_idx[0]) if root.selected_children_idx else int(np.argmax(improved))
             if self.discrete:
-                policy_target = improved.astype(np.float32)
+                policy_target = discrete_policy_target(root, improved, int(self.n_actions))
                 if det[lane]:
                     env_action: Any = int(np.argmax(policy_target))
                 else:
@@ -3265,7 +3303,7 @@ class NativeResearchImZero(CustomAlgorithm):
         current_lr = self._update_learning_rate()
         current_priority_beta = self._update_priority_beta()
         self._grad_step_count += 1
-        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.gamma)
+        batch = self.buffer.sample(self.batch_size, self.unroll_steps, self.td_steps, self.search_discount)
         device = self.device
         b, k_steps = self.batch_size, self.unroll_steps
         length = self.context_length
@@ -3795,8 +3833,10 @@ class NativeResearchImZero(CustomAlgorithm):
     # ------------------------------------------------------------------
     def learn(self, total_timesteps: int, callback: TrainingCallback) -> None:
         n_envs = num_envs_of(self.env)
-        obs_list = vec_reset(self.env, seed=self.seed)
+        obs_list, infos = vec_reset(self.env, seed=self.seed, return_info=True)
+        maybe_enable_two_player_from_infos(self, infos)
         obs_arr = obs_batch_to_array(obs_list, self._obs_space)
+        action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
         ep_reward = np.zeros(n_envs, dtype=np.float64)
         ep_extrinsic = np.zeros(n_envs, dtype=np.float64)
         ep_intrinsic = np.zeros(n_envs, dtype=np.float64)
@@ -3825,17 +3865,18 @@ class NativeResearchImZero(CustomAlgorithm):
             behavior_metadata: list[dict[str, Any]] = []
             searched_root_caches: list[_TransformerCache] | None = None
             if num_timesteps < self.learning_starts:
-                for _ in range(n_envs):
-                    raw_action = self._action_space.sample()
-                    policy_target = (
-                        np.full(self.n_actions, 1.0 / self.n_actions, dtype=np.float32)
-                        if self.discrete
+                for lane in range(n_envs):
+                    mask = None if action_masks is None else action_masks[lane]
+                    if self.discrete:
+                        raw_action = sample_masked_action(self._action_space, mask)
+                        policy_target = uniform_legal_policy(int(self.n_actions), mask)
+                    else:
+                        raw_action = self._action_space.sample()
                         # No real search yet during random warmup - the
                         # sampled action itself is the fallback "target"
                         # (`efficientzero.py`'s own choice, matching this
                         # file's `policy_target_dim = action_dim`).
-                        else np.asarray(raw_action, dtype=np.float32).reshape(-1)
-                    )
+                        policy_target = np.asarray(raw_action, dtype=np.float32).reshape(-1)
                     env_action = action_to_env(raw_action, self._action_space)
                     env_actions.append(env_action)
                     action_flats.append(obs_to_array(env_action, self._action_space))
@@ -3854,7 +3895,7 @@ class NativeResearchImZero(CustomAlgorithm):
                 # no replay from `self.buffer` needed, unlike the
                 # (removed) cold-start-every-step approach this file used
                 # to take.
-                results = self.search(obs_arr, self._lane_cache, deterministic=None)
+                results = self.search(obs_arr, self._lane_cache, deterministic=None, action_masks=action_masks)
                 root_cache_candidates = [result.get("root_cache") for result in results]
                 if all(cache is not None for cache in root_cache_candidates):
                     searched_root_caches = root_cache_candidates
@@ -3911,8 +3952,10 @@ class NativeResearchImZero(CustomAlgorithm):
                     )
 
             next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
+            maybe_enable_two_player_from_infos(self, infos)
             dones = terminated | truncated
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
+            action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
             # `vec_step` uses SAME_STEP autoreset: `next_obs_arr` is the
             # fresh reset observation for a done lane (the state the next
             # policy call must see), while `final_obs` is the true next
@@ -4039,10 +4082,16 @@ class NativeResearchImZero(CustomAlgorithm):
         if episode_start:
             self._eval_cache = None
         obs_arr = obs_to_array(obs, self._obs_space)
+        mask = mask_from_unwrapped_env(self.env, int(self.n_actions)) if self.discrete else None
         # Same persistent-cache strategy `learn()` uses for its own real
         # steps (module docstring's "Persistent, incrementally-extended
         # per-lane root cache" section) - just one lane.
-        results = self.search(obs_arr[None], [self._eval_cache], deterministic=np.array([deterministic]))
+        results = self.search(
+            obs_arr[None],
+            [self._eval_cache],
+            deterministic=np.array([deterministic]),
+            action_masks=None if mask is None else mask[None],
+        )
         env_action = action_to_env(results[0]["env_action"], self._action_space)
         action_flat = obs_to_array(env_action, self._action_space)
         self._eval_cache = self._append_actions_to_root_caches(

@@ -1,6 +1,6 @@
 import { Fragment, type ReactNode } from 'react'
 import {
-  ArrowRight, Brain, Crosshair, Database, Dices, Moon, Repeat, RefreshCw, Shuffle, Swords,
+  ArrowRight, Brain, Crosshair, Database, Dices, Gauge, Moon, Repeat, RefreshCw, Shield, Shuffle, Swords,
   Target, TrendingUp, Eye, Layers, History, Sparkles, Users,
 } from 'lucide-react'
 import { cn, formatNumber } from '@/lib/utils'
@@ -40,7 +40,7 @@ interface Step {
 
 type Family =
   | 'ppo' | 'a2c' | 'dqn' | 'rainbow_dqn' | 'sac' | 'ddpg' | 'td3' | 'es' | 'alphazero'
-  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'unizero' | 'latentimzero'
+  | 'dreamer' | 'mbpo' | 'pets' | 'world_models_ha' | 'efficientzero' | 'unizero' | 'researchimzero' | 'latentimzero'
   | 'ippo' | 'qmix' | 'generic'
 
 /** Best-effort family detection from the algorithm id — used to pick which
@@ -64,8 +64,9 @@ function familyOf(algorithmId: string, kind: 'gym' | 'alphazero'): Family {
   if (id.includes('pets')) return 'pets'
   if (id.includes('world_models_ha') || id.includes('world-models-ha')) return 'world_models_ha'
   if (id.includes('latentimzero')) return 'latentimzero'
+  if (id.includes('researchimzero')) return 'researchimzero'
   if (id.includes('efficientzero') || id.includes('efficient-zero') || id.includes('muzero')) return 'efficientzero'
-  if (id.includes('unizero') || id.includes('researchimzero')) return 'unizero'
+  if (id.includes('unizero')) return 'unizero'
   if (id === 'ippo' || id.includes('ippo')) return 'ippo'
   if (id === 'qmix' || id.includes('qmix')) return 'qmix'
   return 'generic'
@@ -285,15 +286,41 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
         ],
         loopCaption: 'Как EfficientZero, но вместо рекуррентной (LSTM/MLP) динамики — единый causal Transformer над явной последовательностью токенов [obs₀, act₀, obs₁, act₁, ...]: каждое прошлое наблюдение остаётся напрямую доступным через attention, а не сжимается в один вектор состояния',
       }
+    case 'researchimzero':
+      return {
+        steps: [
+          { icon: History, title: 'Токены + KV-cache', detail: hp(hyperparams, 'context_length', 'context=') },
+          {
+            icon: Crosshair,
+            title: 'Gumbel search (адаптивный бюджет)',
+            detail: joinDetail(hp(hyperparams, 'num_simulations', 'sim≤'), hp(hyperparams, 'num_simulations_initial', 'start=')),
+          },
+          {
+            icon: RefreshCw,
+            title: 'Teacher-force + closed-loop',
+            detail: joinDetail(hp(hyperparams, 'unroll_steps', 'unroll='), hp(hyperparams, 'closed_loop_horizon', 'imagine=')),
+          },
+          {
+            icon: Database,
+            title: 'PER + recent + reanalyze',
+            detail: hp(hyperparams, 'reanalyze_freq', 'reanalyze каждые='),
+          },
+        ],
+        loopCaption: 'Наша версия UniZero: тот же Transformer + Gumbel, плюс closed-loop overshooting, streaming replay и бюджет поиска, который растёт по мере падения ошибки модели',
+      }
     case 'latentimzero':
       return {
         steps: [
-          { icon: History, title: 'Posterior stochastic state', detail: hp(hyperparams, 'context_length', 'context=') },
-          { icon: Moon, title: 'Prior imagination', detail: hp(hyperparams, 'imagination_horizon', 'horizon=') },
-          { icon: Brain, title: 'Continue-aware λ-return actor-critic', detail: hp(hyperparams, 'imagination_lambda', 'λ=') },
-          { icon: Crosshair, title: 'Uncertainty-gated Gumbel planner', detail: hp(hyperparams, 'num_simulations', 'sim≤') },
+          { icon: History, title: 'Ядро ResearchImZero', detail: hp(hyperparams, 'context_length', 'context=') },
+          {
+            icon: Gauge,
+            title: 'VoC: бюджет {0, 4, 16, 32}',
+            detail: hp(hyperparams, 'num_simulations', 'потолок='),
+          },
+          { icon: Sparkles, title: 'Uncertainty probe (sidecar)', detail: 'detach, отдельный Adam' },
+          { icon: Shield, title: 'Safety floor / shadow / audit' },
         ],
-        loopCaption: 'Stochastic imagination planning: реальный posterior обучает модель мира, длинные prior-rollout дают actor/value сигналы, а uncertainty-gated поиск корректирует и дистиллирует политику',
+        loopCaption: 'Тот же ResearchImZero, плюс изолированные sidecar’ы: VoC решает сколько симуляций потратить, uncertainty-зонд оценивает недоверие модели, ядро не получает их градиентов',
       }
     case 'ippo':
       return {

@@ -9,7 +9,32 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      MUJOCO_GL: osmesa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -r rl_core/requirements.txt -r backend/requirements.txt
+      - run: python -m pytest rl_core/tests -q --tb=short
+
   build-linux:
+    needs: quality
     runs-on: ubuntu-22.04
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -34,6 +59,7 @@ jobs:
           retention-days: 5
 
   build-windows:
+    needs: quality
     # Pin to windows-2022: windows-latest now maps to windows-2025, where the
     # node-gyp bundled by @electron/rebuild fails to locate Visual Studio when
     # compiling native modules ("Could not find any Visual Studio installation").
@@ -61,6 +87,7 @@ jobs:
           retention-days: 5
 
   build-macos:
+    needs: quality
     # macOS is best-effort for now (no code-signing/notarization configured yet,
     # so Gatekeeper will warn on first launch) — a failure here must not block
     # the Linux/Windows release, see the `release` job's condition below.
@@ -89,12 +116,13 @@ jobs:
           retention-days: 5
 
   release:
-    needs: [build-linux, build-windows, build-macos]
+    needs: [quality, build-linux, build-windows, build-macos]
     runs-on: ubuntu-22.04
     # Linux + Windows are the priority platforms and must both succeed; macOS is
     # included in the release if it happened to succeed, but never blocks it.
     if: |
       always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.quality.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-windows.result == 'success'
     steps:

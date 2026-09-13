@@ -89,3 +89,10 @@ lbforaging>=2.0
 # minihack instead of a "looks installed, silently broken until first
 # import" one — uncomment alongside the two lines above.
 # setuptools<81
+# OpenSpiel (DeepMind) — chess / Go 9×9 as AlphaZero self-play board games
+# (rl_core/games/openspiel_games.py). C++ wheel, import name `pyspiel`.
+# Official wheels need CPython 3.11+ (v2.0 also ships Windows); the marker
+# skips the install on 3.10 so a Native boot against an older system
+# interpreter still succeeds, and the gallery cards grey out until the
+# user is on 3.11+ (managed portable CPython is 3.12).
+open_spiel>=1.6.15; python_version >= "3.11"

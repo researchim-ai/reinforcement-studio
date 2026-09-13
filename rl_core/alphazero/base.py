@@ -83,10 +83,13 @@ class AlphaZeroTrainer(ABC):
         `predict(encoded_state, device) -> (policy_probs, value)` method
         (used by MCTS)."""
         g = self.sample_game
+        in_planes = int(g.input_planes)
         network_spec = self.hp.get("network_spec")
         if network_spec:
-            return SpecAlphaZeroNet(g.rows, g.cols, g.action_size, network_spec)
-        return AlphaZeroNet(g.rows, g.cols, g.action_size, self.hp["channels"], self.hp["num_blocks"])
+            return SpecAlphaZeroNet(g.rows, g.cols, g.action_size, network_spec, in_planes=in_planes)
+        return AlphaZeroNet(
+            g.rows, g.cols, g.action_size, self.hp["channels"], self.hp["num_blocks"], in_planes=in_planes,
+        )
 
     @abstractmethod
     def run_iteration(self, iteration: int) -> dict[str, Any]: ...
@@ -107,7 +110,7 @@ class AlphaZeroTrainer(ABC):
             "rows": g.rows,
             "cols": g.cols,
             "action_size": g.action_size,
-            "input_planes": 3,
+            "input_planes": int(g.input_planes),
         }
         if self.hp.get("network_spec"):
             info["network_spec"] = self.hp["network_spec"]

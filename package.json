@@ -28,6 +28,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:py": "python -m pytest rl_core/tests -q --tb=short",
     "typecheck": "tsc --noEmit",
     "postinstall": "electron-builder install-app-deps"
   },

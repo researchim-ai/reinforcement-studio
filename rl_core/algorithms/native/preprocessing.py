@@ -15,12 +15,19 @@ import gymnasium as gym
 
 
 def is_image_space(space: gym.Space) -> bool:
-    """(H, W, C) or (C, H, W) uint8-ish Box — treat as a CNN input."""
-    return (
-        isinstance(space, gym.spaces.Box)
-        and len(space.shape) == 3
-        and min(space.shape) <= 4
-    )
+    """(H, W, C) or (C, H, W) uint8-ish Box — treat as a CNN input.
+
+    The `min(shape) <= 4` branch is the usual Atari/MiniGrid case (a
+    channel axis of 1–4). Board-game tensors such as chess `(8, 8, 20)`
+    have more planes than that, so a small spatial H×W with a moderate
+    channel count is also accepted as an image (channel-last).
+    """
+    if not isinstance(space, gym.spaces.Box) or len(space.shape) != 3:
+        return False
+    if min(space.shape) <= 4:
+        return True
+    height, width, channels = (int(dim) for dim in space.shape)
+    return 3 <= height <= 32 and 3 <= width <= 32 and 1 <= channels <= 128
 
 
 def obs_flat_dim(space: gym.Space) -> int:

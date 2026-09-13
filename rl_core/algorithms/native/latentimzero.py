@@ -36,6 +36,12 @@ from rl_core.algorithms.native.researchimzero import (
     _signed_hyperbolic,
     _transformed_completed_qs,
 )
+from rl_core.algorithms.native.zero_selfplay import (
+    chosen_discrete_action,
+    discrete_expand_slots,
+    discrete_policy_target,
+    interior_max_children,
+)
 
 
 LATENTIMZERO_CHECKPOINT_VERSION = 11
@@ -728,15 +734,15 @@ class NativeLatentImZero(NativeResearchImZero):
             _, action_hidden, next_hidden = self._step_imagine(parent_caches, action_tensor)
             target_q = (
                 self.target_heads.reward(action_hidden)
-                + self.gamma * self.target_heads.value(next_hidden)
+                + self.search_discount * self.target_heads.value(next_hidden)
             )
             online_q = (
                 self.heads.reward(action_hidden)
-                + self.gamma * self.heads.value(next_hidden)
+                + self.search_discount * self.heads.value(next_hidden)
             )
             probe_q = (
                 self.uncertainty_probe.reward(action_hidden)
-                + self.gamma * self.uncertainty_probe.value(next_hidden)
+                + self.search_discount * self.uncertainty_probe.value(next_hidden)
             )
             probe_uncertainty = probe_q.std(dim=-1, unbiased=False)
             stability_error = (target_q - online_q).abs()
@@ -1270,6 +1276,7 @@ class NativeLatentImZero(NativeResearchImZero):
         obs_batch: np.ndarray,
         root_caches: list[Any],
         deterministic: np.ndarray | None = None,
+        action_masks: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
         """Run one max-schedule planner and expose true prefix checkpoints.
 
@@ -1281,7 +1288,7 @@ class NativeLatentImZero(NativeResearchImZero):
         never train VoC or mutate its safety state.
         """
         if self.force_research_mode or not self.voc_enabled:
-            return super().search(obs_batch, root_caches, deterministic)
+            return super().search(obs_batch, root_caches, deterministic, action_masks=action_masks)
 
         batch_size = len(obs_batch)
         collection = deterministic is None
@@ -1336,6 +1343,8 @@ class NativeLatentImZero(NativeResearchImZero):
                 max(2, maximum_budget // 2),
             ),
         )
+        discount = self.search_discount
+        interior_k = interior_max_children(int(self.n_actions or 0)) if self.discrete else None
         schedule = _HalvingSchedule(maximum_budget, num_top_actions)
         minmax = [_MinMaxStats(self.value_minmax_delta) for _ in range(batch_size)]
         roots: list[_SearchNode] = []
@@ -1343,12 +1352,23 @@ class NativeLatentImZero(NativeResearchImZero):
         actor_entropies: list[float] = []
         for lane in range(batch_size):
             if self.discrete:
-                candidates = list(range(num_root_actions))
-                priors = root_logits_np[lane, :num_root_actions]
-                probabilities = actor_probabilities[lane, :num_root_actions]
+                mask = None if action_masks is None else action_masks[lane]
+                priors, action_ids = discrete_expand_slots(
+                    root_logits_np[lane],
+                    action_mask=mask,
+                    max_children=None,
+                    as_logits=True,
+                )
+                candidates = action_ids
+                probabilities = actor_probabilities[lane].astype(np.float64)
+                if mask is not None:
+                    probabilities = probabilities * (np.asarray(mask).reshape(-1) > 0)
+                    total = float(probabilities.sum())
+                    if total > 0:
+                        probabilities = probabilities / total
                 entropy = -float(
                     np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, None))),
-                ) / max(math.log(max(2, len(probabilities))), 1e-6)
+                ) / max(math.log(max(2, int(self.n_actions))), 1e-6)
             else:
                 candidates, priors = self._continuous_anytime_candidates(
                     actor_means[lane], actor_stds[lane],
@@ -1365,7 +1385,7 @@ class NativeLatentImZero(NativeResearchImZero):
                 priors,
                 root_states[lane],
                 0.0,
-                candidate_actions=None if self.discrete else candidates,
+                candidate_actions=candidates,
             )
             root.visit_count = 1
             root.value_sum = float(root_values_np[lane])
@@ -1373,14 +1393,16 @@ class NativeLatentImZero(NativeResearchImZero):
             root_candidates.append(candidates)
             actor_entropies.append(entropy)
 
-        fixed_gumbels = (
-            np.random.gumbel(size=(batch_size, num_root_actions))
+        fixed_gumbels = [
+            np.random.gumbel(size=len(root.children))
             * self.policy_target_temperature
             * self._current_exploration_scale()
-        )
+            for root in roots
+        ]
         for lane, root in enumerate(roots):
             scores = fixed_gumbels[lane] + np.asarray([child.prior for child in root.children])
-            root.selected_children_idx = list(np.argsort(-scores)[:num_top_actions])
+            keep = min(num_top_actions, len(root.children))
+            root.selected_children_idx = list(np.argsort(-scores)[:keep])
         checkpoint_indices: list[dict[int, int]] = [dict() for _ in range(batch_size)]
         checkpoint_policies: list[dict[int, np.ndarray]] = [dict() for _ in range(batch_size)]
         checkpoint_actions: list[dict[int, Any]] = [dict() for _ in range(batch_size)]
@@ -1400,7 +1422,13 @@ class NativeLatentImZero(NativeResearchImZero):
         root_scalars: list[torch.Tensor] = []
         for lane in range(batch_size):
             if self.discrete:
-                behavior = actor_probabilities[lane, :num_root_actions].astype(np.float32)
+                behavior = actor_probabilities[lane].astype(np.float32)
+                if action_masks is not None:
+                    legal = np.asarray(action_masks[lane]).reshape(-1) > 0
+                    behavior = behavior * legal
+                    total = float(behavior.sum())
+                    if total > 0:
+                        behavior = behavior / total
                 actor_index = int(np.argmax(behavior))
                 feature_policy = behavior
             else:
@@ -1477,7 +1505,7 @@ class NativeLatentImZero(NativeResearchImZero):
                     child_index = _select_action(
                         node,
                         minmax[lane],
-                        self.gamma,
+                        discount,
                         self.c_visit,
                         self.c_scale,
                     )
@@ -1489,7 +1517,7 @@ class NativeLatentImZero(NativeResearchImZero):
                 actions.append(
                     node.candidate_action
                     if not self.discrete
-                    else parent.children.index(node)
+                    else chosen_discrete_action(node, parent)
                 )
                 search_paths.append(path)
 
@@ -1521,8 +1549,14 @@ class NativeLatentImZero(NativeResearchImZero):
             for local_index, lane in enumerate(active_lanes):
                 leaf = leaf_nodes[local_index]
                 if self.discrete:
-                    leaf_candidates = None
-                    leaf_priors = next_policy_np[local_index]
+                    if interior_k is not None:
+                        leaf_priors, leaf_action_ids = discrete_expand_slots(
+                            next_policy_np[local_index], max_children=interior_k, as_logits=True,
+                        )
+                        leaf_candidates = leaf_action_ids
+                    else:
+                        leaf_candidates = None
+                        leaf_priors = next_policy_np[local_index]
                 else:
                     leaf_candidates, leaf_priors = self._continuous_anytime_candidates(
                         next_means_np[local_index],
@@ -1538,7 +1572,7 @@ class NativeLatentImZero(NativeResearchImZero):
                     search_paths[local_index],
                     float(next_values_np[local_index]),
                     minmax[lane],
-                    self.gamma,
+                    discount,
                 )
                 expansion_counts[lane] += 1
             if schedule.maybe_advance(simulation):
@@ -1548,7 +1582,7 @@ class NativeLatentImZero(NativeResearchImZero):
                         fixed_gumbels[lane],
                         minmax[lane],
                         schedule.current_top,
-                        self.gamma,
+                        discount,
                         self.c_visit,
                         self.c_scale,
                     )
@@ -1562,14 +1596,15 @@ class NativeLatentImZero(NativeResearchImZero):
             stage_scalars: list[torch.Tensor] = []
             for lane in active_lanes:
                 completed_q = _transformed_completed_qs(
-                    roots[lane], minmax[lane], self.gamma, self.c_visit, self.c_scale,
+                    roots[lane], minmax[lane], discount, self.c_visit, self.c_scale,
                 )
                 improved = roots[lane].improved_policy(completed_q).astype(np.float32)
                 selected_index = int(np.argmax(improved))
                 checkpoint_indices[lane][completed_budget] = selected_index
                 if self.discrete:
-                    checkpoint_policies[lane][completed_budget] = improved
-                    checkpoint_actions[lane][completed_budget] = selected_index
+                    full_policy = discrete_policy_target(roots[lane], improved, int(self.n_actions))
+                    checkpoint_policies[lane][completed_budget] = full_policy
+                    checkpoint_actions[lane][completed_budget] = int(np.argmax(full_policy))
                 else:
                     policy_mean = np.sum(
                         improved[:, None] * np.stack(root_candidates[lane]),

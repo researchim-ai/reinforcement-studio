@@ -109,11 +109,15 @@ win:
   icon: build/icon.ico
 
 nsis:
+  artifactName: ${productName}-${version}-${os}-${arch}-setup.${ext}
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Reinforcement Studio
+
+portable:
+  artifactName: ${productName}-${version}-${os}-${arch}-portable.${ext}
 
 dmg:
   contents:

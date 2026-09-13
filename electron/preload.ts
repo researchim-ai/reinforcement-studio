@@ -26,6 +26,7 @@ export type BootPhase =
   | { phase: 'starting-container' }
   | { phase: 'waiting-container-health'; attempt: number }
   | { phase: 'starting-python' }
+  | { phase: 'installing-python'; line?: string }
   | { phase: 'creating-venv'; line?: string }
   | { phase: 'installing-dependencies'; line?: string }
   | { phase: 'python-starting'; line?: string }

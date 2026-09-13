@@ -18,7 +18,7 @@ Electron-окно с React UI. Бэкенд на Python (FastAPI) запуска
   Prioritized Replay и n-step возвраты сверху обычного DQN; SAC — off-policy
   метод для непрерывных действий (альтернатива PPO/A2C на continuous-средах).
 - **AlphaZero** с нуля: PUCT MCTS + dual-head CNN + self-play + arena-gating,
-  для Tic-Tac-Toe, Connect Four и Gomoku.
+  для Tic-Tac-Toe, Connect Four, Gomoku, шахмат и го 9×9 (OpenSpiel).
 - **Память (LSTM/GRU)** — PPO, A2C, DQN и Rainbow DQN можно переключить в
   рекуррентный режим: между извлечением признаков и головами действия/
   ценности встаёт LSTM или GRU, настраиваются размер hidden state, число
@@ -59,7 +59,6 @@ Electron-окно с React UI. Бэкенд на Python (FastAPI) запуска
   архитектуры сети показываются и при дизайне эксперимента, и во время
   обучения — для всех встроенных алгоритмов и кастомных модификаций
   (`src/components/AlgorithmDiagram.tsx`).
-- **AlphaZero Arena** — сыграй против своего агента или случайного бота.
 - **Model Zoo** — сохранённые чекпоинты, независимые от истории запусков.
 - **Свои плагины** — пишите собственные алгоритмы (Gym и AlphaZero) и
   reward-функции прямо в приложении (Monaco-редактор на странице
@@ -77,11 +76,11 @@ Electron-окно с React UI. Бэкенд на Python (FastAPI) запуска
   не только там, где она была создана. Работает для PPO/A2C (actor_critic),
   DQN (q_network), Rainbow DQN (dueling_q) и AlphaZero (policy+value).
   Подробности в разделе [«Конструктор архитектур сетей»](#конструктор-архитектур-сетей).
-- **Учебный центр** (`/academy`) — курс по RL внутри приложения: отдельный урок на
-  каждый алгоритм (DQN, Rainbow DQN, A2C, PPO, SAC, AlphaZero) плюс основы RL,
-  память (LSTM/GRU) и POMDP-среды — с формулами, графиками (ε-greedy decay,
-  PPO clip objective, discount factor) и схемами (MCTS-дерево, replay buffer,
-  dueling-сеть, ...), и итоговой шпаргалкой «что выбрать».
+- **Учебный центр** (`/academy`) — полноценный курс, не справочник аббревиатур: старт
+  (что такое RL, первый эксперимент CartPole+PPO), основы (агент/среда, возврат, политика,
+  Беллман, exploration, on/off-policy), табличные методы (DP, Monte Carlo, TD/Q-learning),
+  затем по уроку на каждый алгоритм каталога и практика (графики, гиперпараметры, поломки,
+  шпаргалка). Поиск, «назад/дальше», deep-link `?lesson=`.
 
 ---
 
@@ -89,8 +88,8 @@ Electron-окно с React UI. Бэкенд на Python (FastAPI) запуска
 
 ### Требования
 
-- **Node.js** >= 20
-- **Python** >= 3.10 + pip
+- **Node.js** >= 20 (только для разработки; в установщике Windows/Linux/macOS не нужен)
+- **Python** — не обязателен. Если в системе есть CPython 3.10+, Native-режим его использует; иначе приложение само скачает встроенный интерпретатор.
 - **Docker** — опционально, для изолированного/переносимого запуска бэкенда
 
 ### 1. Установка
@@ -99,9 +98,12 @@ Electron-окно с React UI. Бэкенд на Python (FastAPI) запуска
 npm install
 ```
 
-Python ставить руками **не нужно** — только сам интерпретатор Python
-3.10+ должен быть в `PATH`. При первом запуске Electron сам создаёт
-приватное виртуальное окружение (`userData/pyenv`) и ставит туда
+Python ставить руками **не нужно**. При первом запуске Native-режима
+Electron ищет CPython 3.10+ (на Windows — в том числе через `py -3` и
+стандартные папки установки, заглушка Microsoft Store игнорируется).
+Если интерпретатора нет, скачивается встроенный CPython 3.12 в
+`userData/python-runtime`. Затем создаётся приватное виртуальное
+окружение (`userData/pyenv`) и туда ставятся
 `rl_core/requirements.txt` + `backend/requirements.txt` (progress виден на
 сплэш-экране). Повторные запуски это окружение переиспользуют — установка
 запускается заново только если requirements изменились.
@@ -152,7 +154,7 @@ npm run build         # текущая платформа
 |----------|-----------|
 | `Auto`   | Сначала Docker, если не вышло — нативный Python |
 | `Docker` | Только контейнер `rl-studio:latest` (соберётся сам при первом запуске) |
-| `Native` | Только локальный `python3 -m uvicorn backend.api:app` |
+| `Native` | Приватный venv + uvicorn. Системный Python не обязателен: если его нет, студия скачает встроенный CPython. |
 
 ### GPU
 
@@ -204,15 +206,11 @@ PyPI, которому может требоваться более новый �
 │           Electron Desktop App        │
 │  ┌─────────────┐   ┌────────────────┐ │
 │  │ Main Process│   │ Renderer (React)│ │
-│  │ Стартует     │   │ 8 страниц:      │ │
-│  │ Python/Docker│   │  Dashboard      │ │
-│  │ бэкенд       │   │  Designer       │ │
-│  │ автоматом    │   │  Monitor        │ │
-│  │              │   │  Environments   │ │
-│  │              │   │  Arena          │ │
-│  │              │   │  Model Zoo      │ │
-│  │              │   │  Plugins        │ │
-│  │              │   │  Settings       │ │
+│  │ Стартует     │   │ Dashboard, Designer, Monitor, │
+│  │ Python/Docker│   │ Environments, Model Zoo,      │
+│  │ бэкенд       │   │ Sweeps, Plugins, Networks,     │
+│  │ автоматом    │   │ World Models, Scene Builder,   │
+│  │              │   │ Academy, Settings              │
 │  └──────┬───────┘   └────────┬────────┘ │
 └─────────┼────────────────────┼──────────┘
           │           HTTP + WebSocket
@@ -221,7 +219,7 @@ PyPI, которому может требоваться более новый �
   │  /api/environments/* — каталог сред  │
   │  /api/training/*     — запуск/стоп   │
   │  /api/models/*       — Model Zoo     │
-  │  /api/alphazero/*    — Arena         │
+  │  /api/alphazero/*    — AlphaZero API │
   │  /api/plugins/*      — свои плагины  │
   │  /ws/metrics/{run_id}— метрики (WS)  │
   │  subprocess → rl_core.runner         │
@@ -314,10 +312,19 @@ DQN/PPO/A2C/SAC на чистом PyTorch, без Stable-Baselines3 (это де
 
 ### Настольные игры
 
-`rl_core/games/` — общий интерфейс `BoardGame` (см. `base.py`), три
-реализации: `TicTacToe` (3×3), `ConnectFour` (7×6, drop-in-column),
-`Gomoku` (9×9, 5 в ряд). `current_player` флипается на каждом ходе (даже
-терминальном) — это упрощает знаки в MCTS backup.
+`rl_core/games/` — общий интерфейс `BoardGame` (см. `base.py`): `TicTacToe`
+(3×3), `ConnectFour` (7×6, drop-in-column), `Gomoku` (9×9, 5 в ряд), плюс
+обёртки OpenSpiel `Chess` (20×8×8, 4674 хода) и `Go9x9` (пас, коми 7.5).
+`current_player` флипается на каждом ходе (даже терминальном) — это
+упрощает знаки в MCTS backup. OpenSpiel ставится из `requirements.txt`
+(`open_spiel`, CPython 3.11+).
+
+AlphaZero ходит в `BoardGame` напрямую. EfficientZero / UniZero /
+ResearchImZero / LatentImZero — через Gym-обёртку
+`rl_core/envs/board_game_gym.py` (тот же id среды): один ply за `step`,
+маска легальных ходов, скидка `−γ` в поиске (self-play двух игроков одной
+сетью). В Дизайнере на карточке шахмат/го выбирается любой из этих
+алгоритмов.
 
 ---
 
@@ -385,7 +392,7 @@ ALGORITHM_CLASS = MyAlgorithm       # класс, см. ниже
 - Или override `run_iteration(iteration) -> dict` целиком — полная замена
   цикла обучения. Можно переиспользовать `self_play.play_self_play_game`,
   `arena.play_match`. Верните `"_self_play_records"` в результате, чтобы
-  партии были доступны для реплея на странице Arena.
+  партии сохранились в записях self-play запуска.
 
 ### Reward-функция
 
@@ -684,7 +691,7 @@ reinforcement-studio/
 │                                      models, alphazero, plugins, networks
 ├── rl_core/                  # RL-ядро — envs, алгоритмы, AlphaZero
 │   ├── envs/                   #   Gymnasium registry + wrappers + reward_fn + pomdp.py
-│   ├── games/                   #   TicTacToe / ConnectFour / Gomoku
+│   ├── games/                   #   TicTacToe / ConnectFour / Gomoku / Chess / Go9x9
 │   ├── algorithms/               #   base.py + native/ (PPO/A2C/DQN/Rainbow/SAC с нуля) +
 │   │                                    native_runner/runner_utils + sb3_runner
 │   │                                    (опционально, для custom-плагинов) +

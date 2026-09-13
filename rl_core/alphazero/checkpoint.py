@@ -18,6 +18,7 @@ def save_checkpoint(net: AlphaZeroNet, path: Path, meta: dict[str, Any]) -> None
             "rows": net.rows,
             "cols": net.cols,
             "action_size": net.action_size,
+            "in_planes": getattr(net, "in_planes", 3),
             "meta": meta,
         },
         path,
@@ -46,7 +47,10 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any
         # assuming the default AlphaZeroNet.
         from rl_core.netbuilder import SpecAlphaZeroNet
 
-        net = SpecAlphaZeroNet(payload["rows"], payload["cols"], payload["action_size"], hp["network_spec"])
+        net = SpecAlphaZeroNet(
+            payload["rows"], payload["cols"], payload["action_size"], hp["network_spec"],
+            in_planes=payload.get("in_planes", 3),
+        )
     else:
         # Built-in trainer with the default architecture — respect whatever
         # channels/num_blocks it was actually trained with (older
@@ -54,6 +58,7 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any
         net = AlphaZeroNet(
             payload["rows"], payload["cols"], payload["action_size"],
             hp.get("channels", 48), hp.get("num_blocks", 3),
+            in_planes=payload.get("in_planes", 3),
         )
     net.load_state_dict(payload["state_dict"])
     net.to(device)

@@ -91,4 +91,22 @@ describe('AlgorithmDiagram', () => {
     expect(container.textContent).not.toContain('blocks.11.attn.q_proj')
     expect(container.textContent).not.toContain('Causal Transformer')
   })
+
+  it('renders ResearchImZero as UniZero plus closed-loop and adaptive search', () => {
+    const { container } = render(
+      <AlgorithmDiagram algorithmId="researchimzero" kind="gym" show={{ network: false }} />,
+    )
+    expect(container.textContent).toContain('closed-loop')
+    expect(container.textContent).toContain('адаптивный бюджет')
+  })
+
+  it('renders LatentImZero as Research core plus VoC, not the old imagination stack', () => {
+    const { container } = render(
+      <AlgorithmDiagram algorithmId="latentimzero" kind="gym" show={{ network: false }} />,
+    )
+    expect(container.textContent).toContain('VoC')
+    expect(container.textContent).toContain('ResearchImZero')
+    expect(container.textContent).not.toContain('Prior imagination')
+    expect(container.textContent).not.toContain('λ-return')
+  })
 })

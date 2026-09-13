@@ -9,6 +9,16 @@ GAME_REGISTRY: dict[str, type[BoardGame]] = {
     "gomoku": Gomoku,
 }
 
+try:
+    import pyspiel  # noqa: F401
+    from rl_core.games.openspiel_games import Chess, Go9x9
+
+    GAME_REGISTRY["chess"] = Chess
+    GAME_REGISTRY["go_9x9"] = Go9x9
+except ImportError:
+    Chess = None  # type: ignore[misc, assignment]
+    Go9x9 = None  # type: ignore[misc, assignment]
+
 
 def make_game(game_id: str) -> BoardGame:
     if game_id not in GAME_REGISTRY:

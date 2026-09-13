@@ -12,7 +12,7 @@ import { useSystemInfo } from '@/api/hooks'
 const MODES = [
   { id: 'auto' as const, label: 'Auto', desc: 'Сначала Docker, если не вышло — нативный Python' },
   { id: 'docker' as const, label: 'Docker', desc: 'Только контейнер (нужен установленный Docker)' },
-  { id: 'native' as const, label: 'Native', desc: 'Только локальный Python-процесс' },
+  { id: 'native' as const, label: 'Native', desc: 'Локальный Python-процесс (интерпретатор ставится сам, если его нет)' },
 ]
 
 export function SettingsPage() {

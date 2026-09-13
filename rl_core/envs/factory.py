@@ -13,7 +13,10 @@ from rl_core import scene_store
 from rl_core.envs.pettingzoo_envs import is_pettingzoo_env_id, make_pettingzoo_env, pettingzoo_slug_from_env_id
 from rl_core.envs.scene_env import SceneMultiAgentEnv, SceneRenderEnv, make_scene_env
 from rl_core.envs.tuple_marl_envs import is_tuple_marl_env_id, make_tuple_marl_env, tuple_marl_slug_from_env_id
+from rl_core.envs.board_game_gym import register_board_game_envs
 from rl_core.envs.wrappers import apply_wrappers
+
+register_board_game_envs()
 
 
 def make_training_env(

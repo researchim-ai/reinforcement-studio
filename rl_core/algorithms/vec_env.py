@@ -70,6 +70,9 @@ def _make_registered_gym_env(env_id: str) -> gym.Env:
     register_industrial_envs()
     register_trading_envs()
     register_finrl_envs()
+    from rl_core.envs.board_game_gym import register_board_game_envs
+
+    register_board_game_envs()
     try:
         import ale_py
 
@@ -159,18 +162,29 @@ def _split_vector_infos(infos: dict[str, Any], num_envs: int) -> list[dict[str, 
     return result
 
 
-def vec_reset(env: Any, seed: int | None = None) -> list[Any]:
+def vec_reset(
+    env: Any, seed: int | None = None, *, return_info: bool = False,
+) -> list[Any] | tuple[list[Any], list[dict]]:
     """Returns a length-`num_envs_of(env)` list of raw (non-batched, one
     per lane) observations — same shape of thing whether `env` is a plain
     env (`[obs]`) or a `VectorEnv` (its batched array/tuple, unpacked along
     axis 0). Every lane gets a distinct seed (`seed + i`) so `num_envs>1`
-    doesn't just replay `num_envs` identical trajectories."""
+    doesn't just replay `num_envs` identical trajectories.
+
+    `return_info=True` also returns the per-lane info dicts (needed for
+    board-game `action_mask` on the first search of an episode).
+    """
     if is_vector_env(env):
         seeds = [seed + i for i in range(env.num_envs)] if seed is not None else None
-        obs, _info = env.reset(seed=seeds)
-        return list(obs)
-    obs, _info = env.reset(seed=seed)
-    return [obs]
+        obs, info = env.reset(seed=seeds)
+        obs_list = list(obs)
+        infos = _split_vector_infos(info, env.num_envs)
+    else:
+        obs, info = env.reset(seed=seed)
+        obs_list, infos = [obs], [info]
+    if return_info:
+        return obs_list, infos
+    return obs_list
 
 
 def vec_step(
@@ -219,7 +233,14 @@ def vec_step(
     if terminated or truncated:
         final_obs, final_info = obs, info
         obs, reset_info = env.reset()
+        # Reset keys win for anything both dicts have — except we still
+        # expose the terminal payload under `final_*`. `action_mask` on a
+        # board-game env is the *next* position's legal set (the one the
+        # following search must use); taking it from `final_info` would
+        # leave an empty terminal mask on the freshly reset observation.
         info = {**reset_info, **final_info, "final_obs": final_obs, "final_info": final_info}
+        if "action_mask" in reset_info:
+            info["action_mask"] = reset_info["action_mask"]
     return (
         [obs],
         np.array([reward], dtype=np.float32),

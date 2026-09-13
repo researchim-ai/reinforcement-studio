@@ -1055,21 +1055,42 @@ const BoardReplay = memo(function BoardReplay({ history, winner }: { history: nu
 
 function BoardPreview({ board }: { board: number[][] }) {
   const cols = board[0]?.length ?? 0
+  const rows = board.length
+  const chessLike = rows === 8 && cols === 8
+  const glyphs = ['', 'P', 'N', 'B', 'R', 'Q', 'K']
   return (
-    <div className="inline-grid gap-1" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+    <div
+      className={cn('inline-grid', chessLike ? 'overflow-hidden rounded-md border border-border' : 'gap-1')}
+      style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+    >
       {board.map((rowVals, row) =>
-        rowVals.map((cell, col) => (
-          <div
-            key={`${row}-${col}`}
-            className={cn(
-              'flex h-8 w-8 items-center justify-center rounded-md border border-border text-sm font-bold',
-              cell === 0 ? 'bg-muted/40' : 'bg-muted',
-            )}
-          >
-            {cell === 1 && <span className="text-primary">●</span>}
-            {cell === -1 && <span className="text-warning">○</span>}
-          </div>
-        )),
+        rowVals.map((cell, col) => {
+          const abs = Math.abs(cell)
+          const chessGlyph = chessLike && abs >= 1 && abs <= 6 ? glyphs[abs] : null
+          const light = (row + col) % 2 === 0
+          return (
+            <div
+              key={`${row}-${col}`}
+              className={cn(
+                'flex h-8 w-8 items-center justify-center text-sm font-bold',
+                chessLike
+                  ? light ? 'bg-[#e8d5b5] text-[#1a1510]' : 'bg-[#b58863] text-[#1a1510]'
+                  : cn('rounded-md border border-border', cell === 0 ? 'bg-muted/40' : 'bg-muted'),
+              )}
+            >
+              {chessGlyph ? (
+                <span className={cell > 0 ? 'text-[#f8f5ef] [text-shadow:-0.7px_0_#1a1510,0.7px_0_#1a1510,0_-0.7px_#1a1510,0_0.7px_#1a1510]' : 'text-[#111114]'}>
+                  {chessGlyph}
+                </span>
+              ) : (
+                <>
+                  {cell === 1 && <span className="text-primary">●</span>}
+                  {cell === -1 && <span className="text-warning">○</span>}
+                </>
+              )}
+            </div>
+          )
+        }),
       )}
     </div>
   )

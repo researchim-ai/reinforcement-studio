@@ -43,6 +43,7 @@ except ImportError:
 
 # No optional third-party dependency (unlike every `register_*_envs` above)
 # — always registered.
+from rl_core.envs.board_game_gym import register_board_game_envs
 from rl_core.envs.finrl_envs import register_finrl_envs
 from rl_core.envs.industrial_envs import register_industrial_envs
 from rl_core.envs.trading_envs import register_trading_envs
@@ -50,11 +51,15 @@ from rl_core.envs.trading_envs import register_trading_envs
 register_industrial_envs()
 register_trading_envs()
 register_finrl_envs()
+register_board_game_envs()
 
 ActionKind = Literal["discrete", "continuous"]
 
 _DISCRETE = ["dqn", "rainbow_dqn", "ppo", "a2c", "es", "dreamer", "world_models_ha", "efficientzero", "unizero", "researchimzero", "latentimzero"]
 _CONTINUOUS = ["ppo", "a2c", "sac", "ddpg", "td3", "es", "dreamer", "mbpo", "pets", "world_models_ha", "efficientzero", "unizero", "researchimzero", "latentimzero"]
+# AlphaZero talks to BoardGame directly; the four Zero algorithms use the
+# Gym self-play wrapper (`rl_core/envs/board_game_gym.py`) on the same ids.
+_BOARD_GAME_ALGORITHMS = ["alphazero", "efficientzero", "unizero", "researchimzero", "latentimzero"]
 
 @dataclass
 class EnvSpec:
@@ -760,17 +765,21 @@ BOARD_GAMES: list[EnvSpec] = [
         id="tic_tac_toe",
         name="Tic-Tac-Toe",
         category="board_game",
-        description="3×3, классика для проверки AlphaZero — обучается до совершенной игры за минуты.",
+        description="3×3, self-play: AlphaZero и семейство Zero (EfficientZero, UniZero, "
+                     "ResearchImZero, LatentImZero) — одна сеть играет обе стороны.",
         action_kind="discrete",
-        compatible_algorithms=["alphazero"],
+        compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
+        recommended_total_timesteps=20_000,
     ),
     EnvSpec(
         id="connect_four",
         name="Connect Four",
         category="board_game",
-        description="7×6, нужно собрать 4 в ряд. Требует больше self-play итераций.",
+        description="7×6, нужно собрать 4 в ряд. Self-play AlphaZero и Zero-семейства; "
+                     "требует больше итераций/шагов, чем крестики-нолики.",
         action_kind="discrete",
-        compatible_algorithms=["alphazero"],
+        compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
+        recommended_total_timesteps=80_000,
         default_hyperparams={
             "num_simulations": 50,
             "games_per_iteration": 24,
@@ -783,15 +792,58 @@ BOARD_GAMES: list[EnvSpec] = [
         id="gomoku",
         name="Gomoku",
         category="board_game",
-        description="9×9, 5 в ряд. Самая тяжёлая из встроенных игр — по умолчанию считается на "
-                     "заметно большем бюджете симуляций/сети, чем Tic-Tac-Toe, иначе не успевает "
-                     "выучиться за разумное число итераций.",
+        description="9×9, 5 в ряд. Self-play AlphaZero и Zero-семейства — по умолчанию "
+                     "считается на заметно большем бюджете симуляций/сети, чем Tic-Tac-Toe.",
         action_kind="discrete",
-        compatible_algorithms=["alphazero"],
+        compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
+        recommended_total_timesteps=150_000,
         default_hyperparams={
             "num_simulations": 100,
             "games_per_iteration": 30,
             "eval_num_simulations": 80,
+            "buffer_size": 40_000,
+            "channels": 64,
+            "num_blocks": 5,
+        },
+    ),
+    EnvSpec(
+        id="chess",
+        name="Chess",
+        category="board_game",
+        description="Полные шахматы (FIDE) через OpenSpiel: self-play одной сетью "
+                     "(AlphaZero или EfficientZero/UniZero/ResearchImZero/LatentImZero). "
+                     "Наблюдение 20×8×8, 4674 действия, маска легальных ходов в поиске. "
+                     "Нужен `open_spiel` (CPython 3.11+).",
+        action_kind="discrete",
+        compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
+        extra_requirement="open_spiel",
+        recommended_total_timesteps=200_000,
+        default_hyperparams={
+            "num_simulations": 50,
+            "games_per_iteration": 8,
+            "eval_games": 4,
+            "eval_num_simulations": 40,
+            "buffer_size": 40_000,
+            "channels": 64,
+            "num_blocks": 4,
+        },
+    ),
+    EnvSpec(
+        id="go_9x9",
+        name="Go 9×9",
+        category="board_game",
+        description="Го на доске 9×9 через OpenSpiel (коми 7.5, есть пас). Self-play "
+                     "AlphaZero и Zero-семейства, с захватами и ко. 19×19 в каталог не "
+                     "ставим — на CPU десктопа это другой порядок бюджета. Нужен `open_spiel`.",
+        action_kind="discrete",
+        compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
+        extra_requirement="open_spiel",
+        recommended_total_timesteps=200_000,
+        default_hyperparams={
+            "num_simulations": 80,
+            "games_per_iteration": 12,
+            "eval_games": 6,
+            "eval_num_simulations": 60,
             "buffer_size": 40_000,
             "channels": 64,
             "num_blocks": 5,
@@ -809,6 +861,7 @@ _EXTRA_IMPORTS: dict[str, tuple[str, ...]] = {
     "nle": ("nle",),
     "minihack": ("minihack",),
     "gymnasium_robotics": ("gymnasium_robotics",),
+    "open_spiel": ("pyspiel",),
 }
 
 _extra_ok_cache: dict[str, bool] = {}
@@ -998,7 +1051,7 @@ def list_environments() -> list[dict]:
         out.append({
             **spec.__dict__,
             "kind": "alphazero",
-            "available": True,
+            "available": _extra_installed(spec.extra_requirement),
             "preview_url": preview_api_path(spec.id),
             "preview_thumb_url": preview_api_path(spec.id, thumb=True),
         })

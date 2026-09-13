@@ -26,8 +26,8 @@ export function Dashboard() {
       <div className="space-y-1">
         <h2 className="text-2xl font-semibold">Добро пожаловать в Reinforcement Studio</h2>
         <p className="text-sm text-muted-foreground">
-          Локальная лаборатория для reinforcement learning: классика на Gymnasium (DQN/PPO/A2C) и
-          AlphaZero self-play для настольных игр — без единой строчки кода.
+          Локальная лаборатория для reinforcement learning: Gymnasium (PPO, DQN, SAC),
+          AlphaZero self-play и world models — без единой строчки кода.
         </p>
       </div>
 

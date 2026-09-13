@@ -43,6 +43,7 @@ const EXTRA_HINT: Record<string, string> = {
   // `--no-deps` keeps the already-installed wheel instead of pip's
   // resolver downgrading it back to the source-only pin.
   smaclite: 'pip install "Rtree>=1.2" && pip install --no-deps "smaclite @ git+https://github.com/uoe-agents/smaclite.git"',
+  open_spiel: 'pip install open_spiel  (CPython 3.11+)',
 }
 
 const CATEGORY_ORDER = [
@@ -168,7 +169,8 @@ export function Environments() {
         <h2 className="text-2xl font-semibold">Галерея сред</h2>
         <p className="text-sm text-muted-foreground">
           {environments.length} сред: Classic Control, Toy Text, Box2D, MuJoCo, Atari, готовые многоагентные
-          бенчмарки PettingZoo/RWARE/LBForaging/SMAC(lite) и настольные игры для AlphaZero.
+          бенчмарки PettingZoo/RWARE/LBForaging/SMAC(lite) и настольные игры
+          (self-play: AlphaZero и семейство Zero).
           Картинки — официальные демо из репозитория Farama Foundation.
         </p>
       </div>
