@@ -159,6 +159,7 @@ import gymnasium as gym
 from rl_core.algorithms.base import CustomAlgorithm, TrainingCallback
 from rl_core.algorithms.native.preprocessing import action_to_env, obs_batch_to_array, obs_flat_dim, obs_to_array
 from rl_core.algorithms.native.zero_selfplay import (
+    action_mask_from_info,
     attach_two_player,
     chosen_discrete_action,
     discrete_expand_slots,
@@ -167,7 +168,12 @@ from rl_core.algorithms.native.zero_selfplay import (
     mask_from_unwrapped_env,
     masks_from_infos,
     maybe_enable_two_player_from_infos,
+    record_self_play_outcomes,
     sample_masked_action,
+    self_play_eviction_index,
+    self_play_outcome_metrics,
+    self_play_replay_capacity,
+    terminal_self_play_outcome,
     uniform_legal_policy,
 )
 from rl_core.algorithms.vec_env import (
@@ -718,11 +724,13 @@ class _EfficientZeroBuffer:
         self.obs_shape = obs_shape
         self.action_dim = action_dim
         self.policy_target_dim = policy_target_dim
+        self._storage_dtype = np.float16 if max(action_dim, policy_target_dim) >= 512 else np.float32
         self.priority_alpha = max(0.0, priority_alpha)
         self.priority_beta = max(0.0, priority_beta)
         self.min_priority = max(1e-8, min_priority)
         self.episodes: list[dict[str, np.ndarray]] = []
         self._episode_alpha_sum: list[float] = []
+        self._episode_outcomes: list[int | None] = []
         self._max_priority = 1.0
         self._cur: list[dict[str, list[Any]]] = [self._new_episode() for _ in range(max(1, num_lanes))]
 
@@ -732,18 +740,18 @@ class _EfficientZeroBuffer:
 
     def add(
         self, obs: np.ndarray, action_flat: np.ndarray, reward: float, next_obs: np.ndarray,
-        policy_target: np.ndarray, done: bool, lane: int = 0,
+        policy_target: np.ndarray, done: bool, lane: int = 0, episode_outcome: int | None = None,
     ) -> None:
         cur = self._cur[lane]
-        cur["obs"].append(np.asarray(obs, dtype=np.float32))
-        cur["action"].append(np.asarray(action_flat, dtype=np.float32))
+        cur["obs"].append(np.asarray(obs, dtype=self._storage_dtype))
+        cur["action"].append(np.asarray(action_flat, dtype=self._storage_dtype))
         cur["reward"].append(float(reward))
-        cur["next_obs"].append(np.asarray(next_obs, dtype=np.float32))
-        cur["policy_target"].append(np.asarray(policy_target, dtype=np.float32))
+        cur["next_obs"].append(np.asarray(next_obs, dtype=self._storage_dtype))
+        cur["policy_target"].append(np.asarray(policy_target, dtype=self._storage_dtype))
         if done:
-            self._flush_episode(lane)
+            self._flush_episode(lane, episode_outcome)
 
-    def _flush_episode(self, lane: int = 0) -> None:
+    def _flush_episode(self, lane: int = 0, episode_outcome: int | None = None) -> None:
         cur = self._cur[lane]
         if not cur["obs"]:
             return
@@ -762,9 +770,14 @@ class _EfficientZeroBuffer:
         }
         self.episodes.append(episode)
         self._episode_alpha_sum.append(float(np.sum(episode["priority"] ** self.priority_alpha)))
+        self._episode_outcomes.append(
+            int(episode_outcome) if episode_outcome in (-1, 0, 1) else None,
+        )
         if len(self.episodes) > self.capacity:
-            self.episodes.pop(0)
-            self._episode_alpha_sum.pop(0)
+            evict = self_play_eviction_index(self._episode_outcomes, self.capacity)
+            self.episodes.pop(evict)
+            self._episode_alpha_sum.pop(evict)
+            self._episode_outcomes.pop(evict)
         self._cur[lane] = self._new_episode()
 
     def __len__(self) -> int:
@@ -1025,13 +1038,22 @@ class NativeEfficientZero(CustomAlgorithm):
 
         sample_obs_arr = obs_to_array(self._obs_space.sample(), self._obs_space)
         policy_target_dim = self.n_actions if self.discrete else self.action_dim
+        requested_buffer_capacity = int(hyperparams.get("buffer_size", 2_000))
+        effective_buffer_capacity = self_play_replay_capacity(
+            requested_buffer_capacity,
+            num_envs_of(env),
+            self.two_player,
+        )
         self.buffer = _EfficientZeroBuffer(
-            capacity_episodes=int(hyperparams.get("buffer_size", 2_000)),
+            capacity_episodes=effective_buffer_capacity,
             obs_shape=sample_obs_arr.shape, action_dim=self.action_dim, policy_target_dim=policy_target_dim,
             num_lanes=num_envs_of(env),
             priority_alpha=self.priority_alpha, priority_beta=self.priority_beta, min_priority=self.min_priority,
         )
-        self._last_metrics: dict[str, float] = {}
+        self._last_metrics: dict[str, float] = {
+            "replay_capacity_episodes": float(effective_buffer_capacity),
+            "replay_capacity_requested": float(requested_buffer_capacity),
+        }
 
     # ------------------------------------------------------------------
     # Search - a genuine batched Gumbel search tree, see module docstring.
@@ -1231,12 +1253,21 @@ class NativeEfficientZero(CustomAlgorithm):
         price of not needing a second process, at the cost of adding
         `reanalyze_batch_size`-worth of search compute every
         `reanalyze_freq` real steps."""
+        # Historical legal masks are not part of this legacy replay
+        # schema. Reanalysis without one poisons board-game targets; trying
+        # to infer it from policy support also drops legal-but-unvisited
+        # actions. Keep valid collection targets instead.
+        if self.two_player:
+            return None
         if self.reanalyze_batch_size <= 0 or self.buffer.num_episodes == 0:
             return None
         episode_idx, timestep, obs_batch = self.buffer.sample_for_reanalyze(self.reanalyze_batch_size)
         if obs_batch.shape[0] == 0:
             return None
-        results = self.search(obs_batch, deterministic=np.zeros(obs_batch.shape[0], dtype=bool))
+        results = self.search(
+            obs_batch,
+            deterministic=np.zeros(obs_batch.shape[0], dtype=bool),
+        )
         policy_targets = np.stack([r["policy_target"] for r in results])
         search_values = np.asarray([r["value_target"] for r in results], dtype=np.float32)
         self.buffer.update_reanalyzed_targets(episode_idx, timestep, policy_targets, search_values)
@@ -1377,6 +1408,9 @@ class NativeEfficientZero(CustomAlgorithm):
         n_envs = num_envs_of(self.env)
         obs_list, infos = vec_reset(self.env, seed=self.seed, return_info=True)
         maybe_enable_two_player_from_infos(self, infos)
+        self.buffer.capacity = self_play_replay_capacity(
+            self.buffer.capacity, n_envs, self.two_player,
+        )
         obs_arr = obs_batch_to_array(obs_list, self._obs_space)
         action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
         ep_reward = np.zeros(n_envs, dtype=np.float64)
@@ -1414,12 +1448,23 @@ class NativeEfficientZero(CustomAlgorithm):
             next_obs_list, rewards, terminated, truncated, infos = vec_step(self.env, env_actions)
             maybe_enable_two_player_from_infos(self, infos)
             dones = terminated | truncated
+            record_self_play_outcomes(self, infos, terminated, truncated)
             next_obs_arr = obs_batch_to_array(next_obs_list, self._obs_space)
             action_masks = masks_from_infos(infos, int(self.n_actions or 0)) if self.discrete else None
+            transition_next_obs_arr = next_obs_arr.copy()
+            for lane in np.flatnonzero(dones):
+                final_obs = infos[int(lane)].get("final_obs")
+                if final_obs is not None:
+                    transition_next_obs_arr[int(lane)] = obs_to_array(final_obs, self._obs_space)
             for lane in range(n_envs):
                 self.buffer.add(
-                    obs_arr[lane], action_flats[lane], float(rewards[lane]), next_obs_arr[lane],
+                    obs_arr[lane], action_flats[lane], float(rewards[lane]), transition_next_obs_arr[lane],
                     policy_targets[lane], bool(dones[lane]), lane=lane,
+                    episode_outcome=terminal_self_play_outcome(
+                        infos[lane],
+                        bool(terminated[lane]),
+                        bool(truncated[lane]),
+                    ),
                 )
             obs_arr = next_obs_arr
             ep_reward += rewards
@@ -1454,6 +1499,12 @@ class NativeEfficientZero(CustomAlgorithm):
                     if reanalyze_metrics:
                         self._last_metrics = {**self._last_metrics, **reanalyze_metrics}
 
+            self._last_metrics = {
+                **self._last_metrics,
+                "replay_capacity_episodes": float(self.buffer.capacity),
+                "replay_capacity_requested": float(self.hyperparams.get("buffer_size", 2_000)),
+                **self_play_outcome_metrics(self),
+            }
             any_done = False
             for lane in range(n_envs):
                 if not dones[lane]:
@@ -1470,9 +1521,18 @@ class NativeEfficientZero(CustomAlgorithm):
                 if not keep_going:
                     return
 
-    def predict(self, obs: Any, deterministic: bool = True) -> tuple[Any, Any]:
+    def predict(
+        self,
+        obs: Any,
+        deterministic: bool = True,
+        action_mask: np.ndarray | None = None,
+    ) -> tuple[Any, Any]:
         obs_arr = obs_to_array(obs, self._obs_space)
-        mask = mask_from_unwrapped_env(self.env, int(self.n_actions)) if self.discrete else None
+        mask = (
+            action_mask_from_info({"action_mask": action_mask}, int(self.n_actions))
+            if self.discrete and action_mask is not None
+            else mask_from_unwrapped_env(self.env, int(self.n_actions)) if self.discrete else None
+        )
         action_masks = None if mask is None else mask[None]
         results = self.search(obs_arr[None], deterministic=np.array([deterministic]), action_masks=action_masks)
         return action_to_env(results[0]["env_action"], self._action_space), None

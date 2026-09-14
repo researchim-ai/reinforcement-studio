@@ -68,7 +68,9 @@ def _run_episodes_custom_algorithm(
     algo: CustomAlgorithm, env_id: str, wrapper_specs: list[dict], episodes: int,
     seed: int | None, record_gif: bool, deterministic: bool,
 ) -> dict[str, Any]:
-    accepts_episode_start = "episode_start" in inspect.signature(algo.predict).parameters
+    predict_parameters = inspect.signature(algo.predict).parameters
+    accepts_episode_start = "episode_start" in predict_parameters
+    accepts_action_mask = "action_mask" in predict_parameters
     rewards: list[float] = []
     lengths: list[int] = []
     gif_frames: list[np.ndarray] = []
@@ -77,7 +79,7 @@ def _run_episodes_custom_algorithm(
     for ep in range(episodes):
         want_frames = record_gif and ep == 0
         env = _make_env(env_id, wrapper_specs, render=want_frames)
-        obs, _ = env.reset(seed=(seed + ep) if seed is not None else None)
+        obs, info = env.reset(seed=(seed + ep) if seed is not None else None)
         if want_frames:
             fps = float(getattr(env, "metadata", {}).get("render_fps", 20) or 20)
             frame = env.render()
@@ -87,12 +89,14 @@ def _run_episodes_custom_algorithm(
         total_reward = 0.0
         length = 0
         for _ in range(_MAX_EPISODE_STEPS):
+            kwargs: dict[str, Any] = {"deterministic": deterministic}
             if accepts_episode_start:
-                action, _ = algo.predict(obs, deterministic=deterministic, episode_start=episode_start)
-            else:
-                action, _ = algo.predict(obs, deterministic=deterministic)
+                kwargs["episode_start"] = episode_start
+            if accepts_action_mask:
+                kwargs["action_mask"] = info.get("action_mask")
+            action, _ = algo.predict(obs, **kwargs)
             episode_start = False
-            obs, reward, terminated, truncated, _info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
             total_reward += float(reward)
             length += 1
             if want_frames:

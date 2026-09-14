@@ -33,6 +33,16 @@ def run_training_loop(
         "device": trainer.device,
         "total_params": trainer.total_params,
         "seed": training_cfg.get("seed"),
+        "num_envs": int(trainer.hp.get("self_play_workers", training_cfg.get("num_envs", 1))),
+        "self_play_workers": int(
+            trainer.hp.get("self_play_workers", training_cfg.get("num_envs", 1)),
+        ),
+        "self_play_workers_requested": int(
+            trainer.hp.get(
+                "self_play_workers_requested",
+                training_cfg.get("num_envs", 1),
+            ),
+        ),
         "network": trainer.network_info,
     }
 

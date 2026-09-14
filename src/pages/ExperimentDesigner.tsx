@@ -50,7 +50,15 @@ function buildDefaultHyperparams(spec: AlgorithmSpec | undefined, env: EnvSpec |
       defaults.num_simulations = overlay.num_simulations
     }
     if ('learning_starts' in defaults) defaults.learning_starts = Math.min(defaults.learning_starts, 32)
-    if ('buffer_size' in defaults) defaults.buffer_size = Math.min(defaults.buffer_size, 256)
+    // A board-game replay is measured in complete episodes. Keeping only
+    // 64 chess games while collecting from dozens of lanes churns nearly
+    // the whole dataset in one completion wave and encourages self-play
+    // policy collapse. float16 storage keeps 256 episodes practical.
+    const replayEpisodeCap = 256
+    if ('buffer_size' in defaults) defaults.buffer_size = Math.min(defaults.buffer_size, replayEpisodeCap)
+    if (env.id === 'chess' && 'batch_size' in defaults) {
+      defaults.batch_size = Math.min(defaults.batch_size, 64)
+    }
     return defaults
   }
   Object.assign(defaults, overlay)
@@ -159,7 +167,7 @@ export function ExperimentDesigner() {
         if (a.kind === 'gym') {
           return !selectedEnv || !a.supported_action_kinds || a.supported_action_kinds.includes(selectedEnv.action_kind)
         }
-        return a.kind === envKind
+        return false
       }),
     [allAlgorithms, envKind, selectedEnv],
   )

@@ -655,6 +655,19 @@ export interface MetricsSnapshot {
   // (AlphaZero counts "games"/iterations instead, see `latest.games_played`
   // if that ever gets added).
   episodes_completed?: number
+  self_play_games?: number
+  self_play_decisive_games?: number
+  self_play_draws?: number
+  self_play_truncations?: number
+  self_play_first_player_wins?: number
+  self_play_second_player_wins?: number
+  self_play_illegal_actions?: number
+  self_play_decisive_rate?: number
+  self_play_draw_rate?: number
+  self_play_truncation_rate?: number
+  self_play_first_player_win_rate_decisive?: number
+  replay_capacity_episodes?: number
+  replay_capacity_requested?: number
   // A full episode played end-to-end and packed into a single-play GIF
   // (rendered every `render_every_steps` — see rl_core/algorithms/
   // metrics_callback.py::render_episode) rather than a single freeze-frame,

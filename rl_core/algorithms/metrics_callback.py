@@ -7,6 +7,7 @@ AlphaZero trainer, so the Training Monitor page can treat both the same way.
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import json
 import time
@@ -115,7 +116,7 @@ def _encode_episode_gif(frames: list[np.ndarray], fps: float) -> str:
 
 def render_episode(
     make_render_env: Callable[[], Any] | None,
-    predict: Callable[[Any, bool], tuple[Any, Any]],
+    predict: Callable[..., tuple[Any, Any]],
     max_steps: int = _MAX_EPISODE_STEPS,
 ) -> str | None:
     """Rolls out `predict` in a fresh render-mode env for one full episode —
@@ -130,24 +131,35 @@ def render_episode(
     actually representative of "how is the agent doing" the way watching it
     play a full episode is.
 
-    `predict` is called as `predict(obs, episode_start)` — `episode_start`
-    is `True` only on the very first step right after `env.reset()`, so a
-    memory-enabled (LSTM/GRU) algorithm knows to start this rollout from a
-    fresh hidden state instead of carrying one over from wherever a
-    *previous* preview render (or, worse, actual training) happened to
-    leave it. Callers that don't care just ignore the second argument."""
+    `predict` is called as `predict(obs, episode_start, info)` when it
+    accepts three arguments, otherwise as `predict(obs, episode_start)`.
+    `episode_start` resets recurrent state; `info` carries the preview
+    env's current legal-action mask so board-game policies never consult
+    the unrelated training env. Older two-argument callers remain valid."""
     if make_render_env is None:
         return None
     try:
         env = make_render_env()
-        obs, _ = env.reset()
+        obs, info = env.reset()
+        predict_signature = inspect.signature(predict)
+        accepts_info = (
+            any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                for parameter in predict_signature.parameters.values()
+            )
+            or len(predict_signature.parameters) >= 3
+        )
         first_frame = env.render()
         frames = [np.asarray(first_frame)] if first_frame is not None else []
         episode_start = True
         for _ in range(max_steps):
-            action, _ = predict(obs, episode_start)
+            action, _ = (
+                predict(obs, episode_start, info)
+                if accepts_info
+                else predict(obs, episode_start)
+            )
             episode_start = False
-            obs, _, terminated, truncated, _ = env.step(action)
+            obs, _, terminated, truncated, info = env.step(action)
             frame = env.render()
             if frame is not None:
                 frames.append(np.asarray(frame))

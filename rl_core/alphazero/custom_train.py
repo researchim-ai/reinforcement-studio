@@ -24,6 +24,8 @@ def run(config: dict[str, Any], run_dir: Path, slug: str) -> None:
 
     game_id = env_cfg["id"]
     hyperparams = dict(algo_cfg.get("hyperparams") or {})
+    hyperparams["self_play_workers"] = max(1, int(training_cfg.get("num_envs", 1)))
+    hyperparams["seed"] = training_cfg.get("seed")
     network_spec = resolve_network_spec(config)
     write_network_snapshot(run_dir, config, network_spec)
     if network_spec:

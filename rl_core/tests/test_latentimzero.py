@@ -1507,6 +1507,22 @@ def test_success_replay_fraction_one_samples_top_return_quantile() -> None:
     assert float(batch["success_pool_size"]) == 1.0
 
 
+def test_self_play_success_replay_uses_outcome_not_material_sum() -> None:
+    buffer = _make_replay(1.0)
+    buffer.add(
+        np.zeros(1), np.array([1.0, 0.0]), 3.0, np.ones(1),
+        np.array([0.5, 0.5]), True, episode_outcome=0,
+    )
+    buffer.add(
+        np.zeros(1), np.array([1.0, 0.0]), 0.1, np.ones(1),
+        np.array([0.5, 0.5]), True, episode_outcome=-1,
+    )
+    batch = buffer.sample(32, 1, 1, 0.99)
+    assert np.allclose(batch["reward"][:, 0], 0.1)
+    assert float(batch["success_sample_fraction"]) == 1.0
+    assert float(batch["success_pool_size"]) == 1.0
+
+
 def test_success_fraction_zero_preserves_sampling_path() -> None:
     implicit = _make_replay(0.0)
     explicit = _make_replay(0.0)

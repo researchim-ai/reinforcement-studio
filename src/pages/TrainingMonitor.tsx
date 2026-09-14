@@ -584,6 +584,38 @@ export function TrainingMonitor() {
               <StatCard label="Время" value={latest?.elapsed_seconds ? formatDuration(latest.elapsed_seconds) : '—'} />
             </div>
 
+            {latest?.self_play_games != null && (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <StatCard label="Self-play партий" value={latest.self_play_games.toFixed(0)} />
+                <StatCard
+                  label={latest.env_id === 'chess' ? 'Победы белых' : 'Победы первого'}
+                  value={String(latest.self_play_first_player_wins?.toFixed(0) ?? '—')}
+                />
+                <StatCard
+                  label={latest.env_id === 'chess' ? 'Победы чёрных' : 'Победы второго'}
+                  value={String(latest.self_play_second_player_wins?.toFixed(0) ?? '—')}
+                />
+                <StatCard label="Ничьи" value={String(latest.self_play_draws?.toFixed(0) ?? '—')} />
+                <StatCard
+                  label="Решающих партий"
+                  value={latest.self_play_decisive_rate != null ? `${(latest.self_play_decisive_rate * 100).toFixed(1)}%` : '—'}
+                />
+                <StatCard label="Time-limit" value={String(latest.self_play_truncations?.toFixed(0) ?? '—')} />
+                <StatCard label="Нелегальных ходов" value={String(latest.self_play_illegal_actions?.toFixed(0) ?? '—')} />
+                {latest.replay_capacity_episodes != null && (
+                  <StatCard
+                    label="Replay партий"
+                    value={
+                      latest.replay_capacity_requested != null
+                        && latest.replay_capacity_episodes !== latest.replay_capacity_requested
+                        ? `${latest.replay_capacity_episodes.toFixed(0)} (задано ${latest.replay_capacity_requested.toFixed(0)})`
+                        : latest.replay_capacity_episodes.toFixed(0)
+                    }
+                  />
+                )}
+              </div>
+            )}
+
             {!isAlphaZero && (
               latest?.exploration_epsilon != null
               || latest?.rnd_bonus_mean != null

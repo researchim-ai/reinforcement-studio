@@ -138,11 +138,15 @@ def run_custom_algorithm(
     # only pass it through if the algorithm's own `predict()` actually
     # declares it — anything else keeps working exactly as before.
     _predict_accepts_episode_start = "episode_start" in inspect.signature(algo.predict).parameters
+    _predict_accepts_action_mask = "action_mask" in inspect.signature(algo.predict).parameters
 
-    def _predict(obs: Any, episode_start: bool) -> tuple[Any, Any]:
+    def _predict(obs: Any, episode_start: bool, info: dict[str, Any]) -> tuple[Any, Any]:
+        kwargs: dict[str, Any] = {"deterministic": True}
         if _predict_accepts_episode_start:
-            return algo.predict(obs, deterministic=True, episode_start=episode_start)
-        return algo.predict(obs, deterministic=True)
+            kwargs["episode_start"] = episode_start
+        if _predict_accepts_action_mask:
+            kwargs["action_mask"] = info.get("action_mask")
+        return algo.predict(obs, **kwargs)
 
     resolved_policy_label = policy_label(obs_space(train_env)) if callable(policy_label) else policy_label
     static_info = {

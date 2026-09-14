@@ -74,6 +74,129 @@ def maybe_enable_two_player_from_infos(algo: Any, infos: list[dict[str, Any]]) -
         algo.search_discount = -float(algo.gamma)
 
 
+def terminal_self_play_outcome(
+    info: dict[str, Any],
+    terminated: bool,
+    truncated: bool,
+) -> int | None:
+    """Return the board-game winner for a completed real game.
+
+    ``None`` deliberately distinguishes a time-limit/unfinished trajectory
+    from a genuine draw (``0``).  Vector envs put terminal data under
+    ``final_info`` after SAME_STEP autoreset.
+    """
+    if not terminated or truncated:
+        return None
+    terminal_info = info.get("final_info")
+    if not isinstance(terminal_info, dict):
+        terminal_info = info
+    winner = terminal_info.get("winner")
+    return int(winner) if winner in (-1, 0, 1) else None
+
+
+def self_play_replay_capacity(requested: int, num_lanes: int, two_player: bool) -> int:
+    """Keep enough completed games for parallel self-play diversity.
+
+    A capacity smaller than the vector width churns almost the entire
+    replay on every wave of completed games. Four games per lane is a
+    conservative floor; compact float16 storage remains responsible for
+    keeping large chess policy targets affordable.
+    """
+    requested = max(1, int(requested))
+    return max(requested, 4 * max(1, int(num_lanes))) if two_player else requested
+
+
+def self_play_eviction_index(
+    outcomes: list[int | None],
+    capacity: int,
+    reserve_fraction: float = 0.25,
+) -> int:
+    """Choose an overflow eviction while retaining a small decisive archive.
+
+    FIFO remains the default. For outcome-labelled self-play, up to a
+    quarter of replay is protected for rare decisive games; stale decisive
+    data can still age out once that reserve is full.
+    """
+    if len(outcomes) <= capacity or not any(outcome is not None for outcome in outcomes):
+        return 0
+    decisive = sum(outcome in (-1, 1) for outcome in outcomes)
+    reserve = max(1, int(round(max(1, capacity) * reserve_fraction)))
+    if decisive <= reserve:
+        for index, outcome in enumerate(outcomes):
+            if outcome == 0:
+                return index
+    return 0
+
+
+def record_self_play_outcomes(
+    algo: Any,
+    infos: list[dict[str, Any]],
+    terminated: np.ndarray,
+    truncated: np.ndarray,
+) -> None:
+    """Accumulate board-game outcomes independently from shaped rewards."""
+    if not getattr(algo, "two_player", False):
+        return
+    if not hasattr(algo, "_self_play_outcomes"):
+        algo._self_play_outcomes = {
+            "games": 0,
+            "decisive": 0,
+            "draws": 0,
+            "truncations": 0,
+            "first_player_wins": 0,
+            "second_player_wins": 0,
+            "illegal_actions": 0,
+        }
+    stats = algo._self_play_outcomes
+    for lane in np.flatnonzero(np.asarray(terminated) | np.asarray(truncated)):
+        stats["games"] += 1
+        lane_info = infos[int(lane)]
+        terminal_info = lane_info.get("final_info")
+        if not isinstance(terminal_info, dict):
+            terminal_info = lane_info
+        if bool(terminal_info.get("illegal_action")):
+            stats["illegal_actions"] += 1
+        if bool(truncated[int(lane)]):
+            stats["truncations"] += 1
+            continue
+        winner = terminal_self_play_outcome(
+            lane_info,
+            bool(terminated[int(lane)]),
+            bool(truncated[int(lane)]),
+        )
+        if winner in (1, -1):
+            stats["decisive"] += 1
+            key = "first_player_wins" if int(winner) == 1 else "second_player_wins"
+            stats[key] += 1
+        else:
+            stats["draws"] += 1
+
+
+def self_play_outcome_metrics(algo: Any) -> dict[str, float]:
+    stats = getattr(algo, "_self_play_outcomes", None)
+    if not stats:
+        return {}
+    games = max(1, int(stats["games"]))
+    decisive = max(1, int(stats["decisive"]))
+    return {
+        "self_play_games": float(stats["games"]),
+        "self_play_decisive_games": float(stats["decisive"]),
+        "self_play_draws": float(stats["draws"]),
+        "self_play_truncations": float(stats["truncations"]),
+        "self_play_first_player_wins": float(stats["first_player_wins"]),
+        "self_play_second_player_wins": float(stats["second_player_wins"]),
+        "self_play_illegal_actions": float(stats["illegal_actions"]),
+        "self_play_decisive_rate": float(stats["decisive"]) / games,
+        "self_play_draw_rate": float(stats["draws"]) / games,
+        "self_play_truncation_rate": float(stats["truncations"]) / games,
+        "self_play_first_player_win_rate_decisive": (
+            float(stats["first_player_wins"]) / decisive
+            if stats["decisive"]
+            else 0.0
+        ),
+    }
+
+
 def action_mask_from_info(info: dict[str, Any], n_actions: int) -> np.ndarray | None:
     mask = info.get("action_mask")
     if mask is None:

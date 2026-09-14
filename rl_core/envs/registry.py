@@ -818,6 +818,7 @@ BOARD_GAMES: list[EnvSpec] = [
         compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
         extra_requirement="open_spiel",
         recommended_total_timesteps=200_000,
+        recommended_num_envs=4,
         default_hyperparams={
             "num_simulations": 50,
             "games_per_iteration": 8,

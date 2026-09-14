@@ -18,6 +18,7 @@ def play_self_play_game(
     c_puct: float = 1.5,
     temperature_moves: int = 8,
     device: str = "cpu",
+    seed: int | None = None,
 ) -> tuple[list[TrainingExample], dict[str, Any]]:
     """Plays one game of the network against itself via MCTS.
 
@@ -27,7 +28,10 @@ def play_self_play_game(
     """
     game = game_cls()
     game.reset()
-    mcts = MCTS(network, num_simulations=num_simulations, c_puct=c_puct, device=device)
+    rng = np.random.default_rng(seed)
+    mcts = MCTS(
+        network, num_simulations=num_simulations, c_puct=c_puct, device=device, rng=rng,
+    )
 
     raw_examples: list[tuple[np.ndarray, np.ndarray, int]] = []
     move_history: list[dict[str, Any]] = []
@@ -46,9 +50,9 @@ def play_self_play_game(
 
         probs = policy / policy.sum() if policy.sum() > 0 else None
         if probs is None:
-            action = int(np.random.choice(game.legal_actions()))
+            action = int(rng.choice(game.legal_actions()))
         else:
-            action = int(np.random.choice(len(policy), p=probs))
+            action = int(rng.choice(len(policy), p=probs))
 
         move_history.append({"action": action, "player": int(game.current_player)})
         game.step(action)

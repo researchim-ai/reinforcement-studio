@@ -3,6 +3,7 @@ answers "what would the AI play here?" for the interactive Arena page.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from rl_core.alphazero.mcts import MCTS
@@ -16,13 +17,14 @@ def play_match(
     num_simulations: int = 40,
     num_games: int = 10,
     device: str = "cpu",
+    workers: int = 1,
 ) -> dict[str, int]:
     """Alternates who plays first across games so neither net gets a first-move edge."""
-    mcts_a = MCTS(network_a, num_simulations=num_simulations, device=device)
-    mcts_b = MCTS(network_b, num_simulations=num_simulations, device=device)
-
-    wins_a = wins_b = draws = 0
-    for i in range(num_games):
+    def play_one(i: int) -> str:
+        # MCTS instances own mutable trees, so each concurrent game gets
+        # its own pair while the read-only network weights are shared.
+        mcts_a = MCTS(network_a, num_simulations=num_simulations, device=device)
+        mcts_b = MCTS(network_b, num_simulations=num_simulations, device=device)
         a_is_first = i % 2 == 0
         game = game_cls()
         game.reset()
@@ -33,13 +35,22 @@ def play_match(
             game.step(action)
 
         if game.winner == 0:
-            draws += 1
-        elif (game.winner == 1) == a_is_first:
-            wins_a += 1
-        else:
-            wins_b += 1
+            return "draw"
+        return "a" if (game.winner == 1) == a_is_first else "b"
 
-    return {"wins_a": wins_a, "wins_b": wins_b, "draws": draws, "games": num_games}
+    worker_count = min(max(1, int(workers)), max(1, int(num_games)))
+    if worker_count == 1:
+        outcomes = list(map(play_one, range(num_games)))
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="alphazero-arena") as pool:
+            outcomes = list(pool.map(play_one, range(num_games)))
+
+    return {
+        "wins_a": outcomes.count("a"),
+        "wins_b": outcomes.count("b"),
+        "draws": outcomes.count("draw"),
+        "games": num_games,
+    }
 
 
 def suggest_move(

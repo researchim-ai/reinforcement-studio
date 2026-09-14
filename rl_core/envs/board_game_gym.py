@@ -7,8 +7,8 @@ moves. This wrapper is that bridge, with the MuZero two-player contract:
 
 - observation is always from the player to move (`BoardGame.encode()`);
 - each `step` is one ply of the *same* policy sitting in both seats;
-- reward is 0 until the game ends, then +1/0/−1 for the player who just
-  moved;
+- reward is +1/0/−1 at the end; chess additionally emits normalized
+  mover-relative material deltas so sparse draw-heavy self-play can learn;
 - `info["two_player"]` tells the Zero algorithms to backup with ``-γ``.
 
 Registered under the same ids as the AlphaZero catalog (`tic_tac_toe`,
@@ -56,6 +56,15 @@ _WHITE_TOKEN = (244, 241, 234)
 _BLACK_TOKEN = (32, 30, 28)
 _WHITE_INK = (36, 32, 28)
 _BLACK_INK = (244, 241, 234)
+_CHESS_MATERIAL_VALUES = np.asarray([0, 1, 3, 3, 5, 9, 0], dtype=np.float32)
+_CHESS_TOTAL_MATERIAL = 39.0
+
+
+def _chess_material_for(board: np.ndarray, player: int) -> float:
+    pieces = np.asarray(board, dtype=np.int32)
+    values = _CHESS_MATERIAL_VALUES[np.clip(np.abs(pieces), 0, 6)]
+    signs = np.sign(pieces) * int(player)
+    return float(np.sum(values * signs))
 
 
 def _piece_font(size: int):
@@ -182,6 +191,10 @@ class BoardGameSelfPlayEnv(gym.Env):
             "two_player": True,
             "board": self.game.board_list(),
             "current_player": int(self.game.current_player),
+            "winner": (
+                None if self.game.winner is None else int(self.game.winner)
+            ),
+            "game_done": bool(self.game.done),
         }
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
@@ -208,12 +221,22 @@ class BoardGameSelfPlayEnv(gym.Env):
             info["illegal_action"] = True
             return self._obs(), -1.0, True, False, info
 
+        mover = int(self.game.current_player)
+        material_before = _chess_material_for(self.game.board, mover) if self.game_id == "chess" else 0.0
         _enc, done, winner = self.game.step(action)
         self._steps += 1
         # `step` flips `current_player` even on the terminal ply, so the
         # mover is the opposite of whoever is to-move now.
-        mover = -int(self.game.current_player)
-        if not done:
+        if self.game_id == "chess" and not done:
+            # Pure terminal chess reward gives a randomly initialized
+            # model virtually no signal: most self-play games terminate
+            # by repetition/ply limit as draws.  A normalized material
+            # delta is a zero-sum, mover-relative transition reward; with
+            # the Zero algorithms' -gamma backup, our captures are
+            # positive and the opponent's captures are negative.
+            material_after = _chess_material_for(self.game.board, mover)
+            reward = (material_after - material_before) / _CHESS_TOTAL_MATERIAL
+        elif not done:
             reward = 0.0
         elif winner in (0, None):
             reward = 0.0

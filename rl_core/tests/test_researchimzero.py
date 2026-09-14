@@ -128,8 +128,8 @@ class TestVectorCollectionRegressions:
         )
         train_calls = 0
 
-        def fake_search(obs_batch, root_caches, deterministic=None):
-            del root_caches, deterministic
+        def fake_search(obs_batch, root_caches, deterministic=None, action_masks=None):
+            del root_caches, deterministic, action_masks
             return [
                 {
                     "env_action": 0,

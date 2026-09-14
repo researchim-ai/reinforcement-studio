@@ -41,6 +41,7 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_eps: float = 0.25,
         device: str = "cpu",
+        rng: np.random.Generator | None = None,
     ) -> None:
         self.network = network
         self.num_simulations = num_simulations
@@ -48,6 +49,7 @@ class MCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
         self.device = device
+        self.rng = rng if rng is not None else np.random.default_rng()
 
     def _evaluate_and_expand(self, node: Node, game: BoardGame) -> float:
         probs, value = self.network.predict(game.encode(), device=self.device)
@@ -68,7 +70,7 @@ class MCTS:
 
         if add_noise and root.children:
             actions = list(root.children.keys())
-            noise = np.random.dirichlet([self.dirichlet_alpha] * len(actions))
+            noise = self.rng.dirichlet([self.dirichlet_alpha] * len(actions))
             for action, n in zip(actions, noise):
                 child = root.children[action]
                 child.prior = (1 - self.dirichlet_eps) * child.prior + self.dirichlet_eps * n

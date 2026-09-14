@@ -537,7 +537,7 @@ class NativeLatentImZero(NativeResearchImZero):
     ) -> torch.Tensor:
         reward_predictions = self.uncertainty_probe.reward(action_hidden.detach().float())
         value_predictions = self.uncertainty_probe.value(next_hidden.detach().float())
-        return reward_predictions + self.gamma * value_predictions
+        return reward_predictions + self.search_discount * value_predictions
 
     def _adjust_search_predictions(
         self,
@@ -2017,9 +2017,9 @@ class NativeLatentImZero(NativeResearchImZero):
             if has_return_pairs:
                 return_predictions = (
                     reward_predictions[:, :-1]
-                    + self.gamma * value_predictions[:, 1:]
+                    + self.search_discount * value_predictions[:, 1:]
                 )
-                return_target = reward[:, :-1] + self.gamma * value[:, 1:]
+                return_target = reward[:, :-1] + self.search_discount * value[:, 1:]
                 disagreement = return_predictions.std(dim=-1, unbiased=False)
                 mean_disagreement = disagreement[pair_valid].mean()
                 mean_prediction = return_predictions.mean(dim=-1)

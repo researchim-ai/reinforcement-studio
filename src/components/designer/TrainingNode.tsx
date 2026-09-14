@@ -89,34 +89,35 @@ export const TrainingNode = memo(function TrainingNode({ data }: NodeProps & { d
           </div>
         )}
 
-        {data.kind === 'gym' && (
-          <div className="space-y-1">
-            <Label className="text-[11px] text-muted-foreground">Параллельных сред (num_envs)</Label>
-            <NumericInput
-              integer
-              value={data.numEnvs}
-              onChange={data.onChangeNumEnvs}
-              className="h-7 text-xs"
-            />
-            <p className="text-[10px] text-muted-foreground/60">
-              Сколько независимых копий среды крутятся параллельно (отдельный
-              процесс на каждую) — больше опыта за шаг и быстрее сбор данных на
-              CPU. 1 — одна среда, как раньше.
+        <div className="space-y-1">
+          <Label className="text-[11px] text-muted-foreground">
+            {data.kind === 'gym' ? 'Параллельных сред (num_envs)' : 'Параллельных self-play партий'}
+          </Label>
+          <NumericInput
+            integer
+            value={data.numEnvs}
+            onChange={data.onChangeNumEnvs}
+            className="h-7 text-xs"
+          />
+          <p className="text-[10px] text-muted-foreground/60">
+            {data.kind === 'gym'
+              ? 'Независимые среды в отдельных процессах: ускоряют сбор опыта на CPU.'
+              : 'Партии AlphaZero выполняются одновременно и используют общую сеть только для inference.'}
+            {' '}1 — последовательный режим.
+          </p>
+          {!!data.recommendedNumEnvs && data.numEnvs < data.recommendedNumEnvs && (
+            <p className="text-[10px] text-warning">
+              Эта среда выигрывает от параллелизма: рекомендуем ≥{data.recommendedNumEnvs}.{' '}
+              <button
+                type="button"
+                className="underline"
+                onClick={() => data.onChangeNumEnvs(data.recommendedNumEnvs!)}
+              >
+                Поставить {data.recommendedNumEnvs}
+              </button>
             </p>
-            {!!data.recommendedNumEnvs && data.numEnvs < data.recommendedNumEnvs && (
-              <p className="text-[10px] text-warning">
-                Эта среда выигрывает от параллелизма: рекомендуем ≥{data.recommendedNumEnvs}.{' '}
-                <button
-                  type="button"
-                  className="underline"
-                  onClick={() => data.onChangeNumEnvs(data.recommendedNumEnvs!)}
-                >
-                  Поставить {data.recommendedNumEnvs}
-                </button>
-              </p>
-            )}
-          </div>
-        )}
+          )}
+        </div>
 
         <div className="space-y-1">
           <Label className="text-[11px] text-muted-foreground">Seed</Label>

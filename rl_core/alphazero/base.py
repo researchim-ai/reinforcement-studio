@@ -12,8 +12,10 @@ and works with any subclass.
 from __future__ import annotations
 
 import copy
+import os
 from abc import ABC, abstractmethod
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ DEFAULT_HYPERPARAMS = {
     "c_puct": 1.5,
     "channels": 48,
     "num_blocks": 3,
+    "self_play_workers": 1,
 }
 
 
@@ -126,6 +129,13 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
 
     def __init__(self, game_cls: type[BoardGame], hyperparams: dict[str, Any], device: str) -> None:
         super().__init__(game_cls, hyperparams, device)
+        requested_workers = max(1, int(self.hp.get("self_play_workers", 1)))
+        self.hp["self_play_workers_requested"] = requested_workers
+        self.hp["self_play_workers"] = min(
+            requested_workers,
+            max(1, int(self.hp["games_per_iteration"])),
+            max(1, os.cpu_count() or 1),
+        )
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.hp["learning_rate"])
         self.replay_buffer: deque = deque(maxlen=self.hp["buffer_size"])
         self.best_state = copy.deepcopy(self.net.state_dict())
@@ -133,9 +143,6 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
     def _train_epochs(self, examples: list[tuple[np.ndarray, np.ndarray, float]]) -> dict[str, float]:
         net, optimizer, hp, device = self.net, self.optimizer, self.hp, self.device
         net.train()
-        states = torch.as_tensor(np.stack([e[0] for e in examples]), dtype=torch.float32, device=device)
-        policies = torch.as_tensor(np.stack([e[1] for e in examples]), dtype=torch.float32, device=device)
-        values = torch.as_tensor(np.array([e[2] for e in examples]), dtype=torch.float32, device=device)
 
         n = len(examples)
         total_loss, total_policy_loss, total_value_loss = 0.0, 0.0, 0.0
@@ -146,9 +153,19 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
                 idx = perm[start : start + hp["batch_size"]]
                 if len(idx) < 2:
                     continue
-                logits, value_pred = net(states[idx])
-                policy_loss = -(policies[idx] * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-                value_loss = F.mse_loss(value_pred, values[idx])
+                batch = [examples[int(i)] for i in idx.tolist()]
+                states = torch.as_tensor(
+                    np.stack([e[0] for e in batch]), dtype=torch.float32, device=device,
+                )
+                policies = torch.as_tensor(
+                    np.stack([e[1] for e in batch]), dtype=torch.float32, device=device,
+                )
+                values = torch.as_tensor(
+                    np.asarray([e[2] for e in batch]), dtype=torch.float32, device=device,
+                )
+                logits, value_pred = net(states)
+                policy_loss = -(policies * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+                value_loss = F.mse_loss(value_pred, values)
                 loss = policy_loss + value_loss
 
                 optimizer.zero_grad()
@@ -170,15 +187,37 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
         self.net.load_state_dict(self.best_state)
         self.net.eval()
 
-        iteration_records = []
-        for g in range(self.hp["games_per_iteration"]):
-            examples, record = play_self_play_game(
+        game_count = int(self.hp["games_per_iteration"])
+        base_seed = self.hp.get("seed")
+
+        def play_one(game_index: int):
+            game_seed = (
+                None
+                if base_seed is None
+                else int(base_seed) + (iteration - 1) * game_count + game_index
+            )
+            return play_self_play_game(
                 self.game_cls, self.net,
                 num_simulations=self.hp["num_simulations"], c_puct=self.hp["c_puct"], device=self.device,
+                seed=game_seed,
             )
-            self.replay_buffer.extend(examples)
-            if g < 3:
-                iteration_records.append(record)
+
+        workers = min(game_count, max(1, int(self.hp.get("self_play_workers", 1))))
+        if workers == 1:
+            games = map(play_one, range(game_count))
+        else:
+            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="alphazero-selfplay")
+            games = pool.map(play_one, range(game_count))
+
+        iteration_records = []
+        try:
+            for g, (examples, record) in enumerate(games):
+                self.replay_buffer.extend(examples)
+                if g < 3:
+                    iteration_records.append(record)
+        finally:
+            if workers > 1:
+                pool.shutdown(wait=True)
 
         loss_metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
         if len(self.replay_buffer) >= self.hp["batch_size"]:
@@ -192,6 +231,7 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
         match = play_match(
             self.game_cls, self.net, prev_net,
             num_simulations=self.hp["eval_num_simulations"], num_games=self.hp["eval_games"], device=self.device,
+            workers=workers,
         )
         decisive = match["wins_a"] + match["wins_b"]
         win_rate = match["wins_a"] / decisive if decisive > 0 else 0.5
@@ -217,5 +257,7 @@ class BuiltinAlphaZeroTrainer(AlphaZeroTrainer):
             "board_history": last_game["board_history"] if last_game else None,
             "board_winner": last_game["winner"] if last_game else None,
             "buffer_size": len(self.replay_buffer),
+            "self_play_workers": workers,
+            "self_play_workers_requested": int(self.hp["self_play_workers_requested"]),
             "_self_play_records": iteration_records,
         }
