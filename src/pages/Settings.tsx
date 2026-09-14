@@ -133,12 +133,18 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="text-xs text-muted-foreground space-y-1">
             {sysInfo.torch_cuda_build ? (
-              <p>
-                Установлен CUDA-билд PyTorch ({sysInfo.torch_version}, cuda {sysInfo.torch_cuda_build}), но он не видит
-                видеокарту — скорее всего дело в драйвере NVIDIA на этой машине (слишком старый/не установлен, или backend
-                в Docker-контейнере без реального доступа к GPU). Проверьте <code>nvidia-smi</code> вне приложения и,
-                если backend в Docker, что NVIDIA Container Toolkit настроен и виден демону Docker.
-              </p>
+              <>
+                <p>
+                  Установлен CUDA-билд PyTorch ({sysInfo.torch_version}, cuda {sysInfo.torch_cuda_build}), но контрольный
+                  CUDA kernel не выполнился. Проверьте драйвер NVIDIA и, для Docker, доступность NVIDIA Container Toolkit.
+                </p>
+                {sysInfo.torch_cuda_error && (
+                  <p className="break-all font-mono text-destructive">{sysInfo.torch_cuda_error}</p>
+                )}
+                {!!sysInfo.torch_cuda_arch_list?.length && (
+                  <p>Архитектуры wheel: {sysInfo.torch_cuda_arch_list.join(', ')}</p>
+                )}
+              </>
             ) : (
               <p>
                 Установлена CPU-версия PyTorch ({sysInfo.torch_version ?? '?'}), хотя переключатель GPU выше включён —

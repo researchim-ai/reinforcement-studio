@@ -22,6 +22,8 @@ async def info():
     torch_cuda = False
     torch_version: str | None = None
     torch_cuda_build: str | None = None
+    torch_cuda_error: str | None = None
+    torch_cuda_arch_list: list[str] = []
     try:
         import torch
 
@@ -33,8 +35,20 @@ async def info():
         # "wrong wheel installed" apart from "wheel is fine, driver isn't"
         # instead of just one flat "нет" either way.
         torch_cuda_build = torch.version.cuda
-    except Exception:
-        pass
+        if torch_cuda:
+            torch_cuda_arch_list = list(torch.cuda.get_arch_list())
+            try:
+                # is_available() only proves that the driver initialized.
+                # A cu126 wheel on Blackwell sm_120 passes that check but
+                # fails on its first real kernel launch.
+                probe = torch.ones(1, device="cuda")
+                probe.add_(1)
+                torch.cuda.synchronize()
+            except Exception as exc:  # noqa: BLE001 - surfaced as diagnostics
+                torch_cuda = False
+                torch_cuda_error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - system info must remain available
+        torch_cuda_error = str(exc)
 
     gpus: list[dict] = []
     try:
@@ -66,5 +80,7 @@ async def info():
         "torch_cuda_available": torch_cuda,
         "torch_version": torch_version,
         "torch_cuda_build": torch_cuda_build,
+        "torch_cuda_error": torch_cuda_error,
+        "torch_cuda_arch_list": torch_cuda_arch_list,
         "gpus": gpus,
     }

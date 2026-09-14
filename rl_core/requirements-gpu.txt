@@ -18,7 +18,9 @@
 # in via electron/main.ts's startBackendNative / Dockerfile.gpu's build arg).
 
 numpy>=1.26
-torch>=2.2
+# PyTorch 2.7 is the first stable release whose cu128 wheels contain
+# Blackwell kernels (sm_100/sm_120, including RTX 50-series GPUs).
+torch>=2.7
 # [box2d,mujoco,atari]: unlocks LunarLander/BipedalWalker/CarRacing, the 11
 # MuJoCo robotics tasks, and the ~40 Atari games in the Environments gallery.
 # All three ship prebuilt wheels (no swig/compiler needed) and add well under

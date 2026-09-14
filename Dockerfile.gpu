@@ -22,8 +22,8 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 # electron/docker.ts at build time from the *host's* driver (see
 # electron/gpu.ts's pickTorchCudaChannel; rl_core/requirements-gpu.txt
 # intentionally has no --index-url of its own, for the same reason: pinning
-# one statically here would go stale the next time PyTorch retires a
-# channel, same as it already did once with cu121/cu128).
+# one statically here would go stale when PyTorch changes its supported
+# wheel channels).
 ARG TORCH_CUDA_CHANNEL=cu126
 RUN pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/${TORCH_CUDA_CHANNEL} \

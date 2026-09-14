@@ -51,18 +51,15 @@ export function detectMaxCudaVersion(): number | null {
   }
 }
 
-// PyTorch's per-CUDA-version pip wheel channels get retired over time as
-// new CUDA majors ship (whl/cu121 and whl/cu128 have both gone fully dead
-// since this app first pinned one of them — pip install would silently
-// fall through to --extra-index-url PyPI's *current* default channel
-// instead, which can easily be newer than the user's actual driver
-// supports and leaves torch.cuda.is_available() == False despite a
-// "successful" install). So instead of a hardcoded index-url, this picks
-// the newest channel the *detected* driver can actually run, at install
-// time. Ordered newest-first; keep this list in sync with what
-// https://download.pytorch.org/whl/ currently serves.
+// Pick the newest wheel runtime the detected driver can run. CUDA 12.8 is
+// not interchangeable with 12.6 here: RTX 50-series Blackwell GPUs
+// (compute capability sm_120) require PyTorch's cu128-or-newer binaries;
+// cu126 can install and report CUDA available, then fail at the first
+// kernel launch with "no kernel image is available". Ordered newest-first;
+// keep this list in sync with https://download.pytorch.org/whl/.
 const TORCH_CUDA_CHANNELS: { channel: string; minDriverCuda: number }[] = [
   { channel: 'cu130', minDriverCuda: 13.0 },
+  { channel: 'cu128', minDriverCuda: 12.8 },
   { channel: 'cu126', minDriverCuda: 12.6 },
 ]
 

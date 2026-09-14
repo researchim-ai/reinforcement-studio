@@ -481,7 +481,7 @@ export async function ensurePythonEnv(
     // (toggling the "GPU" setting points this at requirements-gpu.txt
     // instead of requirements.txt, or extraPipArgs' --index-url now points
     // at a different CUDA channel than last time): all of these still
-    // satisfy the same `torch>=2.2` constraint, so a plain `pip install`
+    // satisfy the same broad torch version constraint, so a plain `pip install`
     // would see the already-installed wheel as "good enough" and silently
     // keep it, leaving the GPU toggle (or a newly-detected driver) with no
     // actual effect. This only runs when the hash changed (first install,

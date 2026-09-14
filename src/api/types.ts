@@ -852,5 +852,10 @@ export interface SystemInfo {
   // false (driver too old/missing), which is a different problem than "the
   // wrong wheel got installed" and needs a different fix from the user.
   torch_cuda_build: string | null
+  // A real one-element CUDA kernel is launched by /system/info. This
+  // catches architecture mismatches (for example cu126 on sm_120) that
+  // torch.cuda.is_available() alone incorrectly reports as usable.
+  torch_cuda_error?: string | null
+  torch_cuda_arch_list?: string[]
   gpus: { id: number; name: string; memory_used_mb: number; memory_total_mb: number; utilization: number | null }[]
 }
