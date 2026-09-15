@@ -5,7 +5,14 @@ import net from 'net'
 import { spawn, type ChildProcess } from 'child_process'
 import { DockerManager } from './docker'
 import { loadConfig, saveConfig, type AppConfig, type BackendMode } from './config'
-import { detectGpus, detectMaxCudaVersion, pickTorchCudaChannel, type DetectedGpu } from './gpu'
+import {
+  detectGpus,
+  detectMaxCudaVersion,
+  pickTorchCudaChannel,
+  torchCpuInstallArgs,
+  torchCudaInstallArgs,
+  type DetectedGpu,
+} from './gpu'
 import { migrateLegacyUserData } from './migrateUserData'
 import { ensurePythonEnv } from './pythonEnv'
 
@@ -412,16 +419,21 @@ async function startBackendNative(): Promise<void> {
   // Python already having fastapi/gymnasium/torch.
   const nativeGpu = loadConfig().nativeGpu
   const rlCoreRequirements = nativeGpu ? 'requirements-gpu.txt' : 'requirements.txt'
-  // requirements-gpu.txt has no --index-url of its own (see that file's
-  // comment for why: PyTorch's cuXXX channels get retired over time and a
-  // stale pin silently falls through to whatever PyPI's *current* default
-  // is, which can need a newer driver than this machine actually has) — so
-  // pick the right one for the driver actually detected on *this* boot.
-  const extraPipArgs: string[] = []
+  // Install torch separately from exactly one PyTorch index. This keeps
+  // CPU/GPU switching deterministic and prevents a general PyPI resolution
+  // from replacing the selected CUDA wheel.
+  const extraInstallArgs: string[] = []
+  const isolatedInstallArgs: string[] = []
   if (nativeGpu) {
-    const cudaChannel = pickTorchCudaChannel(detectMaxCudaVersion())
-    logStream.write(`[env] GPU включён — ставлю torch с канала ${cudaChannel}\n`)
-    extraPipArgs.push('--index-url', `https://download.pytorch.org/whl/${cudaChannel}`, '--extra-index-url', 'https://pypi.org/simple')
+    const maxCudaVersion = detectMaxCudaVersion()
+    const cudaChannel = pickTorchCudaChannel(maxCudaVersion)
+    logStream.write(
+      `[env] GPU включён; драйвер сообщает CUDA ${maxCudaVersion ?? 'unknown'}; ` +
+      `ставлю torch строго с канала ${cudaChannel}\n`,
+    )
+    isolatedInstallArgs.push(...torchCudaInstallArgs(cudaChannel))
+  } else {
+    isolatedInstallArgs.push(...torchCpuInstallArgs())
   }
   let pythonPath: string
   try {
@@ -432,7 +444,8 @@ async function startBackendNative(): Promise<void> {
         logStream.write(`[env:${phase}] ${line ?? ''}\n`)
         emitBootPhase({ phase, line })
       },
-      extraPipArgs,
+      extraInstallArgs,
+      isolatedInstallArgs,
     )
     pythonPath = result.pythonPath
   } catch (err) {
@@ -747,7 +760,7 @@ function registerIpcHandlers() {
     const next = saveConfig({ nativeGpu: gpu, dockerGpu: gpu, setupComplete: true })
     // Same reasoning as config:set-backend-mode: this can now be clicked
     // while a backend is already running or mid-boot (Docker build,
-    // pip install, ...), not just on the very first, backend-less launch —
+    // uv install, ...), not just on the very first, backend-less launch —
     // cancel/stop whatever's in flight so the new choice actually takes
     // effect right away instead of queuing invisibly behind it.
     dockerManager?.cancelBuild()

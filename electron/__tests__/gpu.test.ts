@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { pickTorchCudaChannel } from '../gpu'
+import {
+  pickTorchCudaChannel,
+  torchCpuInstallArgs,
+  torchCudaInstallArgs,
+} from '../gpu'
 
 describe('PyTorch CUDA wheel selection', () => {
   it('selects cu128 for RTX 50-series capable drivers', () => {
@@ -17,5 +21,23 @@ describe('PyTorch CUDA wheel selection', () => {
     expect(pickTorchCudaChannel(12.6)).toBe('cu126')
     expect(pickTorchCudaChannel(12.7)).toBe('cu126')
     expect(pickTorchCudaChannel(null)).toBe('cu126')
+  })
+
+  it('installs torch from an isolated CUDA index', () => {
+    const args = torchCudaInstallArgs('cu128')
+    expect(args).toEqual([
+      '--torch-backend',
+      'cu128',
+      'torch>=2.7',
+    ])
+    expect(args).not.toContain('--index-url')
+  })
+
+  it('installs CPU torch from its isolated index', () => {
+    expect(torchCpuInstallArgs()).toEqual([
+      '--torch-backend',
+      'cpu',
+      'torch>=2.2',
+    ])
   })
 })

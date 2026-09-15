@@ -1,6 +1,7 @@
 # Reinforcement Studio backend image — CPU by default; pass --gpus all at run time if
 # the host has the NVIDIA Container Toolkit and you want AlphaZero/PPO on GPU.
 FROM python:3.11-slim
+COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -11,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY rl_core/requirements.txt /app/rl_core/requirements.txt
 COPY backend/requirements.txt /app/backend/requirements.txt
 
-RUN pip install --no-cache-dir -r /app/rl_core/requirements.txt \
-    && pip install --no-cache-dir -r /app/backend/requirements.txt
+RUN uv pip install --system --no-cache --torch-backend cpu "torch>=2.2" \
+    && uv pip install --system --no-cache \
+      -r /app/rl_core/requirements.txt \
+      -r /app/backend/requirements.txt
 
 COPY rl_core /app/rl_core
 COPY backend /app/backend

@@ -21,6 +21,52 @@ export type PythonEnvPhase = 'installing-python' | 'creating-venv' | 'installing
 /** Pinned portable CPython used when the machine has no usable interpreter. */
 export const MANAGED_CPYTHON_VERSION = '3.12.13'
 export const MANAGED_PYTHON_RELEASE = '20260325'
+export const MANAGED_UV_VERSION = '0.12.9'
+
+export interface ManagedUvAsset {
+  triple: string
+  archive: string
+  sha256: string
+}
+
+const UV_ASSETS: Partial<Record<NodeJS.Platform, Partial<Record<string, ManagedUvAsset>>>> = {
+  win32: {
+    x64: {
+      triple: 'x86_64-pc-windows-msvc',
+      archive: 'uv-x86_64-pc-windows-msvc.zip',
+      sha256: 'ddbfcee1ac615a0499f6aa97b5ec8ebdf3ee4a7714a48055ec2ba0030e3cf810',
+    },
+    arm64: {
+      triple: 'aarch64-pc-windows-msvc',
+      archive: 'uv-aarch64-pc-windows-msvc.zip',
+      sha256: 'd3360363a3cb671f2c854f4ef48cf4a57fe8664f8ec6a248076d68b797a8acc0',
+    },
+  },
+  linux: {
+    x64: {
+      triple: 'x86_64-unknown-linux-gnu',
+      archive: 'uv-x86_64-unknown-linux-gnu.tar.gz',
+      sha256: 'ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460',
+    },
+    arm64: {
+      triple: 'aarch64-unknown-linux-gnu',
+      archive: 'uv-aarch64-unknown-linux-gnu.tar.gz',
+      sha256: 'c36fe17937ff6bd16dc42fc13854b5465999fcab2efe0af559381e945e3c6001',
+    },
+  },
+  darwin: {
+    x64: {
+      triple: 'x86_64-apple-darwin',
+      archive: 'uv-x86_64-apple-darwin.tar.gz',
+      sha256: 'e1ca175824f1056589ce9908f7631879ebc3c36535b5e63dc06510beb370b4c1',
+    },
+    arm64: {
+      triple: 'aarch64-apple-darwin',
+      archive: 'uv-aarch64-apple-darwin.tar.gz',
+      sha256: '301f72afaf54060f92da7016cb0115bd077f43a9c8e39c1d8170a0bac80fd398',
+    },
+  },
+}
 
 const PROBE_CODE = 'import sys; assert sys.version_info >= (3, 10); print(sys.executable)'
 const DOWNLOAD_UA = 'reinforcement-studio'
@@ -61,6 +107,32 @@ export function managedPythonInterpreterPath(
   return platform === 'win32'
     ? path.join(runtimeDir, 'python', 'python.exe')
     : path.join(runtimeDir, 'python', 'bin', 'python3')
+}
+
+export function managedUvAsset(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): ManagedUvAsset {
+  const asset = UV_ASSETS[platform]?.[arch]
+  if (!asset) throw new Error(`Нет standalone uv для ${platform}/${arch}`)
+  return asset
+}
+
+export function managedUvDownloadUrl(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string {
+  const asset = managedUvAsset(platform, arch)
+  return `https://releases.astral.sh/github/uv/releases/download/${MANAGED_UV_VERSION}/${asset.archive}`
+}
+
+export function managedUvExecutablePath(
+  runtimeDir: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string {
+  const { triple } = managedUvAsset(platform, arch)
+  return path.join(runtimeDir, `uv-${triple}`, platform === 'win32' ? 'uv.exe' : 'uv')
 }
 
 function spawnDefaults(): SpawnSyncOptions {
@@ -182,21 +254,6 @@ export function venvPythonPath(venvDir: string): string {
     : path.join(venvDir, 'bin', 'python3')
 }
 
-function run(cmd: string, args: string[]): Promise<number> {
-  return new Promise((resolve) => {
-    const proc = spawn(cmd, args, { stdio: 'ignore', windowsHide: true })
-    proc.on('error', () => resolve(1))
-    proc.on('exit', (code) => resolve(code ?? 1))
-  })
-}
-
-/** Checks whether `pip` is actually importable inside the given venv python. */
-async function hasPip(pyExe: string): Promise<boolean> {
-  if (!fs.existsSync(pyExe)) return false
-  const code = await run(pyExe, ['-m', 'pip', '--version'])
-  return code === 0
-}
-
 function formatMb(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`
 }
@@ -240,33 +297,6 @@ function downloadFile(
   })
 }
 
-/**
- * Last-resort pip bootstrap for Python builds that ship without working
- * ensurepip wheels (seen on some Anaconda/Miniconda distributions) — fetches
- * the official installer from bootstrap.pypa.io and runs it directly, so the
- * app can self-heal without asking the user to run any manual commands.
- */
-async function bootstrapPipViaGetPip(
-  pyExe: string,
-  venvDir: string,
-  onLine: (line: string) => void,
-): Promise<boolean> {
-  const getPipPath = path.join(venvDir, 'get-pip.py')
-  try {
-    onLine('ensurepip недоступен — скачиваю get-pip.py...')
-    await downloadFile('https://bootstrap.pypa.io/get-pip.py', getPipPath)
-    // get-pip.py itself calls out to PyPI to fetch the pip wheel, so this can
-    // hang on a restricted/flaky network — cap it instead of freezing the UI.
-    const code = await runStreaming(pyExe, [getPipPath, '--no-input'], onLine, 90_000)
-    return code === 0 && (await hasPip(pyExe))
-  } catch (err) {
-    onLine(`Не удалось скачать/запустить get-pip.py: ${err instanceof Error ? err.message : String(err)}`)
-    return false
-  } finally {
-    fs.rmSync(getPipPath, { force: true })
-  }
-}
-
 function requirementsHash(files: string[]): string {
   const hash = crypto.createHash('sha256')
   for (const f of files) {
@@ -279,10 +309,14 @@ function requirementsHash(files: string[]): string {
   return hash.digest('hex')
 }
 
+function fileSha256(filePath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
 /**
  * Runs a command, streaming its combined stdout/stderr line by line.
  * `timeoutMs` guards against steps that can hang indefinitely on a stalled
- * network connection (e.g. pip/get-pip.py waiting on a dead socket) — without
+ * network connection (e.g. uv waiting on a dead package index) — without
  * this, a single flaky download could freeze the boot screen forever.
  */
 function runStreaming(
@@ -317,6 +351,70 @@ function runStreaming(
 
 function runtimeId(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
   return `cpython-${MANAGED_CPYTHON_VERSION}+${MANAGED_PYTHON_RELEASE}-${managedPythonTriple(platform, arch) ?? 'unknown'}`
+}
+
+function probeUv(uvExe: string): boolean {
+  if (!fs.existsSync(uvExe)) return false
+  try {
+    const result = spawnSync(uvExe, ['--version'], spawnDefaults())
+    return result.status === 0 && String(result.stdout ?? '').includes(`uv ${MANAGED_UV_VERSION}`)
+  } catch {
+    return false
+  }
+}
+
+async function ensureManagedUv(
+  runtimeDir: string,
+  onProgress: (phase: PythonEnvPhase, line?: string) => void,
+): Promise<string> {
+  const asset = managedUvAsset()
+  const uvExe = managedUvExecutablePath(runtimeDir)
+  const markerPath = path.join(runtimeDir, '.uv-id')
+  const expectedId = `${MANAGED_UV_VERSION}:${asset.triple}:${asset.sha256}`
+  const installedId = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf-8').trim() : ''
+  if (installedId === expectedId && probeUv(uvExe)) return uvExe
+
+  const stagingDir = `${runtimeDir}.staging`
+  fs.rmSync(stagingDir, { recursive: true, force: true })
+  fs.mkdirSync(stagingDir, { recursive: true })
+  const archivePath = path.join(stagingDir, asset.archive)
+  try {
+    onProgress('installing-dependencies', `Скачиваю uv ${MANAGED_UV_VERSION}…`)
+    let lastReported = 0
+    await downloadFile(managedUvDownloadUrl(), archivePath, (received, total) => {
+      if (received - lastReported < 1024 * 1024 && !(total && received === total)) return
+      lastReported = received
+      const suffix = total ? ` из ${formatMb(total)}` : ''
+      onProgress(
+        'installing-dependencies',
+        `Скачиваю uv ${MANAGED_UV_VERSION}… ${formatMb(received)}${suffix}`,
+      )
+    })
+    const actualSha256 = fileSha256(archivePath)
+    if (actualSha256 !== asset.sha256) {
+      throw new Error(`checksum не совпал: ожидался ${asset.sha256}, получен ${actualSha256}`)
+    }
+    onProgress('installing-dependencies', 'Распаковываю uv…')
+    const tarCode = await runStreaming(
+      tarExecutable(),
+      ['-xf', archivePath, '-C', stagingDir],
+      (line) => onProgress('installing-dependencies', line),
+      60_000,
+    )
+    fs.rmSync(archivePath, { force: true })
+    if (tarCode !== 0) throw new Error('tar вернул ошибку')
+    const stagedUv = managedUvExecutablePath(stagingDir)
+    if (process.platform !== 'win32') fs.chmodSync(stagedUv, 0o755)
+    if (!probeUv(stagedUv)) throw new Error('скачанный uv не запускается')
+    fs.rmSync(runtimeDir, { recursive: true, force: true })
+    fs.renameSync(stagingDir, runtimeDir)
+    fs.writeFileSync(path.join(runtimeDir, '.uv-id'), expectedId)
+    return managedUvExecutablePath(runtimeDir)
+  } catch (err) {
+    fs.rmSync(stagingDir, { recursive: true, force: true })
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(`Не удалось установить uv (${detail}). Проверьте интернет и перезапустите приложение.`)
+  }
 }
 
 async function ensureManagedPython(
@@ -389,9 +487,9 @@ export interface EnsurePythonEnvResult {
 /**
  * Ensures a dedicated venv exists under `venvDir` with all packages from
  * `requirementFiles` installed. Skips reinstall if neither the requirement
- * files' content nor `extraPipArgs` (e.g. which CUDA wheel channel to pull
- * torch from) have changed since the last successful install (tracked via
- * a content hash).
+ * files' content, `extraInstallArgs`, nor `isolatedInstallArgs` (e.g. the
+ * sole CUDA wheel channel used for torch) have changed since the last
+ * successful install (tracked via a content hash).
  *
  * A working system Python is no longer required: if none is found, a
  * portable CPython is downloaded next to the venv (`../python-runtime`).
@@ -400,75 +498,47 @@ export async function ensurePythonEnv(
   venvDir: string,
   requirementFiles: string[],
   onProgress: (phase: PythonEnvPhase, line?: string) => void,
-  extraPipArgs: string[] = [],
+  extraInstallArgs: string[] = [],
+  isolatedInstallArgs: string[] = [],
 ): Promise<EnsurePythonEnvResult> {
   const pyExe = venvPythonPath(venvDir)
   const existingFiles = requirementFiles.filter((f) => fs.existsSync(f))
-  // extraPipArgs folded into the hash too: switching CUDA wheel channel
-  // (e.g. detected driver now supports cu130 instead of last time's cu126)
-  // must trigger a reinstall even though the requirement *files* themselves
-  // didn't change a single byte.
-  const currentHash = requirementsHash(existingFiles) + ':' + extraPipArgs.join(' ')
+  // Installer arguments are folded into the hash too: switching CUDA wheel
+  // channel must trigger a reinstall even when requirement files did not
+  // change.
+  const currentHash = [
+    requirementsHash(existingFiles),
+    extraInstallArgs.join(' '),
+    isolatedInstallArgs.join(' '),
+    `uv-${MANAGED_UV_VERSION}`,
+  ].join(':')
   const markerPath = path.join(venvDir, '.deps-hash')
   const runtimeDir = path.join(path.dirname(venvDir), 'python-runtime')
+  const uvRuntimeDir = path.join(path.dirname(venvDir), 'uv-runtime')
+  const uvExe = await ensureManagedUv(uvRuntimeDir, onProgress)
 
-  // A previous run may have been interrupted (crash, force-quit, killed
-  // process) partway through venv creation, leaving a `python3` binary in
-  // place but no working `pip` — or the requirements hash marker stale.
-  // Re-verify pip actually works every time rather than trusting that the
-  // venv directory existing means it's usable; self-heal instead of getting
-  // stuck repeating the same failure forever.
-  if (fs.existsSync(pyExe) && !(await hasPip(pyExe))) {
+  // uv-managed environments do not need pip inside the venv. Probe the
+  // interpreter itself so an interrupted creation self-heals without
+  // deleting a valid pip-less uv environment on every boot.
+  if (fs.existsSync(pyExe) && !probePython(pyExe)) {
     onProgress('creating-venv', 'Обнаружено повреждённое окружение — пересобираю venv...')
     fs.rmSync(venvDir, { recursive: true, force: true })
   }
 
   if (!fs.existsSync(pyExe)) {
     const basePython = await resolveBasePython(runtimeDir, onProgress)
-    onProgress('creating-venv')
+    onProgress('creating-venv', 'Создаю окружение через uv…')
     fs.mkdirSync(path.dirname(venvDir), { recursive: true })
-    // --system-site-packages lets the venv fall back to the base Python's
-    // own site-packages when something isn't installed locally. This is
-    // what actually fixes the common Anaconda/Miniconda case: those base
-    // environments almost always have a perfectly working `pip` already
-    // (conda installs it), even when the *venv module's* bundled ensurepip
-    // wheels are stripped/broken. It costs nothing when the base env is
-    // "clean" system Python, since pip still installs our packages into the
-    // venv's own (isolated) site-packages, not the base one.
-    await runStreaming(
-      basePython,
-      ['-m', 'venv', '--system-site-packages', venvDir],
+    const createCode = await runStreaming(
+      uvExe,
+      ['venv', '--python', basePython, '--clear', venvDir],
       (line) => onProgress('creating-venv', line),
       60_000,
     )
 
-    if (!fs.existsSync(pyExe)) {
+    if (createCode !== 0 || !probePython(pyExe)) {
       throw new Error(
-        'Не удалось создать виртуальное окружение Python (python3 -m venv не создал интерпретатор). ' +
-        'Убедитесь, что установлен модуль venv для вашего Python.',
-      )
-    }
-
-    // Note: we deliberately don't gate this on the venv command's own exit
-    // code — cpython's venv module usually still leaves a working python3
-    // binary in place even when its final ensurepip step fails, which is
-    // exactly the case we're repairing here.
-    if (!(await hasPip(pyExe))) {
-      onProgress('creating-venv', 'pip не установился автоматически, пробую ensurepip...')
-      await runStreaming(pyExe, ['-m', 'ensurepip', '--upgrade'], (line) => onProgress('creating-venv', line), 30_000)
-    }
-    if (!(await hasPip(pyExe))) {
-      // Last resort, only reached if the base Python has no usable pip
-      // anywhere AND ensurepip's bundled wheels are broken — fetch pip
-      // directly instead of asking the user to fix their system Python.
-      // Bounded by its own internal timeout so a dead network can't hang
-      // the boot screen forever.
-      await bootstrapPipViaGetPip(pyExe, venvDir, (line) => onProgress('creating-venv', line))
-    }
-    if (!(await hasPip(pyExe))) {
-      throw new Error(
-        'Не удалось создать рабочее виртуальное окружение Python: pip недоступен даже через system-site-packages, ' +
-        'ensurepip и загрузку get-pip.py. Проверьте, что у базового Python есть рабочий pip, и что есть доступ в интернет.',
+        'Не удалось создать виртуальное окружение Python через uv.',
       )
     }
   }
@@ -476,33 +546,42 @@ export async function ensurePythonEnv(
   const installedHash = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf-8').trim() : null
   if (installedHash !== currentHash && existingFiles.length > 0) {
     onProgress('installing-dependencies')
-    const pipArgs = ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-input']
-    // --force-reinstall matters specifically for the CPU<->GPU torch swap
-    // (toggling the "GPU" setting points this at requirements-gpu.txt
-    // instead of requirements.txt, or extraPipArgs' --index-url now points
-    // at a different CUDA channel than last time): all of these still
-    // satisfy the same broad torch version constraint, so a plain `pip install`
-    // would see the already-installed wheel as "good enough" and silently
-    // keep it, leaving the GPU toggle (or a newly-detected driver) with no
-    // actual effect. This only runs when the hash changed (first install,
-    // app update, or one of these toggles), so the extra reinstall cost is
-    // rare, not per-boot.
-    pipArgs.push('--force-reinstall')
-    pipArgs.push(...extraPipArgs)
-    for (const f of existingFiles) pipArgs.push('-r', f)
+    if (isolatedInstallArgs.length > 0) {
+      // Keep channel-sensitive packages on one index. This is explicit even
+      // though uv's first-index resolver is already safer than pip: the
+      // following common requirements pass then leaves torch untouched.
+      const isolatedCode = await runStreaming(
+        uvExe,
+        [
+          'pip', 'install', '--python', pyExe, '--reinstall',
+          ...isolatedInstallArgs,
+        ],
+        (line) => onProgress('installing-dependencies', line),
+        30 * 60_000,
+      )
+      if (isolatedCode !== 0) {
+        throw new Error(
+          'Не удалось установить CUDA-сборку PyTorch из выбранного канала. Подробности — в логах backend.',
+        )
+      }
+    }
+    const uvArgs = ['pip', 'install', '--python', pyExe]
+    if (isolatedInstallArgs.length === 0) uvArgs.push('--reinstall')
+    uvArgs.push(...extraInstallArgs)
+    for (const f of existingFiles) uvArgs.push('-r', f)
     // Generous timeout: torch + friends are a real download (hundreds of MB)
     // and can legitimately take several minutes on a slow connection. This
     // only guards against a truly dead/stalled connection, not a slow one —
-    // pip's own progress output keeps streaming to the UI the whole time.
+    // uv's own progress output keeps streaming to the UI the whole time.
     const code = await runStreaming(
-      pyExe,
-      pipArgs,
+      uvExe,
+      uvArgs,
       (line) => onProgress('installing-dependencies', line),
       30 * 60_000,
     )
     if (code !== 0) {
       throw new Error(
-        'Не удалось установить Python-зависимости (pip install). Подробности — в логах backend.',
+        'Не удалось установить Python-зависимости через uv. Подробности — в логах backend.',
       )
     }
     fs.writeFileSync(markerPath, currentHash)

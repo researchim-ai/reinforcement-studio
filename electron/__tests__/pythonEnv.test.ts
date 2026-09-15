@@ -6,9 +6,13 @@ import {
   managedPythonDownloadUrl,
   managedPythonInterpreterPath,
   managedPythonTriple,
+  managedUvAsset,
+  managedUvDownloadUrl,
+  managedUvExecutablePath,
   tarExecutable,
   MANAGED_CPYTHON_VERSION,
   MANAGED_PYTHON_RELEASE,
+  MANAGED_UV_VERSION,
 } from '../pythonEnv'
 
 describe('portable Python bootstrap', () => {
@@ -39,5 +43,24 @@ describe('portable Python bootstrap', () => {
       path.join('C:\\Windows', 'System32', 'tar.exe'),
     )
     expect(tarExecutable('win32', 'C:\\Windows', () => false)).toBe('tar')
+  })
+
+  it('pins the checksummed Windows x64 standalone uv archive', () => {
+    expect(managedUvDownloadUrl('win32', 'x64')).toBe(
+      `https://releases.astral.sh/github/uv/releases/download/${MANAGED_UV_VERSION}/uv-x86_64-pc-windows-msvc.zip`,
+    )
+    expect(managedUvAsset('win32', 'x64').sha256).toBe(
+      'ddbfcee1ac615a0499f6aa97b5ec8ebdf3ee4a7714a48055ec2ba0030e3cf810',
+    )
+    expect(managedUvExecutablePath('/data/uv-runtime', 'win32', 'x64')).toBe(
+      path.join('/data/uv-runtime', 'uv-x86_64-pc-windows-msvc', 'uv.exe'),
+    )
+  })
+
+  it('selects native standalone uv archives for Linux and macOS', () => {
+    expect(managedUvDownloadUrl('linux', 'arm64')).toContain('uv-aarch64-unknown-linux-gnu.tar.gz')
+    expect(managedUvExecutablePath('/data/uv-runtime', 'darwin', 'arm64')).toBe(
+      path.join('/data/uv-runtime', 'uv-aarch64-apple-darwin', 'uv'),
+    )
   })
 })

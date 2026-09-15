@@ -75,3 +75,20 @@ export function pickTorchCudaChannel(maxCudaVersion: number | null): string {
   }
   return TORCH_CUDA_CHANNELS[TORCH_CUDA_CHANNELS.length - 1].channel
 }
+
+export function torchCudaInstallArgs(channel: string): string[] {
+  if (!/^cu\d+$/.test(channel)) throw new Error(`Invalid PyTorch CUDA channel: ${channel}`)
+  return [
+    '--torch-backend',
+    channel,
+    'torch>=2.7',
+  ]
+}
+
+export function torchCpuInstallArgs(): string[] {
+  return [
+    '--torch-backend',
+    'cpu',
+    'torch>=2.2',
+  ]
+}
