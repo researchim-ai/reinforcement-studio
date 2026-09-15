@@ -2,6 +2,8 @@
 // `nvidia-smi` directly from the Electron main process (no backend needed
 // yet, since this happens *before* we decide whether/how to start one).
 import { spawnSync } from 'child_process'
+import fs from 'fs'
+import path from 'path'
 
 export interface DetectedGpu {
   index: number
@@ -9,10 +11,25 @@ export interface DetectedGpu {
   memoryTotalMb: number
 }
 
+export function nvidiaSmiExecutable(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (filePath: string) => boolean = fs.existsSync,
+): string {
+  if (platform !== 'win32') return 'nvidia-smi'
+  const systemRoot = env.SystemRoot || env.WINDIR || 'C:\\Windows'
+  const programFiles = env.ProgramW6432 || env.ProgramFiles || 'C:\\Program Files'
+  const candidates = [
+    path.win32.join(systemRoot, 'System32', 'nvidia-smi.exe'),
+    path.win32.join(programFiles, 'NVIDIA Corporation', 'NVSMI', 'nvidia-smi.exe'),
+  ]
+  return candidates.find(exists) ?? 'nvidia-smi'
+}
+
 export function detectGpus(): DetectedGpu[] {
   try {
     const result = spawnSync(
-      'nvidia-smi',
+      nvidiaSmiExecutable(),
       ['--query-gpu=index,name,memory.total', '--format=csv,noheader,nounits'],
       { encoding: 'utf-8', timeout: 5000 },
     )
@@ -42,7 +59,7 @@ export function detectGpus(): DetectedGpu[] {
  */
 export function detectMaxCudaVersion(): number | null {
   try {
-    const result = spawnSync('nvidia-smi', [], { encoding: 'utf-8', timeout: 5000 })
+    const result = spawnSync(nvidiaSmiExecutable(), [], { encoding: 'utf-8', timeout: 5000 })
     if (result.status !== 0 || !result.stdout) return null
     const match = result.stdout.match(/CUDA Version:\s*([\d.]+)/)
     return match ? parseFloat(match[1]) : null
@@ -63,17 +80,31 @@ const TORCH_CUDA_CHANNELS: { channel: string; minDriverCuda: number }[] = [
   { channel: 'cu126', minDriverCuda: 12.6 },
 ]
 
-/** Always returns a channel — cu126 (PyTorch's own documented "older
- * driver" fallback) if the driver's version is unknown or older than every
- * entry above, rather than guessing further down an increasingly-retired
- * list (cu121, cu118, ...). */
-export function pickTorchCudaChannel(maxCudaVersion: number | null): string {
+/** Always returns a channel. Unknown/older drivers normally use cu126,
+ * except RTX 50-series GPUs, which require at least cu128 kernels. */
+export function gpuRequiresCuda128(gpus: Pick<DetectedGpu, 'name'>[]): boolean {
+  return gpus.some(({ name }) => /\b(?:geforce\s+)?rtx\s*50\d{2}\b/i.test(name))
+}
+
+export function pickTorchCudaChannel(
+  maxCudaVersion: number | null,
+  gpus: Pick<DetectedGpu, 'name'>[] = [],
+): string {
+  const requiresCuda128 = gpuRequiresCuda128(gpus)
   if (maxCudaVersion != null) {
     for (const { channel, minDriverCuda } of TORCH_CUDA_CHANNELS) {
-      if (maxCudaVersion >= minDriverCuda) return channel
+      if (maxCudaVersion >= minDriverCuda && (!requiresCuda128 || minDriverCuda >= 12.8)) return channel
     }
   }
+  // Blackwell consumer GPUs cannot execute cu126 kernels at all. If
+  // nvidia-smi's version is unavailable (common with packaged Electron's
+  // stripped PATH) or unexpectedly old, cu128 is the only useful fallback.
+  if (requiresCuda128) return 'cu128'
   return TORCH_CUDA_CHANNELS[TORCH_CUDA_CHANNELS.length - 1].channel
+}
+
+export function detectTorchCudaChannel(): string {
+  return pickTorchCudaChannel(detectMaxCudaVersion(), detectGpus())
 }
 
 export function torchCudaInstallArgs(channel: string): string[] {

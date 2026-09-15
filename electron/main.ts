@@ -8,6 +8,7 @@ import { loadConfig, saveConfig, type AppConfig, type BackendMode } from './conf
 import {
   detectGpus,
   detectMaxCudaVersion,
+  detectTorchCudaChannel,
   pickTorchCudaChannel,
   torchCpuInstallArgs,
   torchCudaInstallArgs,
@@ -369,7 +370,7 @@ async function startBackendDocker(config: AppConfig): Promise<boolean> {
       return false
     }
     emitBootPhase({ phase: 'building-image' })
-    const torchCudaChannel = config.dockerGpu ? pickTorchCudaChannel(detectMaxCudaVersion()) : undefined
+    const torchCudaChannel = config.dockerGpu ? detectTorchCudaChannel() : undefined
     const build = await dockerManager.buildImage(
       (line) => emitBootPhase({ phase: 'building-image', line }),
       config.dockerGpu,
@@ -426,9 +427,11 @@ async function startBackendNative(): Promise<void> {
   const torchInstallArgs: string[] = []
   if (nativeGpu) {
     const maxCudaVersion = detectMaxCudaVersion()
-    const cudaChannel = pickTorchCudaChannel(maxCudaVersion)
+    const detectedGpus = detectGpus()
+    const cudaChannel = pickTorchCudaChannel(maxCudaVersion, detectedGpus)
     logStream.write(
-      `[env] GPU включён; драйвер сообщает CUDA ${maxCudaVersion ?? 'unknown'}; ` +
+      `[env] GPU включён; GPU=${detectedGpus.map(({ name }) => name).join(', ') || 'unknown'}; ` +
+      `nvidia-smi сообщает CUDA ${maxCudaVersion ?? 'unknown'}; ` +
       `ставлю torch строго с канала ${cudaChannel}\n`,
     )
     torchInstallArgs.push(...torchCudaInstallArgs(cudaChannel))
@@ -782,7 +785,7 @@ function registerIpcHandlers() {
   ipcMain.handle('docker:build', async () => {
     if (!dockerManager) return { success: false, error: 'Docker not initialized' }
     const gpu = loadConfig().dockerGpu
-    const torchCudaChannel = gpu ? pickTorchCudaChannel(detectMaxCudaVersion()) : undefined
+    const torchCudaChannel = gpu ? detectTorchCudaChannel() : undefined
     return dockerManager.buildImage((line) => mainWindow?.webContents.send('docker:build-progress', line), gpu, torchCudaChannel)
   })
   ipcMain.handle('docker:logs', async (_event, tail?: number) => dockerManager?.getContainerLogs(tail))

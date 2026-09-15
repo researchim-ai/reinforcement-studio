@@ -583,6 +583,10 @@ export async function ensurePythonEnv(
   if (installedHash !== currentHash && existingFiles.length > 0) {
     onProgress('installing-dependencies')
     const uvArgs = uvPipInstallArgs(pyExe, existingFiles, extraInstallArgs, torchInstallArgs)
+    onProgress(
+      'installing-dependencies',
+      `Команда: uv ${uvArgs.map((arg) => JSON.stringify(arg)).join(' ')}`,
+    )
     // Generous timeout: torch + friends are a real download (hundreds of MB)
     // and can legitimately take several minutes on a slow connection. This
     // only guards against a truly dead/stalled connection, not a slow one —
