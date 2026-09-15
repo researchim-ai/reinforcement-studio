@@ -10,6 +10,7 @@ import {
   managedUvDownloadUrl,
   managedUvExecutablePath,
   tarExecutable,
+  uvPipInstallArgs,
   MANAGED_CPYTHON_VERSION,
   MANAGED_PYTHON_RELEASE,
   MANAGED_UV_VERSION,
@@ -62,5 +63,22 @@ describe('portable Python bootstrap', () => {
     expect(managedUvExecutablePath('/data/uv-runtime', 'darwin', 'arm64')).toBe(
       path.join('/data/uv-runtime', 'uv-aarch64-apple-darwin', 'uv'),
     )
+  })
+
+  it('resolves CUDA torch and all requirements in one uv transaction', () => {
+    expect(uvPipInstallArgs(
+      String.raw`C:\app\pyenv\Scripts\python.exe`,
+      [String.raw`C:\app\requirements-gpu.txt`, String.raw`C:\app\backend-requirements.txt`],
+      [],
+      ['--torch-backend', 'cu128', 'torch>=2.7'],
+    )).toEqual([
+      'pip', 'install',
+      '--python', String.raw`C:\app\pyenv\Scripts\python.exe`,
+      '--reinstall-package', 'torch',
+      '--torch-backend', 'cu128',
+      'torch>=2.7',
+      '-r', String.raw`C:\app\requirements-gpu.txt`,
+      '-r', String.raw`C:\app\backend-requirements.txt`,
+    ])
   })
 })

@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY rl_core/requirements.txt /app/rl_core/requirements.txt
 COPY backend/requirements.txt /app/backend/requirements.txt
 
-RUN uv pip install --system --no-cache --torch-backend cpu "torch>=2.2" \
-    && uv pip install --system --no-cache \
+RUN uv pip install --system --no-cache \
+      --torch-backend cpu \
+      --reinstall-package torch \
+      "torch>=2.2" \
       -r /app/rl_core/requirements.txt \
       -r /app/backend/requirements.txt
 

@@ -312,6 +312,25 @@ function requirementsHash(files: string[]): string {
   return hash.digest('hex')
 }
 
+export function uvPipInstallArgs(
+  pyExe: string,
+  requirementFiles: string[],
+  extraInstallArgs: string[] = [],
+  torchInstallArgs: string[] = [],
+): string[] {
+  const args = ['pip', 'install', '--python', pyExe]
+  if (torchInstallArgs.length > 0) {
+    // Resolve torch and the rest of the environment in one transaction.
+    // A second generic-index pass could otherwise replace cu128 afterwards.
+    args.push('--reinstall-package', 'torch', ...torchInstallArgs)
+  } else {
+    args.push('--reinstall')
+  }
+  args.push(...extraInstallArgs)
+  for (const file of requirementFiles) args.push('-r', file)
+  return args
+}
+
 function fileSha256(filePath: string): string {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
 }
@@ -504,8 +523,8 @@ export interface EnsurePythonEnvResult {
 /**
  * Ensures a dedicated venv exists under `venvDir` with all packages from
  * `requirementFiles` installed. Skips reinstall if neither the requirement
- * files' content, `extraInstallArgs`, nor `isolatedInstallArgs` (e.g. the
- * sole CUDA wheel channel used for torch) have changed since the last
+ * files' content, `extraInstallArgs`, nor `torchInstallArgs` (e.g. the
+ * CUDA backend selected for torch) have changed since the last
  * successful install (tracked via a content hash).
  *
  * A working system Python is no longer required: if none is found, a
@@ -516,7 +535,7 @@ export async function ensurePythonEnv(
   requirementFiles: string[],
   onProgress: (phase: PythonEnvPhase, line?: string) => void,
   extraInstallArgs: string[] = [],
-  isolatedInstallArgs: string[] = [],
+  torchInstallArgs: string[] = [],
 ): Promise<EnsurePythonEnvResult> {
   const pyExe = venvPythonPath(venvDir)
   const existingFiles = requirementFiles.filter((f) => fs.existsSync(f))
@@ -526,8 +545,8 @@ export async function ensurePythonEnv(
   const currentHash = [
     requirementsHash(existingFiles),
     extraInstallArgs.join(' '),
-    isolatedInstallArgs.join(' '),
-    `uv-${MANAGED_UV_VERSION}`,
+    torchInstallArgs.join(' '),
+    `uv-install-v2-${MANAGED_UV_VERSION}`,
   ].join(':')
   const markerPath = path.join(venvDir, '.deps-hash')
   const runtimeDir = path.join(path.dirname(venvDir), 'python-runtime')
@@ -563,29 +582,7 @@ export async function ensurePythonEnv(
   const installedHash = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf-8').trim() : null
   if (installedHash !== currentHash && existingFiles.length > 0) {
     onProgress('installing-dependencies')
-    if (isolatedInstallArgs.length > 0) {
-      // Keep channel-sensitive packages on one index. This is explicit even
-      // though uv's first-index resolver is already safer than pip: the
-      // following common requirements pass then leaves torch untouched.
-      const isolatedCode = await runStreaming(
-        uvExe,
-        [
-          'pip', 'install', '--python', pyExe, '--reinstall',
-          ...isolatedInstallArgs,
-        ],
-        (line) => onProgress('installing-dependencies', line),
-        30 * 60_000,
-      )
-      if (isolatedCode !== 0) {
-        throw new Error(
-          'Не удалось установить CUDA-сборку PyTorch из выбранного канала. Подробности — в логах backend.',
-        )
-      }
-    }
-    const uvArgs = ['pip', 'install', '--python', pyExe]
-    if (isolatedInstallArgs.length === 0) uvArgs.push('--reinstall')
-    uvArgs.push(...extraInstallArgs)
-    for (const f of existingFiles) uvArgs.push('-r', f)
+    const uvArgs = uvPipInstallArgs(pyExe, existingFiles, extraInstallArgs, torchInstallArgs)
     // Generous timeout: torch + friends are a real download (hundreds of MB)
     // and can legitimately take several minutes on a slow connection. This
     // only guards against a truly dead/stalled connection, not a slow one —
@@ -600,6 +597,32 @@ export async function ensurePythonEnv(
       throw new Error(
         'Не удалось установить Python-зависимости через uv. Подробности — в логах backend.',
       )
+    }
+    const backendFlag = torchInstallArgs.indexOf('--torch-backend')
+    const expectedTorchBackend = backendFlag >= 0 ? torchInstallArgs[backendFlag + 1] : null
+    if (expectedTorchBackend) {
+      const verifyCode = await runStreaming(
+        pyExe,
+        [
+          '-c',
+          [
+            'import sys, torch',
+            'expected = sys.argv[1]',
+            'actual = "cpu" if torch.version.cuda is None else "cu" + torch.version.cuda.replace(".", "")',
+            'print(f"PyTorch {torch.__version__}; backend={actual}; expected={expected}")',
+            'assert actual == expected, f"PyTorch backend mismatch: installed {actual}, expected {expected}"',
+          ].join('; '),
+          expectedTorchBackend,
+        ],
+        (line) => onProgress('installing-dependencies', line),
+        60_000,
+      )
+      if (verifyCode !== 0) {
+        throw new Error(
+          `Установлен неверный backend PyTorch вместо ${expectedTorchBackend}. ` +
+          'Окружение не будет помечено готовым; подробности — в логах backend.',
+        )
+      }
     }
     fs.writeFileSync(markerPath, currentHash)
   }

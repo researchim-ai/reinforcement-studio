@@ -423,7 +423,7 @@ async function startBackendNative(): Promise<void> {
   // CPU/GPU switching deterministic and prevents a general PyPI resolution
   // from replacing the selected CUDA wheel.
   const extraInstallArgs: string[] = []
-  const isolatedInstallArgs: string[] = []
+  const torchInstallArgs: string[] = []
   if (nativeGpu) {
     const maxCudaVersion = detectMaxCudaVersion()
     const cudaChannel = pickTorchCudaChannel(maxCudaVersion)
@@ -431,9 +431,9 @@ async function startBackendNative(): Promise<void> {
       `[env] GPU включён; драйвер сообщает CUDA ${maxCudaVersion ?? 'unknown'}; ` +
       `ставлю torch строго с канала ${cudaChannel}\n`,
     )
-    isolatedInstallArgs.push(...torchCudaInstallArgs(cudaChannel))
+    torchInstallArgs.push(...torchCudaInstallArgs(cudaChannel))
   } else {
-    isolatedInstallArgs.push(...torchCpuInstallArgs())
+    torchInstallArgs.push(...torchCpuInstallArgs())
   }
   let pythonPath: string
   try {
@@ -445,7 +445,7 @@ async function startBackendNative(): Promise<void> {
         emitBootPhase({ phase, line })
       },
       extraInstallArgs,
-      isolatedInstallArgs,
+      torchInstallArgs,
     )
     pythonPath = result.pythonPath
   } catch (err) {
