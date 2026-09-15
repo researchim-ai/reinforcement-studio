@@ -131,8 +131,11 @@ export function managedUvExecutablePath(
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
 ): string {
+  // Official Windows ZIPs contain uv.exe directly at archive root, while
+  // Unix tarballs wrap the binaries in an `uv-<target-triple>` directory.
+  if (platform === 'win32') return path.join(runtimeDir, 'uv.exe')
   const { triple } = managedUvAsset(platform, arch)
-  return path.join(runtimeDir, `uv-${triple}`, platform === 'win32' ? 'uv.exe' : 'uv')
+  return path.join(runtimeDir, `uv-${triple}`, 'uv')
 }
 
 function spawnDefaults(): SpawnSyncOptions {
@@ -353,14 +356,27 @@ function runtimeId(platform: NodeJS.Platform = process.platform, arch: string = 
   return `cpython-${MANAGED_CPYTHON_VERSION}+${MANAGED_PYTHON_RELEASE}-${managedPythonTriple(platform, arch) ?? 'unknown'}`
 }
 
-function probeUv(uvExe: string): boolean {
-  if (!fs.existsSync(uvExe)) return false
+function uvProbeFailure(uvExe: string): string | null {
+  if (!fs.existsSync(uvExe)) return `файл не найден: ${uvExe}`
   try {
     const result = spawnSync(uvExe, ['--version'], spawnDefaults())
-    return result.status === 0 && String(result.stdout ?? '').includes(`uv ${MANAGED_UV_VERSION}`)
-  } catch {
-    return false
+    if (result.error) return result.error.message
+    const stdout = String(result.stdout ?? '').trim()
+    const stderr = String(result.stderr ?? '').trim()
+    if (result.status !== 0) {
+      return stderr || stdout || `процесс завершился с кодом ${result.status}`
+    }
+    if (!stdout.includes(`uv ${MANAGED_UV_VERSION}`)) {
+      return `неожиданная версия: ${stdout || '(пустой вывод)'}`
+    }
+    return null
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
   }
+}
+
+function probeUv(uvExe: string): boolean {
+  return uvProbeFailure(uvExe) === null
 }
 
 async function ensureManagedUv(
@@ -405,7 +421,8 @@ async function ensureManagedUv(
     if (tarCode !== 0) throw new Error('tar вернул ошибку')
     const stagedUv = managedUvExecutablePath(stagingDir)
     if (process.platform !== 'win32') fs.chmodSync(stagedUv, 0o755)
-    if (!probeUv(stagedUv)) throw new Error('скачанный uv не запускается')
+    const probeFailure = uvProbeFailure(stagedUv)
+    if (probeFailure) throw new Error(`скачанный uv не запускается: ${probeFailure}`)
     fs.rmSync(runtimeDir, { recursive: true, force: true })
     fs.renameSync(stagingDir, runtimeDir)
     fs.writeFileSync(path.join(runtimeDir, '.uv-id'), expectedId)
