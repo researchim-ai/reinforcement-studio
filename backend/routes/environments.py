@@ -713,17 +713,27 @@ ALGORITHM_CATALOG = [
         "id": "alphazero",
         "name": "AlphaZero",
         "kind": "alphazero",
-        "description": "Self-play + MCTS + dual-head сеть — для настольных игр.",
+        "description": "Батчевый self-play с Gumbel-поиском, улучшенная политика как цель, "
+                       "голова «победа/ничья/поражение» и лестница Эло — для настольных игр.",
         "hyperparams": [
-            {"key": "num_simulations", "label": "MCTS simulations/move", "type": "int", "default": 25, "min": 4, "max": 400},
-            {"key": "games_per_iteration", "label": "Self-play games/iteration", "type": "int", "default": 20, "min": 2, "max": 200},
-            {"key": "epochs", "label": "Training epochs/iteration", "type": "int", "default": 4, "min": 1, "max": 20},
-            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 64, "min": 8, "max": 512},
+            {"key": "parallel_games", "label": "Параллельных партий", "type": "int", "default": 64, "min": 1, "max": 4096},
+            {"key": "selfplay_processes", "label": "Процессов self-play (0 — авто)", "type": "int", "default": 0, "min": 0, "max": 64},
+            {"key": "plies_per_iteration", "label": "Ходов self-play за итерацию", "type": "int", "default": 16, "min": 1, "max": 1024},
+            {"key": "num_considered", "label": "Кандидатов в корне", "type": "int", "default": 8, "min": 1, "max": 64},
+            {"key": "num_survivors", "label": "Кандидатов на 2-м шаге", "type": "int", "default": 4, "min": 1, "max": 32},
+            {"key": "root_temperature", "label": "Температура приора в корне", "type": "float", "default": 1.0, "min": 0.1, "max": 5.0},
+            {"key": "exploration_moves", "label": "Макс. случайных ходов в начале", "type": "int", "default": 8, "min": 0, "max": 200},
+            {"key": "max_game_plies", "label": "Лимит ходов партии (0 — нет)", "type": "int", "default": 0, "min": 0, "max": 2000},
+            {"key": "batch_size", "label": "Batch size", "type": "int", "default": 256, "min": 16, "max": 8192},
+            {"key": "sample_reuse", "label": "Использований каждой позиции", "type": "float", "default": 2.0, "min": 0.25, "max": 16.0},
             {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-3, "min": 1e-6, "max": 1e-1},
-            {"key": "eval_games", "label": "Arena games/iteration", "type": "int", "default": 10, "min": 2, "max": 100},
-            {"key": "win_rate_threshold", "label": "Accept win-rate", "type": "float", "default": 0.55, "min": 0.5, "max": 0.9},
-            {"key": "channels", "label": "Conv channels", "type": "int", "default": 48, "min": 8, "max": 256},
-            {"key": "num_blocks", "label": "Residual blocks", "type": "int", "default": 3, "min": 1, "max": 10},
+            {"key": "buffer_size", "label": "Буфер (позиций)", "type": "int", "default": 100_000, "min": 1_000, "max": 5_000_000},
+            {"key": "eval_every", "label": "Оценка каждые N итераций (0 — нет)", "type": "int", "default": 5, "min": 0, "max": 1000},
+            {"key": "eval_games", "label": "Партий в оценке", "type": "int", "default": 20, "min": 2, "max": 400},
+            {"key": "eval_opening_plies", "label": "Случайных ходов дебюта в оценке", "type": "int", "default": 1, "min": 0, "max": 8},
+            {"key": "eval_max_plies", "label": "Лимит ходов в оценке (0 — нет)", "type": "int", "default": 0, "min": 0, "max": 2000},
+            {"key": "channels", "label": "Conv channels", "type": "int", "default": 64, "min": 8, "max": 512},
+            {"key": "num_blocks", "label": "Residual blocks", "type": "int", "default": 4, "min": 1, "max": 20},
         ],
     },
 ]
@@ -1588,16 +1598,93 @@ _HP_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "next self-play cycle.",
     ),
     "eval_games": _d(
-        "AlphaZero: сколько партий 'арены' (новая сеть против предыдущей лучшей) играется, чтобы решить, "
-        "принять ли новую сеть как текущую лучшую.",
-        "AlphaZero: how many 'arena' games (the new network vs. the previous best) are played to decide whether "
-        "to accept the new network as the current best.",
+        "AlphaZero: сколько партий играется в каждой оценке силы — каждый дебют дважды, по разу за каждый цвет. "
+        "Больше партий — меньше шум в оценке Эло, но дольше оценка.",
+        "AlphaZero: how many games each strength evaluation plays — every opening twice, once per colour. More "
+        "games mean a less noisy Elo estimate but a slower evaluation.",
     ),
     "win_rate_threshold": _d(
         "AlphaZero: минимальная доля побед новой сети над предыдущей лучшей в арене, необходимая, чтобы принять "
         "новую сеть (иначе продолжаем self-play со старой лучшей).",
         "AlphaZero: minimum win rate the new network must achieve against the previous best in the arena to be "
         "accepted (otherwise self-play continues with the old best).",
+    ),
+    "parallel_games": _d(
+        "AlphaZero: сколько self-play партий идёт одновременно. На каждом ходу сеть вызывается один раз на весь "
+        "батч позиций, поэтому больше партий — лучше загрузка GPU и разнообразнее данные. Для шахмат на GPU "
+        "разумно 256–1024.",
+        "AlphaZero: how many self-play games run at once. The network is called once per ply for the whole batch "
+        "of positions, so more games mean better GPU utilisation and more diverse data. For chess on a GPU "
+        "256–1024 is reasonable.",
+    ),
+    "selfplay_processes": _d(
+        "AlphaZero: на сколько процессов разложить параллельные партии. Ходы по доске и сам поиск идут в этих "
+        "процессах, а сеть — одним батчем в основном процессе на GPU. 0 — авто: от 64 партий берётся по "
+        "процессу на каждые 8 партий, но не больше «ядер CPU − 2». 1 — всё в одном процессе.",
+        "AlphaZero: how many processes the parallel games are spread over. Board moves and the search run in "
+        "those processes, the network runs as one batch in the main process on the GPU. 0 = auto: from 64 "
+        "games on, one process per 8 games, at most \"CPU cores − 2\". 1 = everything in one process.",
+    ),
+    "plies_per_iteration": _d(
+        "AlphaZero: сколько ходов делается в каждой из параллельных партий за итерацию, прежде чем сеть "
+        "обучается на завершившихся партиях. Итерация = parallel_games × этот параметр позиций self-play.",
+        "AlphaZero: how many moves each parallel game advances per iteration before the network trains on the "
+        "games that finished. One iteration = parallel_games × this many self-play positions.",
+    ),
+    "num_considered": _d(
+        "AlphaZero (Gumbel-поиск): сколько лучших ходов по «приор + шум Гумбеля» реально проверяются на первом "
+        "шаге поиска — каждый ход делается на копии доски и оценивается сетью.",
+        "AlphaZero (Gumbel search): how many top moves by \"prior + Gumbel noise\" are actually tried at the first "
+        "search step — each move is played on a copy of the board and evaluated by the network.",
+    ),
+    "num_survivors": _d(
+        "AlphaZero (Gumbel-поиск): сколько лучших кандидатов после первого шага проверяются глубже — на ответ "
+        "соперника. Ход выбирается только среди них.",
+        "AlphaZero (Gumbel search): how many of the best candidates after the first step are checked one ply "
+        "deeper, against the opponent's reply. The move is picked among them only.",
+    ),
+    "root_temperature": _d(
+        "AlphaZero: делитель логитов приора в корне поиска. Больше 1 — приор мягче, поиск чаще проверяет "
+        "непопулярные ходы, и цель политики меньше «залипает» на прошлых предпочтениях сети.",
+        "AlphaZero: divisor for the prior logits at the search root. Above 1 the prior is softer, the search "
+        "tries unpopular moves more often, and the policy target sticks less to the network's past preferences.",
+    ),
+    "exploration_moves": _d(
+        "AlphaZero: для каждой партии случайно выбирается число N от 0 до этого значения; первые N ходов "
+        "сэмплируются по посещениям поиска, дальше играется лучший ход. Эти N позиций не идут в обучение — "
+        "они нужны только для разнообразия дебютов.",
+        "AlphaZero: each game draws a random N between 0 and this value; the first N moves are sampled from the "
+        "search visit counts, after that the best move is played. Those N positions are not trained on — they "
+        "only diversify openings.",
+    ),
+    "max_game_plies": _d(
+        "AlphaZero: партия self-play, не закончившаяся за столько ходов, засчитывается ничьей. 0 — без лимита. "
+        "Для шахмат ~512, чтобы бесконечные перестановки фигур не забивали буфер.",
+        "AlphaZero: a self-play game still running after this many plies counts as a draw. 0 means no limit. "
+        "Around 512 for chess, so endless piece shuffling does not flood the buffer.",
+    ),
+    "sample_reuse": _d(
+        "AlphaZero: сколько раз в среднем каждая новая позиция попадает в обучающий батч. Число шагов "
+        "обучения за итерацию = новые позиции × этот параметр / batch size. Сильно больше 2–4 — переобучение "
+        "на свежих партиях.",
+        "AlphaZero: how many times on average each new position is sampled into a training batch. Training "
+        "steps per iteration = new positions × this value / batch size. Much above 2–4 overfits the latest games.",
+    ),
+    "eval_every": _d(
+        "AlphaZero: как часто (в итерациях) мерить силу: матч против случайного игрока и против текущего "
+        "«якоря» лестницы Эло. 0 — не мерить.",
+        "AlphaZero: how often (in iterations) to measure strength: a match against a random player and against "
+        "the current Elo-ladder anchor. 0 disables it.",
+    ),
+    "eval_opening_plies": _d(
+        "AlphaZero: сколько случайных ходов делается в начале каждой оценочной партии, чтобы партии не "
+        "повторялись. Дебюты фиксированы на весь запуск, поэтому оценки сравнимы между собой.",
+        "AlphaZero: how many random moves open each evaluation game so the games do not repeat. Openings are "
+        "fixed for the whole run, so evaluations stay comparable.",
+    ),
+    "eval_max_plies": _d(
+        "AlphaZero: оценочная партия, не закончившаяся за столько ходов, засчитывается ничьей. 0 — без лимита.",
+        "AlphaZero: an evaluation game still running after this many plies counts as a draw. 0 means no limit.",
     ),
     "channels": _d(
         "AlphaZero: число каналов сверточных слоёв dual-head сети (policy + value).",
@@ -1620,6 +1707,12 @@ _HP_DESCRIPTIONS_BY_ALGO: dict[tuple[str, str], dict[str, str]] = {
         "точную оценку хода, но дороже по времени на ход.",
         "AlphaZero: how many MCTS simulations are run to pick a SINGLE move — more simulations give a more "
         "accurate move estimate but cost more time per move.",
+    ),
+    ("alphazero", "buffer_size"): _d(
+        "AlphaZero: сколько последних позиций self-play хранится для обучения. Каждая позиция — это доска, "
+        "улучшенная политика поиска и итог партии. Старые позиции вытесняются новыми.",
+        "AlphaZero: how many of the latest self-play positions are kept for training. Each position is a board, "
+        "the search's improved policy and the game result. Old positions are pushed out by new ones.",
     ),
     ("efficientzero", "num_simulations"): _d(
         "EfficientZero: сколько симуляций Gumbel-поиска выполняется для выбора ОДНОГО реального действия среды "

@@ -347,23 +347,27 @@ function buildSteps(family: Family, hyperparams: Hyperparams): { steps: Step[]; 
         steps: [
           {
             icon: Dices,
-            title: 'Self-play + MCTS',
-            detail: joinDetail(hp(hyperparams, 'games_per_iteration', 'игр='), hp(hyperparams, 'num_simulations', 'sim=')),
+            title: 'Батчевый self-play',
+            detail: joinDetail(hp(hyperparams, 'parallel_games', 'партий='), hp(hyperparams, 'plies_per_iteration', 'ходов=')),
           },
-          { icon: Database, title: 'Буфер партий', detail: hp(hyperparams, 'buffer_size', 'size=') },
+          {
+            icon: Target,
+            title: 'Gumbel-поиск',
+            detail: joinDetail(hp(hyperparams, 'num_considered', 'кандидатов='), hp(hyperparams, 'num_survivors', '→ ')),
+          },
+          { icon: Database, title: 'Буфер позиций', detail: hp(hyperparams, 'buffer_size', 'size=') },
           {
             icon: Brain,
             title: 'Обучение сети',
-            detail: joinDetail(hp(hyperparams, 'epochs', 'epochs='), hp(hyperparams, 'batch_size', 'batch=')),
+            detail: joinDetail(hp(hyperparams, 'sample_reuse', 'reuse='), hp(hyperparams, 'batch_size', 'batch=')),
           },
           {
             icon: Swords,
-            title: 'Арена vs чемпион',
-            detail: joinDetail(hp(hyperparams, 'eval_games', 'игр='), hp(hyperparams, 'win_rate_threshold', 'порог=')),
+            title: 'Лестница Эло',
+            detail: joinDetail(hp(hyperparams, 'eval_every', 'каждые='), hp(hyperparams, 'eval_games', 'игр=')),
           },
-          { icon: Target, title: 'Принять / откатить', detail: 'чемпион меняется только при победе ≥ порога' },
         ],
-        loopCaption: 'Повторяется num_iterations раз; чемпион обновляется только когда новая сеть выигрывает арену',
+        loopCaption: 'Повторяется num_iterations раз; сила меряется против случайного игрока и замороженных прошлых версий',
       }
     default:
       return {

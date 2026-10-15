@@ -1,4 +1,5 @@
-"""Built-in AlphaZero training entrypoint: self-play -> train -> arena-gate.
+"""Built-in AlphaZero training entrypoint: batched Gumbel self-play -> train
+-> Elo-ladder evaluation.
 
 See `rl_core/alphazero/base.py` for the reusable trainer contract (also used
 by custom AlphaZero plugins) and `rl_core/alphazero/loop.py` for the shared
@@ -29,8 +30,8 @@ def run(config: dict[str, Any], run_dir: Path) -> None:
 
     game_id = env_cfg["id"]
     hyperparams = dict(algo_cfg.get("hyperparams") or {})
-    # AlphaZero uses training.num_envs as concurrent self-play games
-    # rather than Gym VectorEnv lanes.
+    # training.num_envs is the worker count for custom AlphaZero plugins;
+    # the built-in trainer batches `parallel_games` games itself.
     hyperparams["self_play_workers"] = max(1, int(training_cfg.get("num_envs", 1)))
     hyperparams["seed"] = training_cfg.get("seed")
     network_spec = resolve_network_spec(config)

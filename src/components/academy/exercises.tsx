@@ -231,8 +231,8 @@ export function LessonExercises({ lessonId, items }: { lessonId: string; items: 
           Проверьте себя
         </h2>
         <p className="text-[12px] text-muted-foreground">
-          Считается руками. В Дизайнере нет табличного Q-learning — после основ запускайте DQN или PPO
-          на CartPole, а не «покликайте таблицу».
+          Проверьте, что главное из урока осталось в голове. Числа считаются руками, десятичные можно
+          писать через запятую.
         </p>
       </div>
       <div className="space-y-3">

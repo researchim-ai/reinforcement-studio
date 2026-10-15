@@ -93,6 +93,9 @@ class EnvSpec:
     # worth of experience per network update meaningfully helps (Atari,
     # Box2D, MuJoCo). `None` keeps the flat default of 1.
     recommended_num_envs: int | None = None
+    # Suggested `training.num_iterations` for AlphaZero on board games —
+    # the Designer's flat 20 iterations is a smoke test, not a training run.
+    recommended_num_iterations: int | None = None
     # Wrapper-graph nodes to pre-fill when this env is selected (see
     # `handleEnvChange` in ExperimentDesigner.tsx) — `[{"type": ..., "params":
     # {...}}, ...]` in the exact order they should be chained. Exists for
@@ -770,6 +773,14 @@ BOARD_GAMES: list[EnvSpec] = [
         action_kind="discrete",
         compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
         recommended_total_timesteps=20_000,
+        recommended_num_iterations=60,
+        default_hyperparams={
+            "parallel_games": 64,
+            "exploration_moves": 4,
+            "buffer_size": 50_000,
+            "channels": 32,
+            "num_blocks": 3,
+        },
     ),
     EnvSpec(
         id="connect_four",
@@ -780,12 +791,17 @@ BOARD_GAMES: list[EnvSpec] = [
         action_kind="discrete",
         compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
         recommended_total_timesteps=80_000,
+        recommended_num_iterations=400,
         default_hyperparams={
+            # Zero-family algorithms read only `num_simulations` from here.
             "num_simulations": 50,
-            "games_per_iteration": 24,
-            "eval_num_simulations": 50,
+            "parallel_games": 128,
+            "exploration_moves": 21,
+            "buffer_size": 200_000,
+            "eval_games": 40,
+            "eval_opening_plies": 2,
             "channels": 64,
-            "num_blocks": 4,
+            "num_blocks": 6,
         },
     ),
     EnvSpec(
@@ -797,13 +813,16 @@ BOARD_GAMES: list[EnvSpec] = [
         action_kind="discrete",
         compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
         recommended_total_timesteps=150_000,
+        recommended_num_iterations=500,
         default_hyperparams={
             "num_simulations": 100,
-            "games_per_iteration": 30,
-            "eval_num_simulations": 80,
-            "buffer_size": 40_000,
+            "parallel_games": 128,
+            "exploration_moves": 20,
+            "buffer_size": 200_000,
+            "eval_games": 40,
+            "eval_opening_plies": 2,
             "channels": 64,
-            "num_blocks": 5,
+            "num_blocks": 6,
         },
     ),
     EnvSpec(
@@ -819,14 +838,25 @@ BOARD_GAMES: list[EnvSpec] = [
         extra_requirement="open_spiel",
         recommended_total_timesteps=200_000,
         recommended_num_envs=4,
+        recommended_num_iterations=3_000,
+        # nanoAlphaZero-style chess budget scaled to one desktop GPU:
+        # 512 games × 16 plies = 8192 positions per iteration.
         default_hyperparams={
             "num_simulations": 50,
-            "games_per_iteration": 8,
-            "eval_games": 4,
-            "eval_num_simulations": 40,
-            "buffer_size": 40_000,
-            "channels": 64,
-            "num_blocks": 4,
+            "parallel_games": 512,
+            "plies_per_iteration": 16,
+            "exploration_moves": 30,
+            "root_temperature": 1.5,
+            "max_game_plies": 512,
+            "batch_size": 512,
+            "learning_rate": 5e-4,
+            "buffer_size": 500_000,
+            "eval_every": 10,
+            "eval_games": 40,
+            "eval_opening_plies": 1,
+            "eval_max_plies": 200,
+            "channels": 128,
+            "num_blocks": 10,
         },
     ),
     EnvSpec(
@@ -840,14 +870,18 @@ BOARD_GAMES: list[EnvSpec] = [
         compatible_algorithms=list(_BOARD_GAME_ALGORITHMS),
         extra_requirement="open_spiel",
         recommended_total_timesteps=200_000,
+        recommended_num_iterations=2_000,
         default_hyperparams={
             "num_simulations": 80,
-            "games_per_iteration": 12,
-            "eval_games": 6,
-            "eval_num_simulations": 60,
-            "buffer_size": 40_000,
-            "channels": 64,
-            "num_blocks": 5,
+            "parallel_games": 256,
+            "exploration_moves": 40,
+            "batch_size": 512,
+            "buffer_size": 500_000,
+            "eval_every": 10,
+            "eval_games": 40,
+            "eval_opening_plies": 2,
+            "channels": 96,
+            "num_blocks": 8,
         },
     ),
 ]

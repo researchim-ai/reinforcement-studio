@@ -177,7 +177,10 @@ def validate_alphazero_trainer_at(path: Path) -> dict[str, Any]:
         game_cls = make_game("tic_tac_toe").__class__
         trainer = cls(
             game_cls,
-            {"num_simulations": 2, "games_per_iteration": 1, "eval_games": 2, "eval_num_simulations": 2, "epochs": 1},
+            {
+                "num_simulations": 2, "games_per_iteration": 1, "eval_games": 2, "eval_num_simulations": 2, "epochs": 1,
+                "parallel_games": 2, "plies_per_iteration": 2, "batch_size": 8, "min_replay_positions": 8,
+            },
             "cpu",
         )
         trainer.run_iteration(1)

@@ -21,6 +21,7 @@ export const BEGINNER_TRACK = [
   'ppo',
   'reading_curves',
   'hyperparams',
+  'evaluation_seeds',
   'failure_modes',
   'cheatsheet',
 ] as const

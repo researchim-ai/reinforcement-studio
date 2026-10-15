@@ -78,24 +78,30 @@ def run_training_loop(
     last_extra: dict[str, Any] = {}
     last_completed_iteration = 0
 
-    for iteration in range(1, num_iterations + 1):
-        if stop_requested():
-            final_status = "stopped"
-            break
+    try:
+        for iteration in range(1, num_iterations + 1):
+            if stop_requested():
+                final_status = "stopped"
+                break
 
-        extra = dict(trainer.run_iteration(iteration) or {})
-        records = extra.pop("_self_play_records", None)
-        if records is not None:
-            (games_dir / f"iteration_{iteration:04d}.json").write_text(json.dumps(records))
+            extra = dict(trainer.run_iteration(iteration) or {})
+            records = extra.pop("_self_play_records", None)
+            if records is not None:
+                (games_dir / f"iteration_{iteration:04d}.json").write_text(json.dumps(records))
 
-        last_extra = extra
-        last_completed_iteration = iteration
-        write_snapshot(iteration, "running", last_extra)
+            last_extra = extra
+            last_completed_iteration = iteration
+            write_snapshot(iteration, "running", last_extra)
 
-        meta = {"game_id": game_id, "iteration": iteration, **(checkpoint_meta or {})}
-        if "win_rate_vs_prev" in extra:
-            meta["win_rate"] = extra["win_rate_vs_prev"]
-        trainer.save(run_dir / "model.pt", meta)
+            meta = {"game_id": game_id, "iteration": iteration, **(checkpoint_meta or {})}
+            if "win_rate_vs_prev" in extra:
+                meta["win_rate"] = extra["win_rate_vs_prev"]
+            elif "eval_score_vs_random" in extra:
+                meta["win_rate"] = extra["eval_score_vs_random"]
+                meta["ladder_elo"] = extra.get("eval_ladder_elo")
+            trainer.save(run_dir / "model.pt", meta)
+    finally:
+        trainer.close()
 
     # Carry the last iteration's extras (loss/win-rate/board/...) forward
     # into the final snapshot — otherwise this last write would blank them

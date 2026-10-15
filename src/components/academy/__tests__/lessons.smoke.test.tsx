@@ -96,6 +96,21 @@ describe('Academy lessons', () => {
     expect(container.textContent).toContain('max(TD, search)')
   })
 
+  it('practice track covers seeds and reward shaping with worked numbers', () => {
+    const ids = LESSONS.map((l) => l.id)
+    expect(ids.indexOf('hyperparams')).toBeLessThan(ids.indexOf('evaluation_seeds'))
+    expect(ids.indexOf('evaluation_seeds')).toBeLessThan(ids.indexOf('failure_modes'))
+    expect(ids.indexOf('failure_modes')).toBeLessThan(ids.indexOf('reward_shaping'))
+    const seeds = renderLesson(LESSONS.find((l) => l.id === 'evaluation_seeds')!.content).container.textContent
+    expect(seeds).toContain('IQM')
+    expect(seeds).toContain('481,7')
+    expect(seeds).toContain('cherry-picking')
+    const shaping = renderLesson(LESSONS.find((l) => l.id === 'reward_shaping')!.content).container.textContent
+    expect(shaping).toContain('γ · Φ(s′) − Φ(s)')
+    expect(shaping).toContain('0,9·(−4) + 5 = 1,4')
+    expect(shaping).toContain('reward hacking')
+  })
+
   it('latentimzero explains VoC checkpoints and sidecar isolation', () => {
     const lesson = LESSONS.find((l) => l.id === 'latentimzero')
     expect(lesson).toBeTruthy()

@@ -131,8 +131,11 @@ ALGORITHM_CLASS = Algorithm
 
 ALPHAZERO_CUSTOM_NETWORK = '''"""Custom AlphaZero trainer — swap only the network architecture.
 
-Keeps the built-in self-play / MCTS / arena-gating loop (from
-BuiltinAlphaZeroTrainer) and overrides just build_network().
+Keeps the built-in batched self-play / Gumbel search / Elo-ladder loop (from
+BuiltinAlphaZeroTrainer) and overrides just build_network(). A network whose
+forward() returns (policy_logits, tanh value) is trained with an MSE value
+loss; expose `value_head_type = "wdl"` and `forward_heads()` (see
+rl_core/alphazero/network.py) to get the win/draw/loss head instead.
 """
 from __future__ import annotations
 
@@ -142,10 +145,10 @@ import torch.nn.functional as F
 from rl_core.alphazero.base import BuiltinAlphaZeroTrainer
 
 NAME = "AlphaZero (своя сеть)"
-DESCRIPTION = "Тот же self-play/MCTS/arena, но с другой архитектурой сети."
+DESCRIPTION = "Тот же батчевый self-play, Gumbel-поиск и лестница Эло, но с другой архитектурой сети."
 HYPERPARAMS = [
-    {"key": "num_simulations", "label": "MCTS simulations/move", "type": "int", "default": 25, "min": 4, "max": 400},
-    {"key": "games_per_iteration", "label": "Self-play games/iteration", "type": "int", "default": 20, "min": 2, "max": 200},
+    {"key": "parallel_games", "label": "Параллельных партий", "type": "int", "default": 64, "min": 1, "max": 4096},
+    {"key": "plies_per_iteration", "label": "Ходов self-play за итерацию", "type": "int", "default": 16, "min": 1, "max": 1024},
     {"key": "learning_rate", "label": "Learning rate", "type": "float", "default": 1e-3, "min": 1e-6, "max": 1e-1},
     {"key": "channels", "label": "Conv channels", "type": "int", "default": 32, "min": 8, "max": 256},
 ]

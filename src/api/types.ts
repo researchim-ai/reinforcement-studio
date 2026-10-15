@@ -27,6 +27,8 @@ export interface EnvSpec {
   // (Atari, Box2D); `null`/absent means "no particular recommendation, 1
   // is fine".
   recommended_num_envs?: number | null
+  // Suggested AlphaZero `training.num_iterations` for board games.
+  recommended_num_iterations?: number | null
   // Wrapper-graph nodes to pre-fill when this env is selected — see
   // `handleEnvChange` in ExperimentDesigner.tsx. `null`/absent leaves the
   // wrapper graph empty like before.
@@ -691,6 +693,18 @@ export interface MetricsSnapshot {
   win_rate_vs_prev?: number
   accepted?: boolean
   buffer_size?: number
+  // Built-in AlphaZero Elo ladder (rl_core/alphazero/batched.py): scores are
+  // 0..1 match scores (win = 1, draw = 0.5), carried forward between
+  // evaluations; `eval_iteration` is when they were last measured.
+  eval_ladder_elo?: number
+  eval_ladder_rung?: number
+  eval_score_vs_random?: number
+  eval_score_vs_anchor?: number
+  eval_anchor_rung?: number
+  eval_iteration?: number
+  selfplay_plies_per_sec?: number
+  selfplay_processes?: number
+  self_play_avg_length?: number
   arena?: { wins_a: number; wins_b: number; draws: number; games: number }
   error?: string
   // Static per-run facts, merged into every snapshot (see MetricsCallback /

@@ -33,6 +33,11 @@ const STATUS_VARIANT: Record<string, 'success' | 'secondary' | 'destructive' | '
   interrupted: 'destructive',
 }
 
+/** Match score 0..1 (win = 1, draw = ½) as a percentage. */
+function formatScore(score: number | null | undefined): string {
+  return score != null ? `${(score * 100).toFixed(0)}%` : '—'
+}
+
 interface LossField {
   key: keyof MetricsSnapshot
   label: string
@@ -407,9 +412,13 @@ export function TrainingMonitor() {
   // zig-zag up/down, which is normal for noisy per-step metrics, and that
   // overshoot is exactly the "wriggling snake" look. Linear segments track
   // the actual points with no artificial curvature.
+  // Runs from before the Elo ladder only have the arena `win_rate_vs_prev`.
+  const hasLadder = isAlphaZero && chartData.some((snap) => snap.eval_ladder_elo != null)
   const rewardLines = isAlphaZero
     ? [
-        <Line key="win_rate" type="linear" dataKey="win_rate_vs_prev" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} />,
+        hasLadder
+          ? <Line key="ladder_elo" name="Эло" type="linear" dataKey="eval_ladder_elo" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} connectNulls />
+          : <Line key="win_rate" type="linear" dataKey="win_rate_vs_prev" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} />,
       ]
     : [
         <Line key="episode_reward_mean" name="Суммарная" type="linear" dataKey="episode_reward_mean" stroke="oklch(0.7 0.15 260)" dot={false} strokeWidth={2} connectNulls />,
@@ -561,13 +570,32 @@ export function TrainingMonitor() {
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <StatCard label="Шаг / итерация" value={`${latest?.step ?? 0} / ${latest?.total_timesteps ?? '—'}`} />
-              <StatCard label="Параллельных сред" value={String(latest?.num_envs ?? 1)} />
-              <StatCard label="Траекторий завершено" value={latest?.episodes_completed != null ? String(latest.episodes_completed) : '—'} />
+              <StatCard label={isAlphaZero ? 'Параллельных партий' : 'Параллельных сред'} value={String(latest?.num_envs ?? 1)} />
+              <StatCard label={isAlphaZero ? 'Партий сыграно' : 'Траекторий завершено'} value={latest?.episodes_completed != null ? String(latest.episodes_completed) : '—'} />
               {isAlphaZero ? (
                 <>
-                  <StatCard label="Win-rate vs prev" value={latest?.win_rate_vs_prev != null ? `${(latest.win_rate_vs_prev * 100).toFixed(0)}%` : '—'} />
+                  {latest?.eval_ladder_elo != null ? (
+                    <>
+                      <StatCard label={`Эло · ступень ${latest.eval_ladder_rung ?? 0}`} value={latest.eval_ladder_elo.toFixed(0)} />
+                      <StatCard label="Против случайного" value={formatScore(latest.eval_score_vs_random)} />
+                      <StatCard
+                        label={latest.eval_anchor_rung ? `Против якоря №${latest.eval_anchor_rung}` : 'Против якоря'}
+                        value={formatScore(latest.eval_score_vs_anchor)}
+                      />
+                    </>
+                  ) : (
+                    <StatCard label="Win-rate vs prev" value={latest?.win_rate_vs_prev != null ? `${(latest.win_rate_vs_prev * 100).toFixed(0)}%` : '—'} />
+                  )}
                   <StatCard label="Loss" value={latest?.loss?.toFixed(3) ?? '—'} />
-                  <StatCard label="Buffer" value={String(latest?.buffer_size ?? '—')} />
+                  <StatCard label="Позиций в буфере" value={String(latest?.buffer_size ?? '—')} />
+                  {latest?.selfplay_plies_per_sec != null && (
+                    <StatCard
+                      label={latest.selfplay_processes && latest.selfplay_processes > 1
+                        ? `Ходов self-play / с · ${latest.selfplay_processes} проц.`
+                        : 'Ходов self-play / с'}
+                      value={latest.selfplay_plies_per_sec.toFixed(0)}
+                    />
+                  )}
                 </>
               ) : isWorldModel ? (
                 <>
@@ -774,7 +802,11 @@ export function TrainingMonitor() {
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm">
-                  {isAlphaZero ? 'Win-rate по итерациям' : 'Награда по шагам (реальная и intrinsic отдельно)'}
+                  {isAlphaZero
+                    ? hasLadder
+                      ? 'Эло по лестнице (0 — случайный игрок)'
+                      : 'Win-rate по итерациям'
+                    : 'Награда по шагам (реальная и intrinsic отдельно)'}
                 </CardTitle>
               </CardHeader>
               <CardContent className="h-64">

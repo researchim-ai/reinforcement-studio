@@ -183,6 +183,7 @@ export function ExperimentDesigner() {
       setEnvironmentId(first.id)
       if (first.recommended_total_timesteps) setTotalTimesteps(first.recommended_total_timesteps)
       if (first.recommended_num_envs) setNumEnvs(first.recommended_num_envs)
+      if (first.recommended_num_iterations) setNumIterations(first.recommended_num_iterations)
       if (requestedEnvId) {
         setSearchParams((prev) => {
           prev.delete('env')
@@ -234,6 +235,7 @@ export function ExperimentDesigner() {
     const nextEnv = environments.find((e) => e.id === id)
     if (nextEnv?.recommended_total_timesteps) setTotalTimesteps(nextEnv.recommended_total_timesteps)
     if (nextEnv?.recommended_num_envs) setNumEnvs(nextEnv.recommended_num_envs)
+    if (nextEnv?.recommended_num_iterations) setNumIterations(nextEnv.recommended_num_iterations)
     // Same idea for the wrapper graph — e.g. CarRacing wants a specific
     // Frame Skip -> Resize -> Grayscale -> Frame Stack -> Normalize Reward
     // pipeline (see `recommended_wrappers` in rl_core/envs/registry.py);

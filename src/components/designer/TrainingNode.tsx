@@ -101,9 +101,8 @@ export const TrainingNode = memo(function TrainingNode({ data }: NodeProps & { d
           />
           <p className="text-[10px] text-muted-foreground/60">
             {data.kind === 'gym'
-              ? 'Независимые среды в отдельных процессах: ускоряют сбор опыта на CPU.'
-              : 'Партии AlphaZero выполняются одновременно и используют общую сеть только для inference.'}
-            {' '}1 — последовательный режим.
+              ? 'Независимые среды в отдельных процессах: ускоряют сбор опыта на CPU. 1 — последовательный режим.'
+              : 'Используется только своими AlphaZero-плагинами. Встроенный AlphaZero берёт число одновременных партий из гиперпараметра «Параллельных партий».'}
           </p>
           {!!data.recommendedNumEnvs && data.numEnvs < data.recommendedNumEnvs && (
             <p className="text-[10px] text-warning">

@@ -11,6 +11,16 @@ import torch
 from rl_core.alphazero.network import AlphaZeroNet
 
 
+def network_kwargs(hp: dict[str, Any]) -> dict[str, Any]:
+    """Head options for `AlphaZeroNet`. Checkpoints saved before these
+    options existed have none of the keys and get the original tanh head."""
+    return {
+        "value_head": str(hp.get("value_head", "tanh")),
+        "global_pool": bool(hp.get("global_pool", False)),
+        "policy_channels": int(hp.get("policy_channels", 8)),
+    }
+
+
 def save_checkpoint(net: AlphaZeroNet, path: Path, meta: dict[str, Any]) -> None:
     torch.save(
         {
@@ -59,6 +69,7 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[Any, dict[str, Any
             payload["rows"], payload["cols"], payload["action_size"],
             hp.get("channels", 48), hp.get("num_blocks", 3),
             in_planes=payload.get("in_planes", 3),
+            **network_kwargs(hp),
         )
     net.load_state_dict(payload["state_dict"])
     net.to(device)
